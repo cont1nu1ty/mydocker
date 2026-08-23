@@ -13,14 +13,16 @@
 | 里程碑 | 状态 | 产出 |
 | --- | --- | --- |
 | M0 仓库初始化 | Verified | 已审计的基线与可度量架构契约 |
-| M1 生命周期基础 | Not started | 纯领域模型、状态及 operation 契约 |
-| M2 隔离与 cgroup v2 | Not started | rootful 隔离与资源强制执行 |
-| M3 守护进程与本地 API | Not started | 长期运行的权威组件和首个可运行评测工具 |
-| M4 存储与网络 | Not started | Snapshot/rootfs 与稳定的 Sandbox 网络 |
+| M1 生命周期基础 | Verified | 纯领域模型、状态及 operation 契约 |
+| M2 隔离与 cgroup v2 | Implemented | rootful 隔离与资源强制执行；特权验收待完成 |
+| M3 守护进程与本地 API | In progress | daemon/API/CLI/恢复/评测基础已有纯测试；生产 launcher 和特权验收待完成 |
+| M4A 镜像与内容 | Not started | OCI Image Layout 导入、内容寻址与 layer unpack |
+| M4B 文件系统与 Snapshot | Not started | OverlayFS snapshot、rootfs、mount 与 bundle |
+| M4C Sandbox 网络 | Not started | 稳定的 netns、veth/bridge、IPAM 与 port mapping |
 | M5 监督与可靠性 | Not started | 重连、崩溃一致性、压力/故障覆盖 |
 | M6 性能与发布基线 | Not started | 实测基线与证据驱动的优化 |
-| C0 创建 mydocker-cluster | Not started | 仅在运行时通过门槛后派生集群项目 |
-| C1 控制平面基础 | Not started | API/存储/控制器/代理基础 |
+| C0 派生 mycluster | Not started | 仅在运行时通过门槛后创建 `mydocker-cluster` 分支 |
+| C1 控制面基础 | Not started | API/存储/控制器/代理基础 |
 | C2 调度器 | Not started | 资源感知的放置与模拟 |
 | C3 协调与幂等性 | Not started | 在重试下实现期望/实际状态收敛 |
 | C4 故障恢复 | Not started | Lease、节点故障、重新调度、MTTR |
@@ -43,7 +45,7 @@
   network/IPAM、状态、测试和 Git 事实。
 - 将已确认事实与需要隔离宿主机才能验证的场景分开。
 - 所有尚未实现的运行时/集群能力保持标记为 Proposed 或 Planned。
-- 只创建允许的 11 份核心文档；不创建代码骨架或虚假结果。
+- 只创建允许的 12 份核心文档；不创建代码骨架或虚假结果。
 
 ### 可靠性验收
 
@@ -68,7 +70,8 @@
 
 ## M1：生命周期基础
 
-**状态：** Not started。
+**状态：** Verified。纯 Go 领域/协调层、operation/event、rollback 与事务状态边界已由
+单元测试、race detector 和静态检查验证；不包含任何宿主机资源实现。
 
 ### 功能目标
 
@@ -107,14 +110,82 @@
 
 ## M2：隔离与 cgroup v2
 
-**状态：** Not started。
+**状态：** Implemented, privileged verification pending。宿主机原语、所有权/回滚
+契约和 provider 边界已实现，并通过纯单元测试、race detector 和静态检查。
+真实 kernel 集成场景尚未在符合安全契约的一次性宿主机上运行，因此本里程碑
+尚未达到 `Verified`。
 
 ### 功能目标
 
 - 实现 rootful UTS/IPC/network/PID/mount namespace 的创建/加入边界。
 - 实现 mount propagation、`pivot_root`、`/proc` 和 rootfs mount 原语。
-- 实现 cgroup v2 的 Sandbox 父层级和 Attempt 子层级，支持 CPU、memory、pids 控制、
-  request/limit 分离及 OOM 证据。
+- 实现 cgroup v2 的 process-free Sandbox controller parent、固定 keeper leaf 和
+  sibling Attempt leaves，支持 CPU、memory、pids 控制、request/limit 分离及 OOM 证据。
+
+### 当前实现
+
+- `internal/isolation` 通过窄 `Ops` 边界实现 rootful/cgroup-v2/namespace/pidfd
+  read-only preflight、专用 helper 中的 namespace creation、锁定 OS thread 的 join/restore、
+  pidfd 加 boot ID/start time/cgroup/executable 强身份，以及 private propagation、
+  self-bind、`pivot_root`、old-root detach、新 `/proc` 和最小 `/dev` tmpfs 原语。
+- `internal/cgroupv2` 只支持 unified cgroup v2，在专用 delegated root 下使用
+  deterministic、process-free Sandbox parent，以及固定 `keeper/` 与
+  `attempt-<sha256(id)>/` sibling leaves。parent 只启用 controllers、不承载进程；
+  manager 提供 keeper 的创建、精确删除、只读 membership/identity confirmation，
+  并在 Attempt leaf 强制 `cpu.max`、`memory.max` 和 `pids.max`，读回 effective values、
+  membership、current/events 及 `memory.events.local` OOM 证据。
+- `cpu.max` period 已固定为 `100000` µs，CPU milli quota 向上取整；为满足
+  kernel `1000` µs quota 下限，domain/API 在任何宿主机副作用前拒绝
+  `1m`–`9m` CPU limit，`10m` 是最小可执行值。
+- `PidsLimit` 缺省值已固定为 `1024`。Sandbox 保留原始 `Resources`，
+  immutable `ContainerSpec.Limits`（`ResolvedResourceLimits`）对 CPU/memory unlimited 以及具体 pids
+  默认值进行显式 JSON 序列化和 clone；CPU 和 memory requests 只保存调度
+  意图，绝不写入 enforcement controllers。
+- cgroup manager 使用 `HostProbe` page size 验证 `memory.max` 向上页对齐的
+  canonical effective readback，上层返回/持久 effective 值，不强行宣称非对齐
+  请求值原样存在。
+- `AttachProcess` 与 keeper confirmation 在 membership read 前后各验证一次
+  strong process evidence，并要求 PID 保持一致；它们只读确认目标 leaf membership，
+  对退出、PID reuse 或二次验证失败均失败关闭，绝不在捕获 cgroup-bound
+  ProcessHandle 后写 `cgroup.procs` 迁移进程；
+  后续真实 launcher 必须先把 helper 创建在目标 cgroup，再捕获 receipt。
+- `internal/ownership`、state/lifecycle checkpoint、receipt adoption、failure rollback 和
+  `internal/provider` 契约已表达每个宿主机副作用的所有者证据、原子阶段
+  进度、转移与精确逆操作。
+- Linux provider operation 必须先持久化无副作用 intent，随后每个事务最多确认一个
+  acquisition receipt；Start 的 `attach_cgroup`、`release_start_gate` 和
+  `observe_process` checkpoint 不可跳过。
+
+### M2/M3 process profile 边界
+
+- M2 固定 identity/gate/provider 契约：Attempt init 是 PID namespace 内 PID 1，
+  是长期存活且不执行 `exec` 的 wrapper；`KindInitProcess` receipt 永远绑定该
+  wrapper 的稳定 executable，不创建随 workload `exec` 变化的 receipt。
+- M3 负责实现并编排具体 wrapper。start gate 释放后由 wrapper `fork`/`exec`
+  workload child；wrapper 负责 descendant reaping、workload exit/OOM evidence
+  关联，以及在作用时验证 child identity 后进行信号转发。
+- PID 1 wrapper 先只完成 PID/mount identity readiness；daemon 分别持久化 init、PID 和
+  mount receipts 后才发出一次性 rootfs prepare 指令。`RootfsRequest` 必须携带三项
+  同 owner evidence；cgroup attachment evidence 必须绑定精确 Attempt cgroup 与 init
+  receipts，rootfs receipt 与该 attachment 均确认后才允许释放 gate。
+- Sandbox namespace keeper 直接位于固定 `keeper/` leaf，Attempt wrapper 与
+  workload descendants 位于 sibling Attempt leaf。M2 的纯原语测试不等同于
+  已运行 M3 launcher 或真实 PID 1/cgroup 集成场景。
+
+### 当前验证与待验收项
+
+- 已验证：fake `Ops`、fake/临时 cgroup filesystem（包括空 parent、keeper/Attempt
+  siblings、只读双重身份 membership 与精确 leaf-to-parent cleanup）、状态/生命周期
+  事务和 provider 契约的普通单元测试、race detector 与 `go vet`。
+- 未运行：真实 `unshare`/`setns`、mount/`pivot_root`、PID 1/`/proc`、
+  cgroup controller 写入/membership/cleanup、CPU quota、memory/OOM、pids limit、
+  特权故障注入与压力场景。
+- 跳过原因：当前是普通、非一次性的裸机开发环境，当前进程无特权
+  内核能力，cgroup v2 子树未委托所需 controllers，且未收到针对该宿主机的
+  高风险实验授权。
+- 放行条件：专用、一次性 rootful Linux VM 或等价隔离宿主机，具备所需
+  namespace/mount/pidfd 能力和已委托 `cpu`/`memory`/`pids` 的专用 cgroup v2
+  root，并对 privileged test 显式 opt-in；必须先通过 read-only preflight。
 
 ### 正确性验收
 
@@ -126,7 +197,8 @@
 ### 可靠性验收
 
 - 每个 namespace/mount/cgroup 阶段的失败都会回滚已拥有资源。
-- 清理是幂等的，并拒绝掩盖处于 busy/unknown 状态的宿主机资源。
+- 清理按 Attempt/keeper leaves 到 Sandbox parent 的顺序逐个执行，保持幂等且
+  禁止递归，并拒绝掩盖处于 populated/busy/unknown 状态的宿主机资源。
 - 前置检查阻止在不合适的普通宿主机上运行特权测试。
 
 ### 度量准备
@@ -142,7 +214,9 @@
 
 ## M3：守护进程与本地 API
 
-**状态：** Not started。
+**状态：** In progress。纯 Go 和注入 provider 实现已组成，但生产
+Linux launcher 和真实 rootful lifecycle 尚未通过，因此不得标记为
+`Implemented` 或 `Verified`。
 
 ### 功能目标
 
@@ -151,16 +225,62 @@
 - 让守护进程成为后台生命周期的权威组件。
 - 使用显式的精简 provider，在 M1/M2 原语之上实现初始 Sandbox/Attempt 编排：
   预先准备的测试 rootfs、`network=none`/loopback，以及由守护进程启动、用于持有
-  Sandbox namespaces 的最小 keeper。M3 不声称具备 M4 的 snapshot/veth 路径，
+  Sandbox namespaces、直接位于固定 keeper leaf 的最小 keeper；同时实现长期不
+  `exec` 的 Attempt init wrapper（PID namespace 内 PID 1），由其在 start gate
+  释放后 `fork`/`exec` workload child，并负责 reap、exit/OOM 关联和经验证的信号
+  转发。`KindInitProcess` receipt 始终绑定 wrapper executable。M3 不声称具备 M4A/M4B 的
+  image/snapshot 路径或 M4C 的 veth 路径，
   也不声称具备 M5 的可重连 supervisor。
 - 为这个具名的精简 provider 加入首个可通过公共 API 运行的评测工具和生命周期基线
   定义（不是优化）。
+
+### 当前实现
+
+- `internal/state.FileStore` 已为 schema/CAS、Sandbox/Container/Attempt、operation、
+  rollback 和事件提供独占锁与原子持久边界，并覆盖 close/reopen、
+  失败注入和不确定 commit 恢复测试。
+- FileStore schema v2 已实现确定性的 count-based retention：active operation 永不淘汰；
+  最近 `1024` 个终态 operation 保留完整响应，更早记录转换为防 ID 复用的 tombstone；
+  最近 `8192` 个 event 构成连续 suffix，过旧或超前的非空 cursor 返回版本化 `resume_gap`。
+  完整 identity+tombstone 总数默认最多 `65536`，状态 envelope 最多 `64 MiB`；达到上限
+  在副作用前以 `resource_exhausted` 失败关闭。小限额可注入测试，策略不依赖 wall clock。
+- `internal/engine`、shim 协议、精简 isolation/cgroup provider 和 owner-bound artifact
+  已实现创建、启动、kill、停止、删除、反向 rollback 和 daemon restart
+  reconciliation 编排。全量 recovery 只在 UDS 绑定前运行；上线后的终态 watcher
+  将自然退出投影为持久 outcome，独立 kill-deadline watcher 只扫描 active Kill，
+  使已持久 escalation deadline 不依赖客户端再次请求且不向在线对象写回旧全局快照。
+- `api/runtime/v1`、HTTP/JSON UDS server、`pkg/client` 和 JSON CLI 已实现严格
+  version/error/request-ID/operation-ID 契约，包括 Sandbox/Container 生命周期、
+  operation 查询、事件 resume 和绑定 Container/Attempt 身份的 log cursor。
+- events 保留资源与 operation 关联，log frames 绑定精确的 Container/Attempt
+  身份；`mydocker-eval` 只经公共 API 运行，
+  已实现 cold/warm prepared-rootfs 场景、调用方单调 span、daemon stage-event
+  关联、失败后清理尝试、环境快照及持久 JSONL 原始证据。
+- Sandbox hostname、DNS 和 `network=none/loopback` 已有 typed validation/provider/fake
+  契约；这些测试不表示 UTS、`resolv.conf` 或 loopback 已在真实 kernel 中执行。
+
+### 当前 blocker
+
+- 生产 `LinuxShimLauncher` 仍以 `ErrLauncherIncomplete` 失败关闭。底层已具备
+  cgroup-at-fork/pidfd、namespace reattach、UTS/none/loopback 配置、deferred-rootfs
+  ACK、DNS 绑定和跨 pivot 保留 artifact descriptor 的协议与纯测试；尚缺的是把这些
+  原语组合成生产 process factory，包括 immutable launch intent、keeper/init bounded
+  readiness、crash rediscovery，以及作用时验证的 inspect/remove/signal/resolve。
+  `mydockerd` 在绑定 UDS 前的只读 preflight 直接返回该错误，所以当前没有可供生产
+  使用的本地 daemon。
+- operation/event 的无界增长已由固定窗口、tombstone、原子 compaction 和显式 gap
+  消除；但达到 `65536` identity 或 `64 MiB` envelope 后尚无在线 rollover/归档/迁移
+  流程。当前会安全拒绝新 intent，而不是无限增长；仍不得据此声称长期生产可用。
+- 真实 rootful namespace/mount/cgroup/PID 1/OOM/quota/hostname/DNS/loopback 生命周期和
+  daemon restart 场景尚未在一次性 VM 上运行。
 
 ### 正确性验收
 
 - API 版本/错误/幂等性测试及 CLI 退出状态测试通过。
 - CLI 退出后，后台工作负载继续正确运行，且守护进程/minimal keeper 拥有精简
   生命周期。
+- Attempt wrapper 在 gated start 前后保持同一 strong executable identity；workload
+  child 的退出、OOM 与信号结果经 wrapper 关联，不通过改写 init receipt 表达。
 - 生命周期 operations 和状态查询与持久/观测 generations 一致。
 - 结构化 logs/events 保留资源与 operation 的关联。
 
@@ -172,57 +292,137 @@
   supervisor。
 - 部分请求或重复请求不会造成副作用重复。
 - 原子元数据测试覆盖写入失败和无效 schema。
+- retention 测试覆盖 exact replay window、过期 ID、active intent、容量拒绝、event gap、
+  v1→v2 重启迁移、oversized 文件和 checksum 正确但 retention binding 被篡改的文件。
 
 ### 度量准备
 
 - 评测工具记录调用方 spans、阶段事件、环境、失败及原始 samples。
-- 建立带 `prepared-rootfs+loopback` 标签、可执行的 cold/warm 场景定义；不得与 M4
-  完整路径直接比较。
+- 建立带 `prepared-rootfs+loopback` 标签、可执行的 cold/warm 场景定义；不得与
+  M4A–M4C 完整路径直接比较。
 - 为 Proposed 的低基数指标加入 label-cardinality 测试。
 
 ### 完成条件
 
 - 首个非特权生命周期测试套件和隔离特权生命周期测试套件通过。
 - 可复现的基线流程存在；不作性能提升声明。
-- 文档说明哪些完整 Ready/Created 资源仍推迟到 M4/M5。
+- 文档说明哪些完整 Ready/Created 资源仍推迟到 M4A–M4C/M5。
 
-## M4：存储与网络
+## M4A：镜像与内容
 
 **状态：** Not started。
 
 ### 功能目标
 
-- 实现镜像导入/content digest、layer store、每个 Attempt 的 OverlayFS snapshot，
-  以及版本化存储元数据。
-- 实现由 keeper 持有的 Sandbox network namespace、veth/bridge、本地并发 IPAM、
-  routes、DNS inputs 和 port mappings。
-- 将存储/网络所有权与生命周期回滚及恢复集成。
+- 实现 OCI Image Layout 导入、manifest/config/layer digest 校验、
+  content-addressable blob store 和版本化镜像元数据。
+- 按 manifest 声明的顺序实现 layer unpack，并将可变镜像引用解析为
+  一个不可变 digest 后再持久化执行身份。
+- 实现 `ImportImage`、`EnsureImage`、`GetImage`、`ListImages` 和 `RemoveImage`
+  的最小本地契约，使用预加载 OCI Image Layout 完成首个可运行路径。
 
 ### 正确性验收
 
-- digest、bundle/path、snapshot/mount、IP uniqueness、route 和 port 行为测试在受控
-  环境中通过。
+- 正确 OCI layout 可导入，错误、缺失或 digest 不匹配的 blob 在进入
+  snapshot 路径前被明确拒绝。
+- 相同 digest 的重复导入和 `EnsureImage` 重试不重复写入内容或生成不一致的元数据；
+  get/list/remove 遵守稳定查询、引用保护和显式删除契约。
+- layer 顺序、whiteout 输入和路径安全检查有自动化测试覆盖。
+
+### 可靠性验收
+
+- 导入、digest 校验、blob 提交和 layer unpack 的每个失败阶段都有
+  逆序回滚与崩溃恢复覆盖。
+- 临时内容和版本化元数据采用原子提交；守护进程重启后只协调
+  经过 digest 与所有者验证的本地内容。
+- 删除受引用的 content/layer 必须失败或按明确的延迟回收策略处理。
+
+### 度量准备
+
+- 记录 `image_import_duration`、`digest_verification_duration`、
+  `layer_unpack_duration`、`content_dedup_ratio` 和 `unpacked_disk_usage`。
+- 区分 content/layer 缺失与已存在的 cold/warm 路径，并保留原始样本和
+  输入 OCI layout 的 digest/环境清单。
+
+### 完成条件
+
+- OCI Image Layout 能经由 digest 校验、内容存储和 layer unpack 形成
+  M4B 可消费的本地输入，正确性/失败测试通过。
+- benchmark 场景保留原始数据和环境清单，但尚不作为发布性能声明。
+- Registry pull 可以后续增强；Dockerfile build、container commit 和 push 不属于
+  mydocker 2.0 的完成条件。
+
+## M4B：文件系统与 Snapshot
+
+**状态：** Not started。
+
+### 功能目标
+
+- 以 M4A 经验证的 unpacked layers 为输入，实现每个 Attempt 的
+  OverlayFS snapshot、rootfs 和嵌套 mount。
+- 实现 mount manager 与 bundle builder，产生供低层 runtime 消费的
+  rootfs/bundle，而不让 runtime 解析镜像。
+- 实现版本化 snapshot/mount 元数据、引用与 daemon restart recovery。
+
+### 正确性验收
+
+- bundle/path、snapshot 所有权、OverlayFS lower/upper/work/merged 约束和
+  mount 验证在受控环境中通过。
+- 每个 Attempt 获得独立可写层，共享的不可变 layers 不被容器写入修改。
+- 已验证 digest 到 rootfs、bundle 再到运行时输入的关联可追溯。
+
+### 可靠性验收
+
+- snapshot prepare、mount、bundle persistence 和 teardown 的每个失败阶段
+  都有逆序回滚与重启协调覆盖。
+- unmount 失败不能通过暴露的宿主机 mount 导致递归删除；状态保留为
+  可诊断且可重试。
+- 守护进程重启后只协调经过所有者、digest 和 mount identity 验证的资源。
+
+### 度量准备
+
+- 记录 `snapshot_prepare_duration`、`overlay_mount_duration` 和
+  `bundle_prepare_duration`，不将它们隐式合并为单一启动数字。
+- 实现 copy-versus-OverlayFS、cold/warm snapshot、allocated/apparent disk usage
+  以及 native/OverlayFS 工作负载场景。
+- 建立 cold/warm 启动 benchmark 输入和 content/unpack/snapshot/page-cache 定义。
+
+### 完成条件
+
+- 镜像到 rootfs/snapshot/bundle 的最小路径可通过公共生命周期 API 启动
+  workload，正确性、回滚和恢复测试通过。
+- 文件系统 benchmark 保留原始数据与环境清单，但尚不作为发布性能声明。
+
+## M4C：Sandbox 网络
+
+**状态：** Not started。
+
+### 功能目标
+
+- 实现由 keeper 持有的 Sandbox network namespace、veth/bridge、本地并发 IPAM、
+  routes、DNS inputs 和 port mappings。
+- 将网络所有权、持久化状态、生命周期回滚及 daemon recovery 集成。
+
+### 正确性验收
+
+- netns、IP uniqueness、route、DNS 和 port mapping 行为测试在受控环境中通过。
 - 顺序 Attempts 保持 Sandbox 网络身份。
 - 并发 IPAM 请求具有唯一性和幂等性。
 
 ### 可靠性验收
 
-- 每个存储/网络失败阶段都有逆序回滚覆盖。
-- 原子 IPAM/network/storage 状态能承受注入的写入/崩溃故障。
-- unmount 失败不能通过暴露的宿主机 mount 导致递归删除。
-- 守护进程重启后只协调经过所有者验证的资源。
+- 每个 network/IPAM/link/route/firewall 失败阶段都有逆序回滚覆盖。
+- 原子 IPAM/network 状态能承受注入的写入/崩溃故障。
+- 守护进程重启后只协调经过所有者验证的本地网络资源。
 
 ### 度量准备
 
-- 实现 copy-versus-OverlayFS、cold/warm snapshot、disk 和 native/OverlayFS
-  工作负载场景。
-- 实现 Sandbox 网络建立/并发/清理观测。
-- 建立 cold/warm 启动 benchmark 输入和缓存定义。
+- 实现 Sandbox 网络建立、并发配置和清理观测。
+- 建立网络 cold/warm 定义，并与 M4A/M4B 的 content、snapshot 缓存状态分开。
 
 ### 完成条件
 
-- 正确性/失败测试套件通过；benchmark 场景保留原始数据和环境清单，但尚不作为
-  发布性能声明。
+- 正确性/失败测试套件通过，网络场景保留原始数据和环境清单。
 - 不加入多节点 VXLAN 或集群网络。
 
 ## M5：监督与可靠性
@@ -295,13 +495,36 @@
   不捏造百分比。
 - 发布基线 tag 标识供未来集群使用且已验证的 runtime/API。
 
-## C0：创建 `mydocker-cluster`
+## C0：派生 mycluster（`mydocker-cluster` 分支）
 
 **状态：** Not started；该分支不存在。
 
 ### 功能目标
 
-从明确且已经验证的 `mydocker-2.0` tag 或 commit 派生集群项目。
+从满足下述任一分支创建门槛的明确 `mydocker-2.0` tag 或 commit 派生集群项目。
+
+### 分支创建门槛
+
+C0 有两条可审查的进入路径：
+
+1. **发布门槛：** M6 的发布基线和受控优化验收全部通过。
+2. **等效 alpha 门槛：** 经明确、留档的审查批准，并且同一候选
+   commit 同时提供以下证据：
+   - Sandbox/Attempt 生命周期在公共 API 上稳定，状态转换、清理和单活跃
+     Attempt 不变量有自动化测试；
+   - 受支持 Linux 环境上的 namespace 和 cgroup v2 最小路径可用，前置检查与
+     资源限制测试通过；
+   - M4A 的 image/content、M4B 的 snapshot/rootfs 和 M4C 的 Sandbox network
+     最小路径可组合启动 workload；
+   - 本地 API 已版本化，agent 所需操作可全部经由 API/`pkg/client`
+     完成；
+   - daemon restart recovery 和 operation 幂等性有自动化测试，重复请求不会
+     创建重复的活跃 workload；
+   - 已建立可复现的节点本地 baseline，保留候选 commit、场景版本、环境
+     清单、原始结果和失败。
+
+等效 alpha 门槛不要求先完成 M6 的 profiling 或最终性能优化。它只允许派生
+集群分支，不会将未完成的 M5/M6 自动标记为 `Verified`，也不支持发布性能声明。
 
 ### 正确性验收
 
@@ -320,17 +543,18 @@
 
 ### 完成条件
 
-- 达到 M6 发布门槛（或经明确批准、证据等效的 alpha 门槛），只有此后才能创建
-  `mydocker-cluster`。
+- 发布门槛或上述全部等效 alpha 门槛已在候选 commit 上审查并留档；
+  只有此后才能创建 `mydocker-cluster`。
 
-## C1：控制平面基础
+## C1：控制面基础
 
 **状态：** Not started。
 
 ### 功能目标
 
-实现集群 API 服务端、持久存储、controller、agent、Node/Task/Assignment 模型
-和关联上下文。
+实现集群 API 服务端、基于 etcd 的持久状态、controller、agent、
+Node/Task/Assignment 模型和关联上下文。使用 etcd 的事务/watch/lease 边界，
+不自研 Raft，也不复刻完整 Kubernetes API/对象。
 
 ### 正确性验收
 
@@ -399,7 +623,7 @@ agent/controller 重启后从持久状态恢复协调。
 
 ### 完成条件
 
-确定性故障/重试测试套件跨控制平面和本地 API 边界通过。
+确定性故障/重试测试套件跨控制面和本地 API 边界通过。
 
 ## C4：故障恢复
 
@@ -456,7 +680,7 @@ samples 及 trace/profiling 状态。
 
 ## 下一里程碑
 
-M0 达到 Verified 后，只进入 M1：定义最小化的 Sandbox 和 Container Attempt 数据
-模型、生命周期状态机、operation/event 模型、持久化边界，以及带单元测试的
-`create/start/state/kill/delete` 契约。M1 只建立度量点语义，不进行
-任何性能优化。
+M2 实现已落地，但下一个 M2 gate 是在专用一次性环境通过 preflight 后，
+运行并记录 namespace、mount、cgroup v2 与资源强制的特权集成验收。
+在这些证据齐备前，M2 保持 `Implemented`，不能标记为 `Verified`；后续里程碑的
+实现不能代替该 gate。

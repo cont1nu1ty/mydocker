@@ -2,7 +2,10 @@
 
 ## 状态
 
-**Proposed。** M0 只定义契约；尚未实现任何生命周期代码。
+**In progress。** M1 已验证纯领域对象/FSM、一对一与单活跃 Attempt 不变量、结构化
+进程参数、强身份验证端口、operation 幂等性、event、rollback、事务状态边界和两阶段
+生命周期协调器。真实 namespace/cgroup/process、daemon restart、UDS API 与 cold/warm
+harness 分别仍属于 M2-M5，因此本功能整体尚未达到 Verified。
 
 ## 目的
 
@@ -109,7 +112,10 @@ Graceful stop 会发送已配置的 termination signal，等待声明的 grace p
 拥有的资源，然后移除一一对应的 Container/Attempt metadata。此前的 delete 失败会保留
 `stopped` 状态并附带 cleanup condition；使用相同 operation ID 的 retry 或 background
 reconciler 会继续执行 teardown。`GetOperation` 只报告该进度，相互冲突的 operations
-仍然被阻塞。验证资源不存在后重复执行 deletion 会成功。
+仍然被阻塞。M1 协调器返回 operation 级的 stage/result；逐项 rollback progress 保存在
+Store 的 OperationRecord 中。M3 的 v1 API 已投影稳定的 operation identity、target、
+stage/result/reason 和终态，但有意不公开 provider receipt 或逐项 rollback descriptor。
+验证资源不存在后重复执行 deletion 会成功。
 
 `run` 是客户端或 daemon 中的编排，其等价过程为：
 
@@ -135,14 +141,17 @@ workload 退出时，supervisor 会持久化规范的 Attempt outcome，`Contain
 - 带 clock semantics 的 start 和 finish facts；
 - 最后一个 operation/event sequence 和 reason class。
 
-只有捕获 outcome 后，状态才会变为 `stopped`。未知 outcome 是显式 condition，
-不得伪造成成功。
+实际进入过 `running` 的 workload 只有捕获 outcome 后才会变为 `stopped`；未知 outcome
+是显式 condition，不得伪造成成功。启动前删除的 Attempt 使用
+`not_applicable` 表示从未运行，不要求虚构 exit evidence；后续 metadata 删除仍要求
+外部确认其资源已经不存在。
 
 ### 幂等性与重试
 
 | 请求情形 | 契约 |
 | --- | --- |
-| operation ID 相同，operation 已完成 | 返回已存储的结果 |
+| operation ID 相同，operation 已完成且仍在完整 replay window | 返回已存储的结果 |
+| operation ID 相同，但已离开完整 replay window | 返回 typed `operation_expired`；禁止创建新的 intent |
 | operation ID 相同，operation 未完成 | 继续/协调同一 operation |
 | operation ID 相同，请求 fingerprint 不同 | 拒绝误用 idempotency key |
 | operation ID 不同，目标状态已经达到 | 返回当前状态，不产生重复副作用 |
@@ -150,7 +159,7 @@ workload 退出时，supervisor 会持久化规范的 Attempt outcome，`Contain
 | Delete 的目标已经不存在 | 验证不存在后成功 |
 | Kill 的目标已经停止 | 返回 terminal outcome；不向已复用的 PID 发送信号 |
 
-客户端在首次发送前生成 operation ID。服务端在定义明确的 retention period 内持久化其
+客户端在首次发送前生成 operation ID。服务端在定义明确的 retention window 内持久化其
 operation type、target、canonical request fingerprint、stage 和 result。Transport
 retry——包括第一次响应丢失后的 retry——会复用该 ID，不会被视为新的 lifecycle intent。
 `GetOperation` 报告该 record；内容相同的 retry 或 background reconciler 会在它未完成时
@@ -188,7 +197,9 @@ verify Sandbox stopped and zero Container records
 ## 故障与恢复
 
 每个 setup step 都在 rollback stack 中注册一个幂等的 inverse。发生失败时，rollback
-按逆序运行，并同时记录 primary error 和每个 rollback error。成功的 cleanup 必须经过
+必须先封存 stack，并在执行第一个 inverse 前将 `started` 进度与 operation 原子持久化；
+daemon 恢复已封存的 stack 后不得再登记新的 inverse。随后 rollback 按逆序运行，并同时
+记录 primary error 和每个 rollback error。成功的 cleanup 必须经过
 验证；如果仍有 host resource 遗留，则当前 phase 应保留 failure/cleanup condition，
 而不是错误地报告 terminal 或 absent phase。
 
@@ -245,8 +256,11 @@ adapter 才能将外部请求转换为本地 API。当前设计不兼容 CRI。
 
 ## 未决问题
 
-- 首个 supervisor 是为每个 Sandbox 使用一个进程，还是将 shim 与 keeper 分开。
-- 哪种 durable store 能提供 atomic records 和 event ordering。
-- operation-result retention 和 idempotency-key expiry 的确切策略。
-- 默认 termination signal 和 grace-period policy。
-- 历史 Container/Attempt 与 operation/event 的 retention rules。
+- M3 已选择分离的 Sandbox keeper 与长期 init wrapper；M5 是否扩展为可无缝重连的
+  per-Sandbox supervisor，以及重连失败时的最终 orphan policy，仍待真实故障矩阵决定。
+- 当前 FileStore schema v2 提供原子 snapshot、event ordering、最近 `1024` 个终态
+  operation 的精确响应、最多 `65536` 个 identity/tombstone 及最近 `8192` 个 event；
+  达到 identity/envelope 上限后的在线 rollover、归档和运维迁移仍未实现。
+- Kill API/CLI 要求显式 signal、grace period 和 escalation signal，不选择隐式默认值；
+  未来高级策略是否由更上层控制面提供仍待决定。
+- 历史 Container/Attempt 记录与 workload log 的长期 retention、删除、反压和导出策略。

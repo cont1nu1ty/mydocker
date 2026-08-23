@@ -1,21 +1,32 @@
 # mydocker 2.0 架构
 
-**状态：** Proposed。M0 仅定义边界；尚未实现任何 2.0 运行时行为。
+**状态：** In progress。M1 已验证纯领域模型、状态机、operation/event、rollback、
+事务状态边界和两阶段协调契约。M2 已实现 rootful Linux isolation/cgroup v2
+原语、宿主机所有权收据与 provider 契约，并通过纯单元测试、race detector 和
+静态检查；真实 namespace/mount/cgroup/OOM/quota/PID 1 特权集成验收尚未运行。
+M3 已实现 FileStore、engine/shim/provider 编排、带版本的 HTTP/JSON UDS
+API、`pkg/client`、CLI、logs/events、recovery 后台 watcher 和评测工具的
+纯测试基础，状态仍是 `In progress`。生产 `LinuxShimLauncher` 明确返回
+`ErrLauncherIncomplete`，daemon 在 UDS 绑定前失败关闭；因此不声称已有生产
+可运行的容器路径。
 
-本文档是跨功能架构的主要依据。生命周期、隔离、存储/网络、守护进程/API
-以及面向集群的详细行为，分别记录在 [`features/`](features/) 下的对应文档中。
+本文档是跨功能架构的主要依据。生命周期、隔离、镜像与文件系统、网络、
+守护进程/API 以及面向集群的详细行为，分别记录在 [`features/`](features/) 下的
+对应文档中。
 
 ## 1. 目标与非目标
 
 ### 目标
 
-mydocker 2.0 要回答的是：一个 Linux 节点如何以正确、可恢复、可诊断且可度量的
-方式创建并管理容器化工作负载。它将：
+mydocker 2.0 定位为 **Node-local Container Execution Engine（单节点容器执行
+引擎/执行面）**。它要回答的是：一个 Linux 节点如何以正确、可恢复、可诊断且
+可度量的方式，把镜像变成运行中的工作负载并管理其生命周期。它将：
 
 - 将稳定的 Sandbox 与每一次具体的 Container Attempt 分离；
 - 明确生命周期转换和所有权；
 - 使用守护进程而非短生命周期 CLI 作为生命周期权威；
 - 使用 cgroup v2 和父子资源层级；
+- 消费 OCI Image Layout，验证内容并将有序 layer 准备为每个 Attempt 的 rootfs；
 - 持久化带版本的状态，并在重启后将其与宿主机实际状态进行协调；
 - 让部分失败的回滚与重试行为可测试；
 - 暴露版本化本地 API，供未来的节点代理调用；
@@ -35,6 +46,8 @@ mydocker 2.0 要回答的是：一个 Linux 节点如何以正确、可恢复、
 - 并发边车容器、init container 或完整的 Pod 语义；
 - Kubernetes CRI、kubelet 集成或兼容性声明；
 - 完整的 OCI 或 containerd 协议兼容性；
+- Dockerfile/build graph、构建缓存或其他镜像构建能力；
+- 将运行中容器导出为镜像的 `commit`，以及 `push` 或 registry server；
 - rootless 运行；
 - 在所有权和可达性规则设计完成前进行垃圾回收；
 - 在可复现基线定位出真实瓶颈前进行优化。
@@ -50,7 +63,7 @@ flowchart TD
     Daemon --> Engine[engine 编排]
     Engine --> SandboxSvc[Sandbox 服务]
     Engine --> ContainerSvc[Container 服务]
-    Engine --> ImageSvc[镜像 / snapshot 协调]
+    Engine --> ImageSvc[ImageService]
     Engine --> NetworkSvc[Sandbox 网络协调]
     Engine --> Store[版本化状态存储]
     Engine --> Observe[事件 / 日志 / 指标]
@@ -68,6 +81,43 @@ flowchart TD
 依赖通过窄接口指向内层。宿主机相关实现可以依赖 Linux 原语；状态和 engine 包
 依赖接口，而不依赖评测工具或未来的集群类型。
 
+上图是目标全路径。当前 M3 已经把 CLI → UDS server → daemon service → engine
+→ provider 之间的版本、身份、幂等性和恢复边界组合起来，但这条组合只通过
+注入 provider 和临时文件系统测试。真实 shim/keeper/PID 1、hostname/DNS 和
+none/loopback 内核设置都被 fail-closed 生产 launcher 阻断，不能从 typed/fake 契约
+推断它们已被内核执行。
+
+### 镜像到进程的数据路径
+
+外部 builder 生产镜像；mydocker 只消费镜像，并负责从不可变镜像身份到 Linux
+进程之间的节点本地执行路径：
+
+```mermaid
+flowchart LR
+    Builder[外部 Builder] -->|OCI Image| Layout[OCI Image Layout]
+    Layout --> ImageService
+    ImageService --> ContentStore
+    ContentStore --> LayerUnpacker
+    LayerUnpacker --> Snapshotter
+    Snapshotter --> MountManager
+    MountManager --> BundleBuilder
+    BundleBuilder --> Runtime[mydocker-runtime]
+    Runtime --> Process[Linux Process]
+```
+
+这条路径分为两个可独立恢复和度量的阶段：
+
+1. `ImportImage` 将 OCI Image Layout 解析为镜像对象，ContentStore 原子接收并验证
+   manifest、config 和压缩 layer blob，LayerUnpacker 按顺序准备不可变文件系统层；
+2. `CreateContainer` 先以解析后的镜像 digest 确认内容可用，再为新的 Attempt
+   准备可写 snapshot、挂载 rootfs 与嵌套 mounts、生成带版本 bundle，最后把 bundle
+   交给 `mydocker-runtime` 创建受 gate 约束的进程。
+
+镜像引用是可变的用户意图；解析后的 digest 才是执行身份，必须在 Attempt 创建前
+持久化。底层 runtime 只理解 bundle、rootfs、结构化进程参数、mounts、namespaces
+和 cgroup path；它不理解 tag、registry、layer 下载或 image cache。具体对象、API、
+回滚和评测契约见 [image-filesystem.md](features/image-filesystem.md)。
+
 ## 3. 核心领域模型
 
 以下是语义定义，而不是 Go 声明。
@@ -81,6 +131,11 @@ flowchart TD
 | `Container Attempt` | 面向内核的执行子记录，包含进程和执行资源 |
 | `ContainerSpec` | bundle、argv、环境、mounts、rootfs/image，以及解析后强制限制的副本 |
 | `ContainerStatus` | 聚合 phase，以及对其规范 Attempt 结果的原子投影 |
+| `Image` | 用户和 engine 可见的镜像记录，将可变 reference 映射到已验证的 manifest digest |
+| `Content Blob` | 由 digest 标识的不可变 manifest、config 或压缩 layer 内容 |
+| `Unpacked Layer` | 校验并应用 OCI layer/whiteout 语义后发布的不可变文件系统层 |
+| `Snapshot` | 基于不可变镜像层、由单个 Attempt 独享可写层的文件系统状态 |
+| `Bundle` | 由镜像配置、ContainerSpec 覆盖、rootfs、资源与 namespace 配置生成的 runtime 输入 |
 | `Resources` | Sandbox spec 中的值，分别包含 requests、limits 和进程限制 |
 | `Generation` | 权威组件接受的单调递增期望 spec 修订号 |
 | `ObservedGeneration` | 其影响已被协调并报告的最高 generation |
@@ -198,7 +253,9 @@ absent -> creating -> created -> running -> stopped -> absent
 ```
 
 Start 使用 gate：创建过程准备 init 进程，但不允许工作负载运行；start 释放 gate，
-并确认进入 running。报告 `stopped` 前需捕获退出码、signal 和 OOM 证据。
+并确认进入 running。对实际进入过 `running` 的 Attempt，报告 `stopped` 前需捕获退出码、
+signal、OOM 或显式 unknown evidence。启动前删除的 `creating/created -> stopped` 不捏造
+进程结果，而是记录 `not_applicable`；metadata 删除仍须在外部确认资源不存在之后完成。
 
 create 失败仅在所有已获取的 Attempt 资源都完成回滚后才进入 `stopped`；其
 Container/operation 记录保留失败结果，直至 delete。若 gate/init 仍处于可安全重试
@@ -209,6 +266,8 @@ Container/operation 记录保留失败结果，直至 delete。若 gate/init 仍
 
 - 必要时，持久转换要在产生非幂等宿主机副作用前记录意图。
 - 每个建立步骤都在回滚栈上注册其逆操作。
+- 执行第一个逆操作前，必须先封存回滚栈并将 `started` 进度与 operation 原子持久化；
+  恢复后的已封存栈不得再追加逆操作。
 - 回滚按逆序执行、记录每个失败，并且可以安全重试。
 - 客户端在首次发送前生成 operation ID。使用该 ID 和相同规范请求指纹的重复请求，
   会返回/恢复已存储的结果；用不同请求体复用该 ID 会被拒绝。
@@ -231,13 +290,15 @@ Container/operation 记录保留失败结果，直至 delete。若 gate/init 仍
 
 ### Engine
 
-实现用例顺序、状态机守卫、幂等性、回滚栈，以及 runtime、storage、network 和 state
-接口之间的协调。它不会通过 CLI 字符串发出临时拼装的 shell 命令。
+实现用例顺序、状态机守卫、幂等性、回滚栈，以及 image/content/unpack/snapshot/
+mount/bundle、network、runtime 和 state 接口之间的协调。它不会通过 CLI 字符串发出
+临时拼装的 shell 命令。
 
 ### `mydocker-runtime`
 
 理解 bundle、process、namespace、mount、rootfs、cgroup 挂接以及底层生命周期原语。
-它不理解 Task、Node、心跳、调度器、租约、assignment 或集群期望状态。
+它不理解镜像 reference/tag、registry、layer 获取或 image cache，也不理解 Task、Node、
+心跳、调度器、租约、assignment 或集群期望状态。
 
 ### Shim 或 supervisor
 
@@ -250,20 +311,62 @@ status，并在守护进程重启后保持可重连。namespace keeper 由 shim 
 通过幂等操作创建和拆除 Sandbox 范围的 network namespaces、veth/bridge 挂接、
 本地 IP 分配、路由和端口映射。
 
-### 存储与 snapshot
+### ImageService
 
-按 digest 解析内容，准备不可变的下层 rootfs 和每个 Attempt 的可写 snapshot，完成
-挂载，并仅在依赖挂载全部消失后将其拆除。
+拥有用户和 engine 可见的镜像对象、reference 到 digest 的映射以及镜像可用性。
+首版公开操作是 `ImportImage`、`EnsureImage`、`GetImage`、`ListImages` 和
+`RemoveImage`；未来可以按 digest 增加 `PullImage`，但不规划 `BuildImage`、
+`CommitContainer` 或 `PushImage`。
+
+### ContentStore
+
+以 digest 保存并校验不可变 manifest、config 和压缩 layer blob，提供原子写入、
+读取、状态查询和受引用保护的显式删除。它不解析 tag，不创建 snapshot，也不决定
+Attempt 生命周期。
+
+### LayerUnpacker
+
+读取已验证的 layer blob，校验解压内容，按顺序应用 OCI whiteout 语义，并原子发布
+不可变 unpacked layer。它拒绝路径遍历和链接逃逸，不创建 Attempt 可写层或真实 mount。
+
+### Snapshotter
+
+以不可变 image filesystem 为 parent，为每个 Attempt 准备独享的 upper/work 数据，
+并通过 `Prepare`、`Mounts`、`Usage` 和 `Remove` 暴露最小 snapshot 语义。它不理解
+image tag、Task、Sandbox 网络或用户 CLI。
+
+### MountManager
+
+执行并验证 OverlayFS、bind、`/proc` 和 tmpfs 等 mount，处理 read-only rootfs 与
+mount propagation，并按依赖逆序 unmount。daemon 恢复时，它只接管能够证明属于
+mydocker 的 mount。
+
+### BundleBuilder
+
+把 image config、ContainerSpec 覆盖、rootfs mount、资源和 namespace 配置转换为
+带版本且可验证的 bundle。它不下载或解包镜像，也不启动进程。
 
 ### 状态存储
 
 提供原子且带版本的记录，以及 operation/event 排序。它不是未经验证 PID 的缓存。
-M0 有意不决定持久化技术。
+M1 已定义 Store/Tx 接口和仅供确定性单元测试使用的 copy-on-write 内存实现，验证
+schema、CAS、跨记录完整性、operation/rollback/event 原子性和严格事件顺序。M3
+选用单 daemon `FileStore`：它使用独占锁、owner-only 文件、checksum envelope、
+原子替换与文件/父目录同步，成功 Update 后才更新内存可见性；对于 rename
+后持久性不确定的失败，当前实例被 poison，需 close/reopen 后从盘面事实恢复。
+它已覆盖 daemon restart 所需的状态重放纯测试，并使用 schema-v2 的同一原子 snapshot
+完成 count-based operation/event retention 与 compaction。默认保留最近 `1024` 个终态
+operation 的完整响应、最多 `65536` 个完整 identity 或 tombstone、最近 `8192` 个 event；
+启动读取和每次编码另受 `64 MiB` envelope 上限保护。达到 identity 或 envelope 上限时
+在新 intent/commit 前失败关闭。当前尚无在线状态 rollover/归档，因此有界不等于可以
+无限期生产运行。
 
 ### 可观测性
 
-在生命周期边界发出结构化事件、日志和低基数指标。它自身不定义 benchmark
-事实。
+当前已有按 operation/resource 关联的持久 stage events、daemon 结构化日志、
+以及按 Container/Attempt 身份绑定、带 checksum 和 cursor 的 stdout/stderr
+frames。事件和 log cursor 支持有界分页；它们自身不是 benchmark 事实。
+低基数 metrics 仍是后续目标，不得用现有日志/事件推断已实现 Prometheus 契约。
 
 ### 未来的 agent
 
@@ -292,13 +395,19 @@ observed_generation
 ```
 
 `request_id` 关联一次传输请求。客户端在首次发送前创建 `operation_id`；它标识持久
-生命周期意图，即使首次响应丢失及后续发生传输重试也保持不变。服务端在规定的保留
-期内，将其绑定到 operation type、target 和规范请求指纹。一次 operation 会按适用
+生命周期意图，即使首次响应丢失及后续发生传输重试也保持不变。当前服务端
+将其绑定到 operation type、target 和规范请求指纹，并持久 terminal response 用于
+同 ID 重放。一次 operation 会按适用
 情况发出有序的 stage events，例如 `validate`、`persist_intent`、`prepare_rootfs`、
 `attach_cgroup`、`configure_network`、`release_start_gate` 和 `persist_result`。
 
-事件支持恢复、诊断和阶段时长分析，但在实现时必须说明其保留期和持久性
-等级。runtime 元数据中的时间戳记录一个事实；它不会自动成为精确的 benchmark
+事件支持恢复、诊断和阶段时长分析。FileStore 保留连续的 event suffix；空 resume token
+从当前最早可用事件读取，非空 token 落在已清理前缀或超过最新已提交 sequence 时返回
+版本化 `resume_gap`，不会把缺口或 future cursor 伪装成空页。完整终态 operation 超出
+replay window 后转换为保留 type、target、
+fingerprint、reason 和顺序的 ID-digest tombstone；相同 ID 返回 `operation_expired`，
+不会作为新 intent 接受。达到总 identity 上限返回 `resource_exhausted`，需要显式状态
+迁移/轮换。runtime 元数据中的时间戳记录一个事实；它不会自动成为精确的 benchmark
 观测值。
 
 两类计时保持分离。调用方可见的 API 延迟，使用同一评测进程的单调时钟，从发送前
@@ -328,52 +437,72 @@ Prometheus labels 不得包含 `sandbox_id`、`container_id`、`task_id`、
 
 ## 9. 数据目录
 
-计划的宿主机布局：
+推荐的宿主机布局：
 
 ```text
 /var/lib/mydocker/   durable, restart-relevant state
 /run/mydocker/       boot-scoped sockets, locks, pidfds/handles and transient state
 ```
 
-持久数据可以包括带 schema version 的 Sandbox/Container 记录、operation/event 状态、
-内容元数据、snapshots 和持久网络分配。仅运行期的数据可以包括 UDS、进程句柄、
-临时 mount 协调和锁。
+当前 `mydockerd` 不隐式选择这些路径：`--state`、`--runtime-root` 和
+`--socket` 都要求干净的绝对非根路径，`--cgroup-root`、`--shim` 和至少一个
+`--prepared-rootfs ID=/absolute/path` 也必须显式给出。`FileStore` 保存带
+schema version 的 Sandbox/Container/Attempt、operation、rollback 和 event 记录；
+runtime root 存放 owner-bound shim/config/terminal/log artifacts。镜像 content、unpacked layers、
+snapshots 和持久网络分配属于 M4A–M4C，当前并不存在。
 
 守护进程必须容忍 `/run/mydocker` 在重启后消失，并根据持久意图和宿主机观测重建它。
-选定状态存储后，必须明确原子写入/重命名和目录同步要求。Secrets、日志和大体积内容
-在实现前需要明确的所有权与保留规则。
+FileStore 和当前 workload log 已明确文件同步、目录同步、所有者/权限与
+不确定 commit 边界；operation/event 已采用上述固定数量与 gap 规则。secrets、长期
+workload 日志，以及达到 identity/envelope 上限后的在线轮换仍需生产策略。
 
 ## 10. 目标代码与评测布局
 
-以下是目标布局，并非 M0 创建的骨架：
+当前 M1–M3 实际创建的主要布局为：
 
 ```text
+go.mod
+api/runtime/v1/
 cmd/
 ├── mydocker/
 ├── mydockerd/
-├── mydocker-runtime/
 └── mydocker-shim/
 internal/
-├── engine/
-├── sandbox/
-├── container/
-├── runtime/
-├── cgroupv2/
-├── snapshot/
-├── network/
+├── domain/
+├── lifecycle/
+├── operation/
+├── rollback/
 ├── state/
+├── ownership/
+├── cgroupv2/
+├── isolation/
+├── provider/
+├── slim/
+├── shim/
+├── engine/
+├── daemon/
+├── server/
+├── logstore/
 └── observability/
-api/
-└── runtime/v1/
-pkg/
-└── client/
-
+pkg/client/
 evaluation/
-├── scenarios/
-├── workloads/
-├── harness/
-├── results/
-└── profiles/
+├── cmd/mydocker-eval/
+└── scenarios/
+```
+
+其中 `cmd/mydocker-shim`、`internal/slim` 和 provider 编排已有协议/纯测试实现，
+但并不表示生产 Linux launcher 已可以创建它们。以下仍是 M4A–M4C 的目标
+布局，不代表对应组件已经实现或集成：
+
+```text
+internal/
+├── image/
+├── content/
+├── unpack/
+├── snapshot/
+├── mount/
+├── bundle/
+└── network/
 ```
 
 只在有真实实现、测试或实验数据时创建目录。生产代码绝不导入评测工具。评测工具
@@ -389,17 +518,19 @@ evaluation/
 | 阶段 | 实际 ref | 规则 |
 | --- | --- | --- |
 | Legacy 教程版 | `origin/legacy/v1`、`v0.1.0-legacy` | 冻结的参考版本；不进行 2.0 开发 |
-| 2.0 runtime/engine | 从现有空 `main` 根创建的 `mydocker-2.0` | 单节点代码、API、可靠性、评测 |
-| 集群 | 未来的 `mydocker-cluster` | 仅从已验证的 2.0 tag/commit 派生 |
+| 2.0 单节点执行引擎 | 从现有空 `main` 根创建的 `mydocker-2.0` | 单节点代码、API、可靠性、评测 |
+| mycluster 控制面 | 未来的 `mydocker-cluster` 分支 | 仅从已验证的 2.0 tag/commit 派生 |
 
 原始方案把 Legacy 分支称为 `master`，但此仓库没有 `master`。`main` 是用于 2.0
 初始化的独立空根，并不是 Legacy commit。M0 不虚构或重命名分支，不合并无关
 的根，不重写历史、不推送 refs，也不改变远端默认分支。
 
-创建集群需要稳定的 Sandbox 和 Container 生命周期、版本化本地 API、经过测试的
-守护进程恢复、已记录的 runtime 基线，以及明确的 alpha tag 或 commit。runtime 修复
-必须先落到 `mydocker-2.0` 并通过验证；仅限集群的控制器/调度器变更留在集群
-中。API 变更在 2.0 中设计。
+创建集群分支必须满足 [roadmap.md](roadmap.md) 的 C0 发布门槛或完整等效 alpha
+门槛。等效 alpha 证据包括稳定的 Sandbox/Attempt 生命周期、可用的
+namespace/cgroup v2 与 image/snapshot/network 最小路径、版本化本地 API、经过测试的
+daemon recovery/operation 幂等性，以及可复现的节点本地 baseline；它不强制先完成
+M6 的最终性能优化。runtime 修复必须先落到 `mydocker-2.0` 并通过验证；仅限集群的
+控制器/调度器变更留在集群中。API 变更在 2.0 中设计。
 
 每个集群结果都记录其准确的 mydocker 基础 commit。不同分支、机器、kernel 或场景的
 结果，若未经受控实验且未明确列出差异，不得声称可比。
@@ -418,6 +549,8 @@ evaluation/
 | D8 | 目前不实现 CRI | 借鉴资源模型不意味着协议兼容 |
 | D9 | 评测优先，而非优化优先 | 先定义边界、验证行为、建立基线、分析性能剖析数据，再优化 |
 | D10 | 测试类别保持分离 | 正确性、benchmark、压力、故障和 profiling 证据不可互换 |
+| D11 | 镜像消费属于单节点执行面 | OCI image 必须经过 content、unpack、snapshot、mount 和 bundle 边界后才进入 runtime |
+| D12 | 镜像生产不属于 2.0 核心范围 | 不实现 Dockerfile build、container commit、push 或 registry server |
 
 这些决策集中保留在此处，而不拆分成独立 ADR 文件。未来的变更需要同时更新此表，
 以及归属该变更的 feature/evaluation 契约。

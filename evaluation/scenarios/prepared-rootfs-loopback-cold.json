@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "name": "prepared-rootfs-loopback-lifecycle",
+  "version": "v1",
+  "classification": "cold",
+  "samples": 1,
+  "concurrency": 1,
+  "rootfs": "prepared-rootfs-baseline-v1",
+  "sandbox": {
+    "labels": {
+      "evaluation.myDocker/scenario": "prepared-rootfs-loopback-cold-v1"
+    },
+    "network": {
+      "mode": "loopback"
+    },
+    "resources": {
+      "requests": {},
+      "limits": {}
+    }
+  },
+  "process": {
+    "argv": [
+      "/bin/sleep",
+      "30"
+    ]
+  },
+  "kill_policy": {
+    "signal": "SIGTERM",
+    "grace_period_ns": 2000000000,
+    "escalation_signal": "SIGKILL"
+  },
+  "environment": {
+    "id": "replace-with-environment-id",
+    "cache": {
+      "content": "unknown",
+      "unpacked_chain": "unknown",
+      "snapshot": "new-per-attempt",
+      "page_cache": "unknown",
+      "immutable_layers": "unknown"
+    },
+    "background_noise": "unknown",
+    "warmup": "none",
+    "labels": {
+      "privilege_profile": "replace-before-run",
+      "result_kind": "raw-baseline"
+    }
+  }
+}

@@ -1,7 +1,12 @@
 # 评测契约
 
-**状态：** Proposed。M0 只定义未来行为和测量应如何验证；当前没有
-benchmark 结果、harness、场景实现、profile 或性能结论。
+**状态：** In progress。M3 已实现只通过版本化公共 API 工作的 `mydocker-eval`
+harness、cold/warm prepared-rootfs 场景、调用方单调时钟跨度、daemon stage-event
+关联、失败后清理尝试和逐行 JSONL 原始证据。当前仍没有真实 rootful benchmark
+运行、结果、profile 或性能结论；纯 Go 单元测试不能替代这些证据。
+生产 `LinuxShimLauncher` 仍返回 `ErrLauncherIncomplete`，使 `mydockerd` 在绑定 UDS
+之前失败关闭；因此 harness 命令和已签入场景当前是已测试的接口/证据
+生成契约，不是可立即执行的生产 benchmark 流程。
 
 本文档是项目关于正确性、可靠性、测量和性能证据的主要契约。架构定义见
 [`docs/architecture.md`](../docs/architecture.md)，功能验收条件见
@@ -18,8 +23,9 @@ benchmark 结果、harness、场景实现、profile 或性能结论。
 - 用于解释已测瓶颈的 profiling 产物；
 - 人类可读的摘要和机器可读的原始结果。
 
-M0 只创建本 README。只有出现真实、可评审的内容时，才创建 scenario、
-workload、harness、result 和 profile 目录。
+当前实现位于 [`cmd/mydocker-eval`](cmd/mydocker-eval)，已签入的严格输入位于
+[`scenarios/`](scenarios/)。尚未产生真实实验时不创建或提交伪造的 `results/`、
+workload 或 profile 产物；M1/M2/M3 的组件正确性测试仍位于对应 Go package。
 
 证据形成顺序是：
 
@@ -36,6 +42,49 @@ workload、harness、result 和 profile 目录。
 ```
 
 正确性和可靠性的优先级高于好看的性能数字。
+
+### 当前 M3 harness 的用法与边界
+
+在隔离的一次性 Linux/VM 中完成 runtime preflight、启动可用的 `mydockerd`，并将场景中
+所有 `replace-*` 与 `unknown` 环境字段替换为本次实验的真实事实后，调用示例如下：
+这些是未来 launcher 完成且 rootful 正确性验收通过后的前置条件；当前仓库尚不满足。
+
+```text
+go run ./evaluation/cmd/mydocker-eval \
+  --socket /run/mydocker/mydockerd.sock \
+  --scenario evaluation/scenarios/prepared-rootfs-loopback-cold.json \
+  --experiment-id <stable-experiment-id> \
+  --output <new-result.jsonl>
+```
+
+`--output` 文件以 `0600`、不可覆盖方式新建；每条记录立即编码，运行结束必须成功
+同步文件和父目录并关闭两者，任一失败都会使命令失败。`--output -` 是非持久流，flush、关闭和
+持久性由下游接收方负责。Harness 在执行任何生命周期副作用之前捕获 event stream
+起点，完成后只分页读取该起点之后且属于本次 operation ID 的事件。
+FileStore 默认只保留最近 `8192` 个 event；若样本读取返回 `resume_gap`，该样本缺少完整
+阶段证据，必须作为失败原样保留，不能在同一样本中用空 token 重置后仍宣称测量完整。
+空 token 仅适合显式开始新的观察窗口。
+
+每个成功样本同时保留逐 API `caller_span` 和一个不可拆分的 E2E `caller_span`：
+
+- cold 使用 `cold.create_sandbox_to_running`，从发送 `CreateSandbox` 前到
+  `StartContainer` 响应明确投影 `Running`；
+- warm 使用 `warm.create_container_to_running`，从已有 Ready Sandbox 中发送
+  `CreateContainer` 前到明确投影 `Running`；
+- E2E 记录的 `operation_ids` 按请求顺序关联组成该跨度的多个 durable operation；
+  daemon stage-event duration 仍单独记录，不能与调用方时间相减或混为一项。
+
+Sandbox/Container ID 和 create operation ID 都在第一次发送前产生。Create 或 Start
+返回失败并不能证明服务端没有部分持久化，因此 harness 仍会用已知资源 ID 依次尝试
+Kill/Delete/Stop；这些清理各自使用新的幂等 operation ID。若原 operation 尚 active，
+清理可能返回冲突；该失败会保留在 JSONL 且命令非零退出，不能把它解释为清理完成。
+
+每条记录携带同一份运行前环境快照：commit/build 设置、工作树状态和有界摘要、kernel、
+cgroup v2 路径与 controllers、CPU、memory、结果文件所在 storage、显式 cache 声明、
+concurrency、实验开始时间和 timezone。Harness 只读采集 Git/procfs/sysfs；无法读取或
+无法可靠推断的字段写为 `unknown`，不会以空值冒充事实。Cache/content/snapshot 字段是
+场景声明而非 harness 独立验证；签入场景中的 `unknown` 必须在正式 benchmark 前按真实
+preflight 证据更新，否则该运行只能归类为调试记录。
 
 ## 2. 评测分类
 
@@ -86,12 +135,13 @@ CreateContainer 请求被接受
 -> Container Attempt Created 得到确认
 ```
 
-包括场景所需的 image/snapshot/rootfs 准备、嵌套 mount、子 cgroup、
-init/start gate 准备和必要持久化。不包括释放 start gate 以及确认用户 workload
-进入 Running。
+包括本地 `EnsureImage` 可用性检查、snapshot/rootfs 准备、嵌套 mount、子 cgroup、
+init/start gate 准备和必要持久化。不包括 `ImportImage` 或可选 `PullImage` 等显式
+acquisition operation，也不包括释放 start gate 以及确认用户 workload 进入 Running。
 
-每份结果都要说明 image content/layer 是缺失（cold content path）还是已经存在，
-因为这会改变“创建”的含义。
+成功样本必须以已验证的 content blob 和 unpacked chain 可用为前置条件，并记录它们、
+page cache 和 immutable-layer cache 的状态。内容缺失或损坏属于失败样本，必须保留对应
+错误；不能把隐式导入/pull 混入 `CreateContainer` latency。
 
 #### Container 启动延迟
 
@@ -113,8 +163,8 @@ StartContainer 请求被接受
 
 该调用方可见 E2E 跨度由 harness 持有：在第一次发送 `CreateSandbox` 前一刻
 开始，在同一进程收到或观察到 Running 确认时结束。Daemon 操作/阶段耗时单独
-报告。结果必须声明 image/rootfs cache 状态和网络 cold/warm 状态，不能让
-`cold` 保持隐含。
+报告。结果必须声明已验证 content/unpacked chain、page cache、rootfs/snapshot 和网络
+的 cold/warm 状态；`cold` 不能表示“镜像缺失”，也不能保持隐含。
 
 #### Sandbox 内 warm Attempt 重启延迟
 
@@ -177,7 +227,49 @@ CreateContainer
 噪声很大的减法。必须明确内存指标（`RSS`、`PSS`、cgroup current 或其他定义）
 和纳入哪些进程；同时记录 cache warm-up 和异步清理等待时间。
 
-### 文件系统
+### 镜像与文件系统
+
+#### 准备阶段指标
+
+以下名称是 benchmark 原始结果 schema 中的逻辑指标，不是已承诺的
+Prometheus metric 名。每个 duration 样本必须记录单位、计时族、精确边界、
+operation ID 关联和 cold/warm 状态：
+
+| 逻辑指标 | 精确边界或计算 | 默认证据渠道 |
+| --- | --- | --- |
+| `image_import_duration` | daemon 接受 `ImportImage` 到经校验的 content、unpacked chain 和 Image 记录原子可用；它是总操作耗时，其中的 digest/unpack 子阶段另报 | harness 收集 daemon 单调操作耗时；另报调用方 `image_import_api_latency` |
+| `digest_verification_duration` | 开始流式读取 manifest/config/layer blob 并计算 descriptor digest，到大小/digest 全部确认；解压后 diffID 验证归入 unpack 阶段 | harness 收集同一 daemon 进程发出的阶段 duration |
+| `layer_unpack_duration` | 从读取已验证的压缩 layer 到按顺序应用、校验 diffID 并原子发布不可变 unpacked chain | harness 收集 daemon 阶段 duration |
+| `snapshot_prepare_duration` | `Snapshotter.Prepare` 开始到 lower/upper/work 资源与持久意图就绪；不包含真实 OverlayFS mount | harness 收集 daemon 阶段 duration |
+| `overlay_mount_duration` | 发起受管 OverlayFS mount 到 mountinfo/所有权验证通过 | harness 收集 daemon 阶段 duration |
+| `bundle_prepare_duration` | 已验证 rootfs mount 就绪到 bundle/config 原子发布并可供低层 runtime 消费 | harness 收集 daemon 阶段 duration |
+| `content_dedup_ratio` | 对固定镜像集合计算 `1 - unique_stored_blob_bytes / logical_referenced_blob_bytes`；必须声明压缩/表观字节口径，逻辑字节为零时样本无效 | harness 在受控导入前后根据 content inventory 计算 |
+| `unpacked_disk_usage` | 固定 unpacked chain 发布后的 apparent 与 allocated bytes；分别报告，并声明共享层去重口径 | harness 采集受管路径的资源 inventory |
+
+`image_import_duration` 包含它的 digest verification 和 layer unpack 子阶段，
+因此总操作与子阶段不得当作独立样本相加。Snapshot、mount 和 bundle 是
+Container create 中的后续阶段，不得与 image import 隐式合并。Harness 不能用
+客户端时钟减去 daemon 事件时间戳；它应当保留 daemon 在同一进程中
+计算的 monotonic duration。
+
+`cold`/`warm` 不能只记为一个模糊布尔值。镜像/文件系统样本至少分别记录
+content blob 存在性、unpacked chain 存在性、snapshot 新建或同一 operation 幂等恢复、
+mount 状态和 page-cache 策略。每个新 Attempt 必须创建独享的 writable snapshot、
+merged mount 和 bundle；跨 Attempt 只能复用不可变 content/unpacked layers 与允许的
+缓存。只有这些维度相同时，才能直接比较对应阶段。
+
+#### Benchmark harness 与 Prometheus 的职责
+
+| 渠道 | 职责 | 不应承载 |
+| --- | --- | --- |
+| Benchmark harness | 保留上述全部逻辑指标的逐样本原始值、失败、阶段关联、content/snapshot/cache 状态及资源 inventory；计算 dedup 与 disk usage | 在未同时保留场景、环境和原始样本时作出性能结论 |
+| Prometheus | 运行期低基数的 operation total/error，以及经基数测试的粗粒度 duration histogram；label 只能使用有限的 operation/stage/outcome 集合 | 单样本 ID、image digest、path、完整 error、cache key、dedup inventory 或精确磁盘扫描 |
+
+正式 benchmark 的规范证据源是 harness 原始结果，不是 Prometheus 抓取值。
+Prometheus 可以验证线上可观测性和辅助定位异常，但不要求将上述每个阶段
+和高基数上下文都转成常驻时序列。
+
+#### 文件系统工作负载
 
 计划测量：
 
@@ -210,7 +302,7 @@ Page cache 状态和破坏性 cache-control 操作只能在隔离 benchmark 主�
 可靠性统计必须包含失败。若不同时报告 rollback 是否正确，单独的 rollback
 duration 没有意义。
 
-## 4. 未来 mydocker-cluster 指标
+## 4. 未来 mycluster 指标（`mydocker-cluster` 分支）
 
 在 cluster 分支存在前，所有 cluster 测量都保持 `Planned`。
 
@@ -246,15 +338,19 @@ SubmitTask 被接受
 -> 已调度
 -> Assignment 已送达
 -> agent 开始 reconcile
+-> image digest 可用（预加载检查或可选 acquisition）
 -> Sandbox Ready
+-> snapshot/rootfs/bundle 已准备
 -> Container Running
 -> controller 观察到 Running 状态
 ```
 
 端到端评测工具遵循上述单一观察者规则：从发送 `Submit` 前一刻到
 观察到相关 `Running` 状态。必须同时报告观察者跨度和组件内部耗时，
-绝不能相减远端时间戳。节点本地的 Sandbox/Container 延迟必须与调度、
-状态存储/RPC、投递和状态观测延迟分开。
+绝不能相减远端时间戳。control-plane、image acquisition、snapshot preparation 和
+runtime startup 延迟必须分别报告；节点本地阶段也必须与调度、状态存储/RPC、投递
+和状态观测延迟分开。SubmitTask-to-Running 可以保留为总边界，但不能把可选 image
+pull 隐藏在这一个不透明数字中。
 
 ### 故障与恢复
 
@@ -272,13 +368,20 @@ SubmitTask 被接受
 
 ## 5. 标准场景
 
-下列名称及其数字后缀是未来配置，不是已完成结果。
+当前签入并通过纯 fake correctness 测试的输入是
+`prepared-rootfs-loopback-cold.json` 与 `prepared-rootfs-loopback-warm.json`；
+这表示场景/harness 代码存在，不表示真实 kernel 场景已运行或测量。下列名称及其
+数字后缀仍是未来配置，不是已完成结果。
 
 ### mydocker
 
 ```text
 cold-sandbox-start
 warm-attempt-restart
+oci-layout-import
+layer-unpack-cold-warm
+content-dedup
+snapshot-stage-breakdown
 concurrent-start-1
 concurrent-start-10
 concurrent-start-50
@@ -296,7 +399,7 @@ daemon-restart-recovery
 timeout 语义、并发度、cold/warm 状态和记录指标。数字后缀只是请求的迭代/并发
 配置，不证明项目已完成该规模测试。
 
-### 未来 mydocker-cluster
+### 未来 mycluster（`mydocker-cluster` 分支）
 
 ```text
 scheduler-10-nodes
@@ -338,6 +441,9 @@ storage device/model and relevant cache policy
 cgroup mode, delegated root and enabled controllers
 network mode, NIC/virtualization and relevant firewall backend
 rootfs/image digest
+OCI Image Layout digest/checksum and source byte accounting
+content present/missing state and unpacked-chain state
+snapshot/mount reuse state and page-cache state
 Sandbox configuration
 Container/Task resource requests and limits
 daemon, supervisor and cluster configuration
@@ -357,12 +463,12 @@ raw result location and checksum/reference
 
 ## 7. 结果格式与状态
 
-未来每次正式实验都保存：
+当前 M3 harness 先生成不可覆盖的逐行 JSONL 原始观察；每次正式实验还必须保存：
 
 ```text
 人类可读摘要（README.md 或 summary.md）
 +
-机器可读原始观察（results.json 或 results.csv）
+机器可读原始观察（当前为 result.jsonl）
 +
 环境清单或其引用
 ```
@@ -374,7 +480,8 @@ raw result location and checksum/reference
 
 - 实验、场景和环境标识；
 - commit SHA 和工作树脏状态；
-- 指标名、计时族、精确边界/时钟、单位和样本数；
+- 指标名、采集渠道（harness、daemon stage event 或 Prometheus）、计时族、
+  精确边界/时钟、单位和样本数；
 - warm-up 样本排除规则；
 - 最小值/最大值和适用的中心统计量；
 - 当样本量和指标适用时的 P50/P95/P99；
@@ -382,7 +489,7 @@ raw result location and checksum/reference
 - 带解释的离群值处理；
 - 结论、局限和是否具备可比性。
 
-M0 不得创建虚假样例结果。Roadmap 跟踪只使用 `Not started`、`In progress`、
+不得创建虚假样例结果。Roadmap 跟踪只使用 `Not started`、`In progress`、
 `Implemented`、`Measured` 和 `Verified`；设计文本可以使用 `Proposed` 或
 `Planned`。`Implemented`、`Measured` 和 `Verified` 不是同义词。
 
