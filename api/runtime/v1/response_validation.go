@@ -545,7 +545,7 @@ func (e Event) Validate() error {
 	if e.OccurredAt.IsZero() {
 		return errors.New("event occurrence time must not be zero")
 	}
-	if e.DurationNanoseconds < 0 {
+	if e.DurationNanoseconds != nil && *e.DurationNanoseconds < 0 {
 		return errors.New("event duration must not be negative")
 	}
 	if e.ObservedGeneration > e.Generation {

@@ -3,6 +3,7 @@ package v1
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -102,6 +103,12 @@ func TestResponseValidationRejectsZeroIdentityPhaseGenerationAndTarget(t *testin
 			event.ObservedGeneration = 2
 			return event.Validate()
 		}},
+		{name: "negative event duration", validate: func() error {
+			event := validResponseEvent(1)
+			duration := int64(-1)
+			event.DurationNanoseconds = &duration
+			return event.Validate()
+		}},
 		{name: "event token", validate: func() error {
 			event := validResponseEvent(2)
 			return (EventListResponse{Events: []Event{event}, NextResumeToken: NewResumeToken(1)}).Validate()
@@ -157,6 +164,27 @@ func TestResponseValidationRejectsZeroIdentityPhaseGenerationAndTarget(t *testin
 				t.Fatal("Validate() error = nil, want semantic rejection")
 			}
 		})
+	}
+}
+
+// TestEventDurationJSONDistinguishesMissingAndZero verifies v1 omits unavailable timing evidence while preserving a real measured zero sample.
+func TestEventDurationJSONDistinguishesMissingAndZero(t *testing.T) {
+	event := validResponseEvent(1)
+	missing, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("json.Marshal(missing) error = %v", err)
+	}
+	if strings.Contains(string(missing), `"duration_ns"`) {
+		t.Fatalf("missing duration JSON = %s, want field omitted", missing)
+	}
+	zero := int64(0)
+	event.DurationNanoseconds = &zero
+	measured, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("json.Marshal(zero) error = %v", err)
+	}
+	if !strings.Contains(string(measured), `"duration_ns":0`) {
+		t.Fatalf("measured zero duration JSON = %s, want explicit zero", measured)
 	}
 }
 

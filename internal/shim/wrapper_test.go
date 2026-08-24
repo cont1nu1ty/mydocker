@@ -179,8 +179,7 @@ func (child *fakeChild) Wait() (ChildExitEvidence, error) {
 // SignalVerified records a signal and returns evidence bound to this exact fake child identity.
 func (child *fakeChild) SignalVerified(signal Signal) (SignalDelivery, error) {
 	child.signals.Add(1)
-	digest := bytesDigest([]byte(child.identity.EvidenceSHA256 + string(signal)))
-	return SignalDelivery{Identity: child.identity, Signal: signal, Delivered: true, EvidenceSHA256: digest}, nil
+	return SignalDelivery{Identity: child.identity, Signal: signal, Delivered: true}, nil
 }
 
 // TestConcurrentReleaseStartsOneChild verifies that concurrent gate release has exactly one winner and one child start.
@@ -233,6 +232,14 @@ func TestConcurrentReleaseStartsOneChild(t *testing.T) {
 	if delivery.Identity != child.identity || child.signals.Load() != 1 {
 		t.Fatalf("signal was not bound to fake child: %+v", delivery)
 	}
+	if err := delivery.Validate(); err != nil {
+		t.Fatalf("SignalDelivery.Validate() error = %v", err)
+	}
+	tamperedDelivery := delivery
+	tamperedDelivery.DeliveredAt = tamperedDelivery.DeliveredAt.Add(time.Nanosecond)
+	if err := tamperedDelivery.Validate(); err == nil {
+		t.Fatal("SignalDelivery.Validate() accepted a timestamp not bound by its evidence")
+	}
 	child.exit <- successfulExit(child.identity, 7, domain.EvidenceFalse)
 	terminal := waitForState(t, wrapper, StateTerminal)
 	if terminal.Terminal == nil || terminal.Terminal.Outcome.ExitCode == nil || *terminal.Terminal.Outcome.ExitCode != 7 {
@@ -240,6 +247,45 @@ func TestConcurrentReleaseStartsOneChild(t *testing.T) {
 	}
 	if store.commits != 1 {
 		t.Fatalf("terminal commits=%d, want 1", store.commits)
+	}
+}
+
+// TestUnconfirmedDescendantCleanupBlocksTerminal verifies an unexpected PID1
+// reap failure remains non-terminal and cannot authorize later signal delivery.
+func TestUnconfirmedDescendantCleanupBlocksTerminal(t *testing.T) {
+	child := newFakeChild()
+	child.waitErr = errDescendantCleanupUnconfirmed
+	store := &memoryTerminalStore{}
+	wrapper, err := NewInit(
+		testInitSpec(t, "op-reap-unknown", "container-reap-unknown", "attempt-reap-unknown"),
+		InitDependencies{
+			Runner: &fakeRunner{child: child}, Stdout: io.Discard, Stderr: io.Discard,
+			Terminal: store, Clock: fixedClock{now: testTime()},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wrapper.Release(); err != nil {
+		t.Fatalf("Release() error = %v", err)
+	}
+	child.exit <- successfulExit(child.identity, 0, domain.EvidenceFalse)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, inspectErr := wrapper.Inspect()
+		if IsCode(inspectErr, CodeUnavailable) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Inspect() never exposed unconfirmed descendant cleanup: %v", inspectErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if store.commits != 0 {
+		t.Fatalf("terminal commits = %d, want 0 while process-tree quiescence is unknown", store.commits)
+	}
+	if _, err := wrapper.ForwardSignal(SignalTERM); !IsCode(err, CodeNotRunning) {
+		t.Fatalf("ForwardSignal() error = %v, want not_running after direct child exit", err)
 	}
 }
 

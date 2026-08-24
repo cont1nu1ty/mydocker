@@ -35,6 +35,8 @@ var (
 	ErrReadUnavailable = errors.New("workload log committed read boundary is unavailable")
 	// ErrInvalidLimit reports a negative Read page limit.
 	ErrInvalidLimit = errors.New("workload log read limit must not be negative")
+	// ErrCursorGap reports a non-zero read cursor beyond the last committed frame in the opened Attempt log.
+	ErrCursorGap = errors.New("workload log cursor is outside the committed stream")
 	// ErrInUse reports that another Store currently owns the same log file.
 	ErrInUse = errors.New("workload log is already open")
 	// ErrNotFound reports that no log file exists at an internally resolved Attempt location.
@@ -75,6 +77,25 @@ func (stream Stream) Valid() bool {
 
 // Cursor is the strictly increasing position shared by both streams in one Attempt log.
 type Cursor uint64
+
+// CursorGapError carries the requested and last committed positions for internal diagnostics while API mapping exposes a stable resume-gap category.
+type CursorGapError struct {
+	Requested     Cursor
+	LastAvailable Cursor
+}
+
+// Error describes a cursor ahead of the committed log without changing its stable sentinel classification.
+func (err *CursorGapError) Error() string {
+	if err == nil {
+		return ErrCursorGap.Error()
+	}
+	return fmt.Sprintf("workload log cursor %d exceeds last committed cursor %d", err.Requested, err.LastAvailable)
+}
+
+// Is lets errors.Is classify every future committed-log position as ErrCursorGap.
+func (err *CursorGapError) Is(target error) bool {
+	return target == ErrCursorGap
+}
 
 // Frame is one durable workload-output append with global and per-stream ordering evidence.
 type Frame struct {

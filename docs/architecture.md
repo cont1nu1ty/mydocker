@@ -6,9 +6,10 @@
 静态检查；真实 namespace/mount/cgroup/OOM/quota/PID 1 特权集成验收尚未运行。
 M3 已实现 FileStore、engine/shim/provider 编排、带版本的 HTTP/JSON UDS
 API、`pkg/client`、CLI、logs/events、recovery 后台 watcher 和评测工具的
-纯测试基础，状态仍是 `In progress`。生产 `LinuxShimLauncher` 明确返回
-`ErrLauncherIncomplete`，daemon 在 UDS 绑定前失败关闭；因此不声称已有生产
-可运行的容器路径。
+纯测试基础，状态仍是 `In progress`。生产 `LinuxShimLauncher` 已编码持久 launch
+intent、cgroup-at-fork、pidfd、namespace reattach、keeper/init bootstrap 与作用时
+校验，但尚未在一次性 rootful VM 中完成真实内核和 daemon restart 验收；因此不声称
+已有经过验证的生产容器路径。
 
 本文档是跨功能架构的主要依据。生命周期、隔离、镜像与文件系统、网络、
 守护进程/API 以及面向集群的详细行为，分别记录在 [`features/`](features/) 下的
@@ -57,37 +58,100 @@ mydocker 2.0 定位为 **Node-local Container Execution Engine（单节点容器
 
 ## 2. 组件模型
 
+这里必须先区分四种不同概念。**进程边界**说明谁可以独立启动、崩溃和重启；
+**Go package** 只是同一进程内的代码依赖边界；**领域对象**是被持久化和操作的事实；
+**未来能力边界**则只描述职责，不代表仓库中已经存在同名进程或目录。按功能拆分
+`internal/` package 与按 `dockerd`、`containerd`、`runc` 拆分进程是两个正交问题，
+不能从目录名推断进程拓扑。
+
+### 当前 M3 的进程拓扑
+
+```mermaid
+flowchart LR
+    User[用户] --> CLI[进程：mydocker CLI]
+    Eval[进程：mydocker-eval]
+
+    subgraph DaemonProcess[进程：mydockerd]
+        API[internal/server + internal/daemon<br/>传输与 DTO 适配]
+        Engine[internal/engine<br/>生命周期编排]
+        Store[FileStore<br/>持久权威事实]
+        Providers[provider + slim + isolation + cgroupv2<br/>宿主机动作适配]
+        API --> Engine
+        Engine <--> Store
+        Engine --> Providers
+    end
+
+    CLI -->|版本化 HTTP/JSON over UDS| API
+    Eval -->|通过 pkg/client 直接访问 UDS| API
+    Providers -->|启动、校验、控制| Keeper[进程：mydocker-shim<br/>keeper 模式，每个 Sandbox 一个]
+    Providers -->|启动、校验、控制| Init[进程：mydocker-shim<br/>init/PID 1 模式，每个 Attempt 一个]
+    Keeper --> SharedNS[Sandbox 的 UTS / IPC / network namespaces]
+    Init --> AttemptResources[Attempt 的 PID / mount / prepared-rootfs 视图 / 子 cgroup]
+    Init --> Workload[用户 workload 进程树]
+    Agent[未来的 mydocker-agent] -.->|只调用同一版本化 API| API
+```
+
+图中的方框不都对应目录，也不都对应进程。当前关键名称的准确含义如下：
+
+| 名称 | 当前类型 | 当前职责 | 明确不是什么 |
+| --- | --- | --- | --- |
+| `mydockerd` | 常驻可执行进程 | 暴露本地 API，持有权威状态，驱动恢复、串行化生命周期并管理 shim | 不是某个单纯的“daemon 功能目录” |
+| `internal/engine` | `mydockerd` 内的 Go package | 按状态机编排 provider、checkpoint、幂等重放、回滚与恢复 | 不是独立 daemon，也没有自己的 socket/PID |
+| `mydocker-shim` | 独立可执行进程 | keeper 模式维持 Sandbox 共享 namespace；init 模式作为 Attempt 的 PID 1 wrapper，控制 gate、监督并回收 workload 进程树、保存终态 | 不是 API 权威来源，也不决定全局状态转换 |
+| `mydocker-eval` | 独立评测进程 | 通过 `pkg/client` 和公共 UDS API 执行受控场景，定义 sample 边界并保存原始证据 | 不是 daemon、provider、runtime 层或生命周期权威，也不导入 `internal/` 实现 |
+| `mydocker-runtime` | 目标职责名称 | 表示 bundle 到 Linux process 的低层能力边界 | **当前没有** `cmd/mydocker-runtime` 二进制；不能按已实现组件描述 |
+| `Container Attempt` | 持久领域对象 | 表示稳定 Sandbox 中某一次不可变执行实例；当前拥有进程、PID/mount 视图、子 cgroup、日志、outcome 与 prepared-rootfs mount receipt，M4+ 才拥有独享 snapshot | 不是进程、服务、package 或目录；其执行载体才是 init shim 与 workload |
+
+当前 `mydockerd` 同时承载了 Docker 体系中 `dockerd` 的节点 API/策略职责，以及
+`containerd` 的一部分状态、任务编排和 shim 管理职责；项目规模尚不足以证明再拆一个
+常驻 daemon 更正确。`mydocker-shim` 最接近 `containerd-shim`。`runc` 对应的是低层
+进程创建职责：M3 已实现的子集由 `internal/slim`、`internal/isolation`、
+`internal/cgroupv2` 与 shim 协作承担，M4+ 才加入完整 bundle 输入；当前没有独立的
+短生命周期 runtime 进程。未来只有在安全隔离、升级边界或独立兼容性确实需要时，才考虑
+把这部分收敛成一个 `mydocker-runtime`/OCI runtime 风格的二进制；`engine` 和公开 API
+不应因此改变语义。
+
+因此，这些映射只是职责类比，并非兼容性声明，也不是一比一复刻：
+
+| Docker/containerd 体系 | 典型职责 | mydocker 当前对应物 |
+| --- | --- | --- |
+| `docker` CLI | 将用户请求发给 daemon，本身不持有 detached workload | `cmd/mydocker` |
+| `dockerd` | 对外 API、节点策略和高层资源编排 | `cmd/mydockerd` 的 API、策略和资源权威职责 |
+| `containerd` daemon | 管理 content/snapshot/task 生命周期并协调 shim | 暂未单独拆进程；M3 的状态、任务编排和 shim 管理位于 `mydockerd` 内，content/snapshot 是 M4+ 目标 |
+| `containerd-shim` | 在上层 daemon 重启或退出边界之外保持并监督具体 task | `cmd/mydocker-shim` 的 keeper/init 两种模式 |
+| `runc` | 以 OCI bundle 创建 Linux 进程后退出的低层 runtime | 暂无独立二进制；M3 已实现的低层子集由 slim/isolation/cgroupv2/shim 组合承担，完整 bundle 输入是 M4+ 目标 |
+| container/task execution | 被管理的执行实例及其进程 | `Container`/`Container Attempt` 领域记录及其 init shim/workload |
+
+### 目标功能边界，而非目标进程清单
+
+M4+ 会增加 image/content/unpack/snapshot/mount/bundle/network 能力。下面的图按职责
+分层，方框可以先是 `mydockerd` 内的 package；除非后续决策明确说明，否则它们不表示
+需要新增同名 daemon：
+
 ```mermaid
 flowchart TD
-    CLI[mydocker CLI] -->|UDS、版本化本地 API| Daemon[mydockerd]
-    Daemon --> Engine[engine 编排]
-    Engine --> SandboxSvc[Sandbox 服务]
-    Engine --> ContainerSvc[Container 服务]
+    API[版本化本地 API] --> Engine[engine 用例编排]
     Engine --> ImageSvc[ImageService]
     Engine --> NetworkSvc[Sandbox 网络协调]
     Engine --> Store[版本化状态存储]
     Engine --> Observe[事件 / 日志 / 指标]
-    SandboxSvc --> Runtime[mydocker-runtime]
-    ContainerSvc --> Runtime
-    Runtime --> Process[进程 / namespace / mount]
-    Runtime --> Cgroup[cgroup v2]
-    Runtime --> Rootfs[rootfs / bundle]
-    Daemon --> Shim[每个 Sandbox 一个 shim 或 supervisor]
-    Shim --> Keeper[namespace keeper]
-    Shim --> Attempt[Container Attempt]
-    Agent[未来的 mydocker-agent] -.->|同一版本化 API| Daemon
+    Engine --> RuntimeBoundary[低层 runtime 能力边界]
+    ImageSvc --> Content[ContentStore / Unpacker]
+    Content --> Snapshot[Snapshotter / MountManager / BundleBuilder]
+    Snapshot --> RuntimeBoundary
+    NetworkSvc --> RuntimeBoundary
+    RuntimeBoundary --> Kernel[进程 / namespace / mount / cgroup v2]
 ```
 
 依赖通过窄接口指向内层。宿主机相关实现可以依赖 Linux 原语；状态和 engine 包
 依赖接口，而不依赖评测工具或未来的集群类型。
 
-上图是目标全路径。当前 M3 已经把 CLI → UDS server → daemon service → engine
-→ provider 之间的版本、身份、幂等性和恢复边界组合起来，但这条组合只通过
-注入 provider 和临时文件系统测试。真实 shim/keeper/PID 1、hostname/DNS 和
-none/loopback 内核设置都被 fail-closed 生产 launcher 阻断，不能从 typed/fake 契约
-推断它们已被内核执行。
+当前 M3 已经把 CLI → UDS server → daemon service → engine → provider 的版本、
+身份、幂等性和恢复边界组合起来，并实现生产 Linux launcher 与 shim/keeper/PID 1
+路径；普通开发主机上的纯测试不能替代真实 hostname/DNS、none/loopback、namespace、
+mount 与 cgroup 的特权内核验收，因此 M3 仍不能标为 `Verified`。
 
-### 镜像到进程的数据路径
+### M4+ 镜像到进程的目标数据路径
 
 外部 builder 生产镜像；mydocker 只消费镜像，并负责从不可变镜像身份到 Linux
 进程之间的节点本地执行路径：
@@ -101,7 +165,7 @@ flowchart LR
     LayerUnpacker --> Snapshotter
     Snapshotter --> MountManager
     MountManager --> BundleBuilder
-    BundleBuilder --> Runtime[mydocker-runtime]
+    BundleBuilder --> Runtime[低层 runtime 能力边界<br/>当前不是独立二进制]
     Runtime --> Process[Linux Process]
 ```
 
@@ -111,12 +175,13 @@ flowchart LR
    manifest、config 和压缩 layer blob，LayerUnpacker 按顺序准备不可变文件系统层；
 2. `CreateContainer` 先以解析后的镜像 digest 确认内容可用，再为新的 Attempt
    准备可写 snapshot、挂载 rootfs 与嵌套 mounts、生成带版本 bundle，最后把 bundle
-   交给 `mydocker-runtime` 创建受 gate 约束的进程。
+   交给低层 runtime 能力边界创建受 gate 约束的进程。
 
 镜像引用是可变的用户意图；解析后的 digest 才是执行身份，必须在 Attempt 创建前
 持久化。底层 runtime 只理解 bundle、rootfs、结构化进程参数、mounts、namespaces
-和 cgroup path；它不理解 tag、registry、layer 下载或 image cache。具体对象、API、
-回滚和评测契约见 [image-filesystem.md](features/image-filesystem.md)。
+和 cgroup path；它不理解 tag、registry、layer 下载或 image cache。当前该边界不是
+`mydocker-runtime` 独立二进制。具体对象、API、回滚和评测契约见
+[image-filesystem.md](features/image-filesystem.md)。
 
 ## 3. 核心领域模型
 
@@ -129,13 +194,13 @@ flowchart LR
 | `SandboxStatus` | 观测到的生命周期状态、网络/cgroup 挂接、keeper 身份及 conditions |
 | `Container` | Sandbox 下单次执行请求的 API/持久化聚合对象 |
 | `Container Attempt` | 面向内核的执行子记录，包含进程和执行资源 |
-| `ContainerSpec` | bundle、argv、环境、mounts、rootfs/image，以及解析后强制限制的副本 |
+| `ContainerSpec` | 当前公共 API 包含 argv、环境、prepared-rootfs ID 和强制限制；M4+ 才加入 image/bundle 派生输入 |
 | `ContainerStatus` | 聚合 phase，以及对其规范 Attempt 结果的原子投影 |
-| `Image` | 用户和 engine 可见的镜像记录，将可变 reference 映射到已验证的 manifest digest |
-| `Content Blob` | 由 digest 标识的不可变 manifest、config 或压缩 layer 内容 |
-| `Unpacked Layer` | 校验并应用 OCI layer/whiteout 语义后发布的不可变文件系统层 |
-| `Snapshot` | 基于不可变镜像层、由单个 Attempt 独享可写层的文件系统状态 |
-| `Bundle` | 由镜像配置、ContainerSpec 覆盖、rootfs、资源与 namespace 配置生成的 runtime 输入 |
+| `Image`（M4+） | 用户和 engine 可见的镜像记录，将可变 reference 映射到已验证的 manifest digest |
+| `Content Blob`（M4+） | 由 digest 标识的不可变 manifest、config 或压缩 layer 内容 |
+| `Unpacked Layer`（M4+） | 校验并应用 OCI layer/whiteout 语义后发布的不可变文件系统层 |
+| `Snapshot`（M4+） | 基于不可变镜像层、由单个 Attempt 独享可写层的文件系统状态 |
+| `Bundle`（M4+） | 由镜像配置、ContainerSpec 覆盖、rootfs、资源与 namespace 配置生成的 runtime 输入 |
 | `Resources` | Sandbox spec 中的值，分别包含 requests、limits 和进程限制 |
 | `Generation` | 权威组件接受的单调递增期望 spec 修订号 |
 | `ObservedGeneration` | 其影响已被协调并报告的最高 generation |
@@ -169,13 +234,14 @@ Container 记录拥有不可变的请求/spec 以及查询/日志身份；其 At
 | 稳定 ID 和生命周期 | Attempt ID 和生命周期 |
 | UTS、IPC 和 network namespaces | 默认拥有 PID 和 mount namespaces |
 | Hostname 和 DNS 配置 | 用户进程及结构化 argv/environment |
-| 网络挂接、IP、路由、端口 | 受 OCI 启发的 bundle 和 rootfs/snapshot |
+| 当前的 network namespace 与 none/loopback 模式；M4+ 的网络挂接、IP、路由和端口 | 当前 prepared-rootfs mount 视图与 receipt；M4+ 的 bundle 和独享 snapshot |
 | 父 cgroup 和规范 `Resources` | 子 cgroup 和解析后的强制限制 |
 | Labels 和 keeper/supervisor 身份 | 规范 stdout/stderr、退出码、signal、OOM 结果 |
 
-Sandbox 不是空壳。它在顺序执行的多个 Attempts 之间保持工作负载身份和网络可达性，
-提供 namespace keeper 边界，并在父 cgroup 下汇总资源计量。这样可以自然映射到未来
-集群中的 Task 或工作负载副本，而无需让运行时理解调度。
+Sandbox 不是空壳。当前 M3 已让它在顺序 Attempts 之间保持工作负载身份、namespace
+keeper 和父 cgroup 边界；none/loopback 之外的网络可达性仍是 M4+ 目标。完整目标会让
+网络身份与可达性也跨顺序 Attempts 保持，从而自然映射到未来集群中的 Task 或工作负载
+副本，而无需让运行时理解调度。
 
 ### 初始基数
 
@@ -185,7 +251,7 @@ Sandbox 不是空壳。它在顺序执行的多个 Attempts 之间保持工作�
 计量和恢复保持可控。
 
 ```text
-Sandbox S1 (stable network identity)
+Sandbox S1（稳定网络身份）
 ├── Container C1 / Attempt A1: stopped, OOM
 ├── Container C2 / Attempt A2: stopped, start failed
 └── Container C3 / Attempt A3: running
@@ -238,13 +304,15 @@ network/namespace/cgroup 元数据最后删除，且只在确认宿主机上对�
 ```mermaid
 stateDiagram-v2
     [*] --> creating: CreateContainer
-    creating --> created: bundle、rootfs、cgroup 和 init 已准备
+    creating --> created: prepared rootfs、cgroup 和 init 已准备
     creating --> stopped: 创建失败，回滚已验证
     created --> running: StartContainer
     created --> stopped: 启动前删除 / 不可重试的启动失败
     running --> stopped: 退出或 KillContainer
     stopped --> [*]: DeleteContainer
 ```
+
+M4+ 接入 bundle 后，`created` 的准备条件会增加已验证 bundle，但不会引入新的外部 phase。
 
 规范的外部 phases 为：
 
@@ -283,65 +351,96 @@ Container/operation 记录保留失败结果，直至 delete。若 gate/init 仍
 校验用户输入、发送结构化请求、流式传输响应，并将类型化错误映射为退出状态。它不
 拥有任何守护进程状态，也不能监督后台工作负载。
 
+### `mydocker-eval`
+
+它是 `evaluation/cmd/mydocker-eval` 构建出的独立评测进程，只通过 `pkg/client` 和公共
+UDS API 执行受控场景、定义调用方 sample 边界并保存逐行 JSONL 原始证据。它不是生产
+运行时层或第二个生命周期权威，不得导入 `internal/` package；完整测量契约见
+[evaluation/README.md](../evaluation/README.md)。
+
 ### `mydockerd`
 
-拥有本地 API、资源串行化、持久元数据、Sandbox/Container 协调、事件/日志/指标
-发布，以及重启后的协调。
+它是常驻 OS 进程，也是节点本地的唯一生命周期和元数据权威。它拥有本地 API、
+资源串行化、持久元数据、Sandbox/Container 协调、事件/日志发布，以及重启后的协调。
+这里的“拥有”是进程级责任；具体代码分布在 server、daemon、engine、state 与 provider
+等 package 中。
 
-### Engine
+### `internal/engine`
 
-实现用例顺序、状态机守卫、幂等性、回滚栈，以及 image/content/unpack/snapshot/
-mount/bundle、network、runtime 和 state 接口之间的协调。它不会通过 CLI 字符串发出
-临时拼装的 shell 命令。
+它是 `mydockerd` 进程内的编排 package，不是第二个 daemon。它实现用例顺序、
+状态机守卫、幂等性、回滚栈与 state/provider 协调。当前 M3 provider 集合只有
+cgroup、isolation/supervisor 和 rollback；image/content/unpack/snapshot/mount/bundle
+与完整 network 协调是 M4+ 目标，而不是当前 engine 已接入的能力。Engine 不会直接
+成为 API transport，也不会通过 CLI 字符串发出临时拼装的 shell 命令。
 
-### `mydocker-runtime`
+### 底层 Runtime 能力边界
 
-理解 bundle、process、namespace、mount、rootfs、cgroup 挂接以及底层生命周期原语。
-它不理解镜像 reference/tag、registry、layer 获取或 image cache，也不理解 Task、Node、
-心跳、调度器、租约、assignment 或集群期望状态。
+当前已实现部分理解 process、namespace、mount、prepared rootfs、cgroup 挂接以及底层
+生命周期原语，代码分布在 `internal/slim`、`internal/isolation`、`internal/cgroupv2`
+和 `mydocker-shim` 中。M4+ 的 bundle 输入仍止于这一职责边界。当前**不存在名为
+`mydocker-runtime` 的独立进程**；如果未来将该边界拆成独立二进制，它仍不应理解镜像
+reference/tag、registry、layer 获取或 image cache，也不应理解 Task、Node、心跳、
+调度器、租约、assignment 或集群期望状态。
 
-### Shim 或 supervisor
+### `mydocker-shim`
 
-每个 Sandbox 对应一个长期运行实例；按设计持有 namespace 或进程身份，收集 exit
-status，并在守护进程重启后保持可重连。namespace keeper 由 shim 自身还是其子进程
-担任，是后续里程碑的实现决策。
+同一个可执行文件有两种受限模式，但它们是不同进程实例：每个 Sandbox 一个 keeper
+实例，保持稳定的 UTS/IPC/network namespaces；每个 Attempt 一个 init/PID 1 wrapper
+实例，保持 PID/mount namespace 和强进程身份，控制一次性 start gate，监督并回收
+workload 进程树，保存 exit outcome。它们在 CLI 退出后继续存在，并为 daemon 重启后的
+重新校验提供证据，但不取代 `mydockerd` 的权威状态机。
 
-### 网络
+### `Container Attempt`
+
+Attempt 是“第几次执行”的持久事实，而不是实现组件。一次 Attempt 从 `creating` 经
+`created`、`running` 到 `stopped`，绑定精确的 init shim、workload 进程树、rootfs、
+PID/mount namespaces、子 cgroup、日志和 outcome。M3 的 `rootfs` 是 catalog 选择的
+共享 prepared source；Attempt 只拥有自己的 mount 视图和 receipt，不拥有该 source，
+也没有独享 snapshot。初版中一个 `Container` 恰好对应一个 Attempt；以后如需
+workload retry，应新建 Attempt，而不是把旧执行记录改写成另一条进程身份。
+
+### M4+ 完整镜像、文件系统与网络能力（当前未实现）
+
+以下职责描述 M4+ 的目标 package/能力，不是当前进程或现有目录。M3 只有 prepared-rootfs
+路径和 none/loopback 隔离原语；尚无 ImageService、ContentStore、LayerUnpacker、
+Snapshotter、MountManager、BundleBuilder 或 bridge/veth/IPAM 实现。
+
+#### 完整 Sandbox 网络（M4+）
 
 通过幂等操作创建和拆除 Sandbox 范围的 network namespaces、veth/bridge 挂接、
 本地 IP 分配、路由和端口映射。
 
-### ImageService
+#### ImageService（M4+）
 
 拥有用户和 engine 可见的镜像对象、reference 到 digest 的映射以及镜像可用性。
 首版公开操作是 `ImportImage`、`EnsureImage`、`GetImage`、`ListImages` 和
 `RemoveImage`；未来可以按 digest 增加 `PullImage`，但不规划 `BuildImage`、
 `CommitContainer` 或 `PushImage`。
 
-### ContentStore
+#### ContentStore（M4+）
 
 以 digest 保存并校验不可变 manifest、config 和压缩 layer blob，提供原子写入、
 读取、状态查询和受引用保护的显式删除。它不解析 tag，不创建 snapshot，也不决定
 Attempt 生命周期。
 
-### LayerUnpacker
+#### LayerUnpacker（M4+）
 
 读取已验证的 layer blob，校验解压内容，按顺序应用 OCI whiteout 语义，并原子发布
 不可变 unpacked layer。它拒绝路径遍历和链接逃逸，不创建 Attempt 可写层或真实 mount。
 
-### Snapshotter
+#### Snapshotter（M4+）
 
 以不可变 image filesystem 为 parent，为每个 Attempt 准备独享的 upper/work 数据，
 并通过 `Prepare`、`Mounts`、`Usage` 和 `Remove` 暴露最小 snapshot 语义。它不理解
 image tag、Task、Sandbox 网络或用户 CLI。
 
-### MountManager
+#### MountManager（M4+）
 
 执行并验证 OverlayFS、bind、`/proc` 和 tmpfs 等 mount，处理 read-only rootfs 与
 mount propagation，并按依赖逆序 unmount。daemon 恢复时，它只接管能够证明属于
 mydocker 的 mount。
 
-### BundleBuilder
+#### BundleBuilder（M4+）
 
 把 image config、ContainerSpec 覆盖、rootfs mount、资源和 namespace 配置转换为
 带版本且可验证的 bundle。它不下载或解包镜像，也不启动进程。
@@ -354,8 +453,9 @@ schema、CAS、跨记录完整性、operation/rollback/event 原子性和严格�
 选用单 daemon `FileStore`：它使用独占锁、owner-only 文件、checksum envelope、
 原子替换与文件/父目录同步，成功 Update 后才更新内存可见性；对于 rename
 后持久性不确定的失败，当前实例被 poison，需 close/reopen 后从盘面事实恢复。
-它已覆盖 daemon restart 所需的状态重放纯测试，并使用 schema-v2 的同一原子 snapshot
-完成 count-based operation/event retention 与 compaction。默认保留最近 `1024` 个终态
+它已覆盖 daemon restart 所需的状态重放纯测试，并使用 FileStore schema-v3 的同一原子
+snapshot 完成 count-based operation/event retention、compaction，以及旧事件计时语义的
+显式迁移。默认保留最近 `1024` 个终态
 operation 的完整响应、最多 `65536` 个完整 identity 或 tombstone、最近 `8192` 个 event；
 启动读取和每次编码另受 `64 MiB` envelope 上限保护。达到 identity 或 envelope 上限时
 在新 intent/commit 前失败关闭。当前尚无在线状态 rollover/归档，因此有界不等于可以
@@ -401,6 +501,15 @@ observed_generation
 情况发出有序的 stage events，例如 `validate`、`persist_intent`、`prepare_rootfs`、
 `attach_cgroup`、`configure_network`、`release_start_gate` 和 `persist_result`。
 
+`duration_ns` 是可选证据：字段缺失表示该阶段没有在一次 daemon 进程调用内被可靠
+测量，显式 `0` 才表示实测零。当前 provider action 会在调用前后用同一个 daemon
+进程的 `time.Time` 单调分量计时；`persist_intent` 和纯恢复 bookkeeping 不伪造耗时。
+FileStore schema-v3 使用独立的 event schema-v2 表达这项可选语义；加载旧 FileStore
+schema-v1/v2 时，会在完整校验后把历史占位零迁移为“缺失”，再原子重写当前格式。
+只有本次调用接受了新 operation intent（`ResolutionNew`）时，complete event 才记录
+整个调用跨度；resume/recovery 的 complete duration 留空，不能把重启两侧的 wall time
+拼成单调样本。exact replay 不新增事件，也不重测或覆盖原证据。
+
 事件支持恢复、诊断和阶段时长分析。FileStore 保留连续的 event suffix；空 resume token
 从当前最早可用事件读取，非空 token 落在已清理前缀或超过最新已提交 sequence 时返回
 版本化 `resume_gap`，不会把缺口或 future cursor 伪装成空页。完整终态 operation 超出
@@ -411,8 +520,9 @@ fingerprint、reason 和顺序的 ID-digest tombstone；相同 ID 返回 `operat
 观测值。
 
 两类计时保持分离。调用方可见的 API 延迟，使用同一评测进程的单调时钟，从发送前
-一刻计至观察到响应/已确认结果。守护进程的 operation/stage 时长使用该守护进程的
-单调时钟，从接受请求计至其收到/确认终态；不得跨进程相减 supervisor 的时间戳。
+一刻计至观察到响应/已确认结果。守护进程的可用 operation/stage 时长使用该守护进程
+的单调时钟，从当前调用的明确起点计至其收到/确认结果；不得跨进程相减 supervisor 的
+时间戳，也不能把缺失 duration 当作零。
 跨进程或跨节点时，不得把未同步时间戳当作共享同一个时钟而直接相减。追踪可以展示
 因果分解，但必须记录时钟限制。
 
@@ -490,9 +600,11 @@ evaluation/
 └── scenarios/
 ```
 
-其中 `cmd/mydocker-shim`、`internal/slim` 和 provider 编排已有协议/纯测试实现，
-但并不表示生产 Linux launcher 已可以创建它们。以下仍是 M4A–M4C 的目标
-布局，不代表对应组件已经实现或集成：
+其中运行时交付面只有 `cmd/mydocker`、`cmd/mydockerd` 与 `cmd/mydocker-shim` 三个程序
+入口；`evaluation/cmd/mydocker-eval` 是独立评测程序。`internal/engine`、
+`internal/slim` 等均为进程内 package。生产 Linux launcher 已编码，
+但真实特权内核路径仍待一次性 VM 验收。以下仍是 M4A–M4C 的目标 package 布局，
+不代表对应能力已经实现、集成或需要拆成独立进程：
 
 ```text
 internal/
@@ -540,7 +652,7 @@ M6 的最终性能优化。runtime 修复必须先落到 `mydocker-2.0` 并通�
 | ID | 决策 | 影响 |
 | --- | --- | --- |
 | D1 | 完全重写 | 不以兼容 Legacy 代码/状态/CLI 为目标 |
-| D2 | Sandbox 是一等资源 | 网络身份、共享 namespaces 和父 cgroup 可跨顺序 Attempts 保持 |
+| D2 | Sandbox 是一等资源 | M3 的共享 namespaces/父 cgroup 及 M4+ 的完整网络身份可跨顺序 Attempts 保持 |
 | D3 | 初期只允许一个活跃 Attempt | 模型成熟过程中，生命周期和恢复保持确定性 |
 | D4 | 仅支持 cgroup v2 | 不为 Legacy v1 controller 文件提供兼容层 |
 | D5 | CLI 调用 daemon API | 后台生命周期拥有长期运行的权威组件 |
@@ -549,7 +661,7 @@ M6 的最终性能优化。runtime 修复必须先落到 `mydocker-2.0` 并通�
 | D8 | 目前不实现 CRI | 借鉴资源模型不意味着协议兼容 |
 | D9 | 评测优先，而非优化优先 | 先定义边界、验证行为、建立基线、分析性能剖析数据，再优化 |
 | D10 | 测试类别保持分离 | 正确性、benchmark、压力、故障和 profiling 证据不可互换 |
-| D11 | 镜像消费属于单节点执行面 | OCI image 必须经过 content、unpack、snapshot、mount 和 bundle 边界后才进入 runtime |
+| D11 | 镜像消费属于单节点执行面 | M4+ 完整路径中的 OCI image 必须经过 content、unpack、snapshot、mount 和 bundle 边界后才进入 runtime |
 | D12 | 镜像生产不属于 2.0 核心范围 | 不实现 Dockerfile build、container commit、push 或 registry server |
 
 这些决策集中保留在此处，而不拆分成独立 ADR 文件。未来的变更需要同时更新此表，

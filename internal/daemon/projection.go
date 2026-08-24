@@ -230,21 +230,25 @@ func projectEvent(value operation.Event) (v1.Event, error) {
 			return v1.Event{}, err
 		}
 	}
-	return v1.Event{
-		Sequence:            uint64(value.Sequence),
-		OperationID:         string(value.OperationID),
-		Type:                string(value.Type),
-		Target:              target,
-		Resources:           resources,
-		Stage:               string(value.Stage),
-		Result:              string(value.Result),
-		Reason:              string(value.Reason),
-		OccurredAt:          value.OccurredAt,
-		DurationNanoseconds: int64(value.Duration),
-		Generation:          value.Generation,
-		ObservedGeneration:  value.ObservedGeneration,
-		Details:             nil,
-	}, nil
+	projected := v1.Event{
+		Sequence:           uint64(value.Sequence),
+		OperationID:        string(value.OperationID),
+		Type:               string(value.Type),
+		Target:             target,
+		Resources:          resources,
+		Stage:              string(value.Stage),
+		Result:             string(value.Result),
+		Reason:             string(value.Reason),
+		OccurredAt:         value.OccurredAt,
+		Generation:         value.Generation,
+		ObservedGeneration: value.ObservedGeneration,
+		Details:            nil,
+	}
+	if value.Duration != nil {
+		duration := int64(*value.Duration)
+		projected.DurationNanoseconds = &duration
+	}
+	return projected, nil
 }
 
 // projectResourceRef validates that one internal lifecycle target is representable by the path-safe v1 identity contract.

@@ -649,7 +649,7 @@ func TestReconcileLeavesConsumedGateStartPending(t *testing.T) {
 	}
 	if _, err := engine.checkpointProgress(context.Background(), request.OperationID,
 		operation.Target{Kind: operation.TargetContainer, ID: string(request.ContainerID)}, begin.Fingerprint,
-		operation.StageAttachCgroup, attachment); err != nil {
+		operation.StageAttachCgroup, attachment, engine.unmeasuredCheckpoint()); err != nil {
 		t.Fatalf("checkpointProgress(attach) error = %v", err)
 	}
 	starting := AttemptObservation{Starting: true, Evidence: "starting-after-consumed-gate"}
@@ -658,7 +658,7 @@ func TestReconcileLeavesConsumedGateStartPending(t *testing.T) {
 	host.mu.Unlock()
 	if _, err := engine.checkpointProgress(context.Background(), request.OperationID,
 		operation.Target{Kind: operation.TargetContainer, ID: string(request.ContainerID)}, begin.Fingerprint,
-		operation.StageReleaseStartGate, starting); err != nil {
+		operation.StageReleaseStartGate, starting, engine.unmeasuredCheckpoint()); err != nil {
 		t.Fatalf("checkpointProgress(release) error = %v", err)
 	}
 	report, err := engine.Reconcile(context.Background())
@@ -708,11 +708,11 @@ func TestReconcileClosesStartingToRunningObservationRace(t *testing.T) {
 		t.Fatalf("NewAttachmentObservation() error = %v", err)
 	}
 	target := operation.Target{Kind: operation.TargetContainer, ID: string(request.ContainerID)}
-	if _, err := engine.checkpointProgress(context.Background(), request.OperationID, target, begin.Fingerprint, operation.StageAttachCgroup, attachment); err != nil {
+	if _, err := engine.checkpointProgress(context.Background(), request.OperationID, target, begin.Fingerprint, operation.StageAttachCgroup, attachment, engine.unmeasuredCheckpoint()); err != nil {
 		t.Fatalf("checkpointProgress(attach) error = %v", err)
 	}
 	if _, err := engine.checkpointProgress(context.Background(), request.OperationID, target, begin.Fingerprint, operation.StageReleaseStartGate,
-		AttemptObservation{Starting: true, Evidence: "starting-release"}); err != nil {
+		AttemptObservation{Starting: true, Evidence: "starting-release"}, engine.unmeasuredCheckpoint()); err != nil {
 		t.Fatalf("checkpointProgress(release) error = %v", err)
 	}
 	host.mu.Lock()
@@ -837,6 +837,79 @@ func TestReconcileCheckpointsInitialKillWithoutWaiting(t *testing.T) {
 	pair, err := engine.Coordinator().GetContainer(context.Background(), request.ContainerID)
 	if err != nil || pair.Attempt.Phase != domain.AttemptRunning {
 		t.Fatalf("GetContainer() = (%#v, %v), want still Running", pair, err)
+	}
+}
+
+// TestReconcileKillObservationDurationIncludesOOMAttribution verifies the
+// recovery-only not-running race keeps its observation span open through the
+// owner-scoped cgroup counter read used to classify a captured terminal exit.
+func TestReconcileKillObservationDurationIncludesOOMAttribution(t *testing.T) {
+	host := newFakeHost()
+	base := time.Date(2026, 8, 24, 14, 0, 0, 0, time.UTC)
+	clock := &manualClock{now: base}
+	store := state.NewMemoryStore()
+	engine, err := NewWithClock(store, testProviders(t, host), clock)
+	if err != nil {
+		t.Fatalf("NewWithClock() error = %v", err)
+	}
+	prepareCreatedContainer(t, engine)
+	if _, err := engine.StartContainer(context.Background(), lifecycle.ContainerActionRequest{
+		OperationID: "op-start-before-measured-recovery-kill", ContainerID: "container-start-test",
+	}); err != nil {
+		t.Fatalf("StartContainer() error = %v", err)
+	}
+	request := lifecycle.KillRequest{
+		OperationID: "op-measured-recovery-kill", ContainerID: "container-start-test",
+		Policy: domain.TerminationPolicy{Signal: "SIGTERM", GracePeriod: time.Hour, EscalationSignal: "SIGKILL"},
+	}
+	if _, err := engine.Coordinator().PlanKill(context.Background(), request); err != nil {
+		t.Fatalf("PlanKill() error = %v", err)
+	}
+	started := base.Add(-time.Second)
+	host.mu.Lock()
+	host.keepRunningAfterInitial = true
+	host.signalNotRunning = true
+	host.oomKill = 1
+	host.attempt = AttemptObservation{
+		Terminal: true, Evidence: "recovery-kill-terminal-before-oom-attribution",
+		Outcome: domain.ExitOutcome(137, domain.EvidenceUnknown, started, base, time.Second),
+	}
+	host.snapshotOOMHook = func() {
+		clock.Set(base.Add(7 * time.Millisecond))
+	}
+	host.mu.Unlock()
+	if _, err := engine.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	completed, err := engine.Coordinator().GetOperation(context.Background(), request.OperationID)
+	if err != nil || completed.State != operation.StateSucceeded {
+		t.Fatalf("GetOperation() = (%#v, %v), want succeeded", completed, err)
+	}
+	pair, err := engine.Coordinator().GetContainer(context.Background(), request.ContainerID)
+	if err != nil || pair.Attempt.Outcome.OOM != domain.EvidenceTrue {
+		t.Fatalf("GetContainer() = (%#v, %v), want OOM-attributed terminal outcome", pair, err)
+	}
+	found := false
+	if err := store.View(context.Background(), func(reader state.Reader) error {
+		events, readErr := reader.EventsAfter(0, 0)
+		if readErr != nil {
+			return readErr
+		}
+		for _, event := range events {
+			if event.OperationID != request.OperationID || event.Stage != operation.StageObserveProcess {
+				continue
+			}
+			found = true
+			if event.Duration == nil || event.Duration.Value() != 7*time.Millisecond {
+				t.Fatalf("recovery observe duration = %#v, want 7ms including OOM snapshot", event.Duration)
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("EventsAfter() error = %v", err)
+	}
+	if !found {
+		t.Fatal("recovered Kill retained no observe-process event")
 	}
 }
 

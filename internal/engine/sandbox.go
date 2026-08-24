@@ -16,6 +16,7 @@ import (
 // CreateSandbox persists intent, checkpoints the canonical M2 Sandbox receipt
 // profile one acquisition at a time, and confirms Ready only after full evidence.
 func (engine *Engine) CreateSandbox(ctx context.Context, request lifecycle.SandboxCreateRequest) (lifecycle.SandboxResult, error) {
+	operationStartedAt := engine.beginMeasurement()
 	target := operation.Target{Kind: operation.TargetSandbox, ID: string(request.SandboxID)}
 	release := engine.targetLocks.lock(target)
 	defer release()
@@ -38,7 +39,9 @@ func (engine *Engine) CreateSandbox(ctx context.Context, request lifecycle.Sandb
 		return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonPrecondition, err)
 	}
 	retained.Spec.Network.Mode = string(canonicalNetworkMode)
+	preflightStartedAt := engine.beginMeasurement()
 	capabilities, err := engine.preflight(ctx)
+	preflightMeasurement := engine.finishMeasurement(preflightStartedAt)
 	if err != nil {
 		return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonPrecondition, err)
 	}
@@ -47,7 +50,7 @@ func (engine *Engine) CreateSandbox(ctx context.Context, request lifecycle.Sandb
 		return result, err
 	}
 	if len(progress.Receipts) == 0 && progress.Operation.Stage == operation.StagePersistIntent {
-		if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageHostPreflight, capabilities); err != nil {
+		if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageHostPreflight, capabilities, preflightMeasurement); err != nil {
 			return result, err
 		}
 	}
@@ -63,14 +66,16 @@ func (engine *Engine) CreateSandbox(ctx context.Context, request lifecycle.Sandb
 		if len(progress.Receipts) >= 6 {
 			break
 		}
+		acquireStartedAt := engine.beginMeasurement()
 		receipt, stage, acquireErr := engine.acquireSandboxReceipt(ctx, owner, request.SandboxID, retained.Spec, progress.Receipts)
+		acquireMeasurement := engine.finishMeasurement(acquireStartedAt)
 		if acquireErr != nil {
 			if provider.IsNoEffect(acquireErr) || provider.IsRollbackRequired(acquireErr) {
 				return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonInternal, acquireErr)
 			}
 			return result, acquireErr
 		}
-		if _, err = engine.checkpointReceipt(ctx, request.OperationID, target, result.Fingerprint, stage, receipt); err != nil {
+		if _, err = engine.checkpointReceipt(ctx, request.OperationID, target, result.Fingerprint, stage, receipt, acquireMeasurement); err != nil {
 			return result, err
 		}
 	}
@@ -81,10 +86,12 @@ func (engine *Engine) CreateSandbox(ctx context.Context, request lifecycle.Sandb
 	if err != nil {
 		return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonInternal, err)
 	}
+	completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 	return engine.lifecycle.ConfirmSandboxCreate(ctx, lifecycle.SandboxConfirmRequest{
 		OperationID: request.OperationID, SandboxID: request.SandboxID, Fingerprint: result.Fingerprint,
 		Verification: lifecycle.Verification{
-			Kind: lifecycle.VerificationSandboxReady, Verified: true, Evidence: evidence, ObservedAt: engine.clock.Now(),
+			Kind: lifecycle.VerificationSandboxReady, Verified: true, Evidence: evidence,
+			ObservedAt: completion.occurredAt, Duration: completion.duration,
 		},
 	})
 }
@@ -92,6 +99,7 @@ func (engine *Engine) CreateSandbox(ctx context.Context, request lifecycle.Sandb
 // StopSandbox verifies that every retained Sandbox resource remains owned and
 // no Attempt is active, then records the stable environment as quiescent.
 func (engine *Engine) StopSandbox(ctx context.Context, request lifecycle.SandboxActionRequest) (lifecycle.SandboxResult, error) {
+	operationStartedAt := engine.beginMeasurement()
 	target := operation.Target{Kind: operation.TargetSandbox, ID: string(request.SandboxID)}
 	release := engine.targetLocks.lock(target)
 	defer release()
@@ -107,6 +115,7 @@ func (engine *Engine) StopSandbox(ctx context.Context, request lifecycle.Sandbox
 		return result, err
 	}
 	observations := make([]provider.ResourceObservation, 0, len(inventory))
+	observationStartedAt := engine.beginMeasurement()
 	for _, receipt := range inventory {
 		observation, inspectErr := engine.inspectReceipt(ctx, receipt)
 		if inspectErr != nil {
@@ -117,7 +126,8 @@ func (engine *Engine) StopSandbox(ctx context.Context, request lifecycle.Sandbox
 		}
 		observations = append(observations, observation)
 	}
-	if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageObserveProcess, observations); err != nil {
+	observationMeasurement := engine.finishMeasurement(observationStartedAt)
+	if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageObserveProcess, observations, observationMeasurement); err != nil {
 		return result, err
 	}
 	progress, err := engine.lifecycle.GetOperationProgress(ctx, request.OperationID)
@@ -132,15 +142,18 @@ func (engine *Engine) StopSandbox(ctx context.Context, request lifecycle.Sandbox
 	if err != nil {
 		return result, err
 	}
+	completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 	return engine.lifecycle.ConfirmSandboxStop(ctx, lifecycle.SandboxConfirmRequest{
 		OperationID: request.OperationID, SandboxID: request.SandboxID, Fingerprint: result.Fingerprint,
-		Verification: lifecycle.Verification{Kind: lifecycle.VerificationSandboxStopped, Verified: true, Evidence: evidence, ObservedAt: engine.clock.Now()},
+		Verification: lifecycle.Verification{Kind: lifecycle.VerificationSandboxStopped, Verified: true, Evidence: evidence,
+			ObservedAt: completion.occurredAt, Duration: completion.duration},
 	})
 }
 
 // RemoveSandbox tears down the complete adopted Sandbox inventory using exact
 // provider receipts and confirms metadata deletion only after every absence proof is durable.
 func (engine *Engine) RemoveSandbox(ctx context.Context, request lifecycle.SandboxActionRequest) (lifecycle.SandboxResult, error) {
+	operationStartedAt := engine.beginMeasurement()
 	target := operation.Target{Kind: operation.TargetSandbox, ID: string(request.SandboxID)}
 	releaseTarget := engine.targetLocks.lock(target)
 	defer releaseTarget()
@@ -151,9 +164,11 @@ func (engine *Engine) RemoveSandbox(ctx context.Context, request lifecycle.Sandb
 	inventory, inventoryErr := engine.sandboxInventory(ctx, request.SandboxID)
 	if inventoryErr != nil {
 		if lifecycle.IsCheckpointNotFound(inventoryErr) {
+			completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 			return engine.lifecycle.ConfirmSandboxRemove(ctx, lifecycle.SandboxConfirmRequest{
 				OperationID: request.OperationID, SandboxID: request.SandboxID, Fingerprint: result.Fingerprint,
-				Verification: lifecycle.Verification{Kind: lifecycle.VerificationSandboxAbsent, Verified: true, Evidence: "metadata_absent_without_owned_receipts", ObservedAt: engine.clock.Now()},
+				Verification: lifecycle.Verification{Kind: lifecycle.VerificationSandboxAbsent, Verified: true, Evidence: "metadata_absent_without_owned_receipts",
+					ObservedAt: completion.occurredAt, Duration: completion.duration},
 			})
 		}
 		return result, inventoryErr
@@ -175,7 +190,9 @@ func (engine *Engine) RemoveSandbox(ctx context.Context, request lifecycle.Sandb
 		if releaseByKind(progress.Releases, kind) != nil {
 			continue
 		}
+		cleanupStartedAt := engine.beginMeasurement()
 		observation, cleanupErr := engine.cleanupReceipt(ctx, receipt)
+		cleanupMeasurement := engine.finishMeasurement(cleanupStartedAt)
 		if cleanupErr != nil {
 			return result, cleanupErr
 		}
@@ -183,7 +200,7 @@ func (engine *Engine) RemoveSandbox(ctx context.Context, request lifecycle.Sandb
 		if releaseErr != nil {
 			return result, releaseErr
 		}
-		if _, checkpointErr := engine.checkpointRelease(ctx, request.OperationID, target, result.Fingerprint, release); checkpointErr != nil {
+		if _, checkpointErr := engine.checkpointRelease(ctx, request.OperationID, target, result.Fingerprint, release, cleanupMeasurement); checkpointErr != nil {
 			return result, checkpointErr
 		}
 	}
@@ -195,9 +212,11 @@ func (engine *Engine) RemoveSandbox(ctx context.Context, request lifecycle.Sandb
 	if err != nil {
 		return result, err
 	}
+	completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 	return engine.lifecycle.ConfirmSandboxRemove(ctx, lifecycle.SandboxConfirmRequest{
 		OperationID: request.OperationID, SandboxID: request.SandboxID, Fingerprint: result.Fingerprint,
-		Verification: lifecycle.Verification{Kind: lifecycle.VerificationSandboxAbsent, Verified: true, Evidence: evidence, ObservedAt: engine.clock.Now()},
+		Verification: lifecycle.Verification{Kind: lifecycle.VerificationSandboxAbsent, Verified: true, Evidence: evidence,
+			ObservedAt: completion.occurredAt, Duration: completion.duration},
 	})
 }
 

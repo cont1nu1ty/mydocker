@@ -11,9 +11,13 @@ import (
 	"unicode"
 )
 
-// SchemaVersion is the only operation record schema understood by this
-// milestone. A future schema change must add an explicit migration path.
+// SchemaVersion is the only durable operation-record schema understood by this
+// milestone. Event records evolve independently through EventSchemaVersion.
 const SchemaVersion uint32 = 1
+
+// EventSchemaVersion identifies optional duration evidence: a missing duration
+// is unavailable, while an explicit zero is a measured zero-length span.
+const EventSchemaVersion uint32 = 2
 
 // CurrentFingerprintVersion identifies the canonical request encoding and
 // digest algorithm used by CanonicalRequestFingerprint.
@@ -443,7 +447,8 @@ func (o Operation) Validate() error {
 	return nil
 }
 
-// Event records one ordered operation stage fact and its same-process duration.
+// Event records one ordered operation stage fact and an optional same-process duration.
+// A nil Duration means the stage was not measured; it must not be interpreted as zero elapsed time.
 type Event struct {
 	SchemaVersion      uint32          `json:"schema_version"`
 	Sequence           Sequence        `json:"sequence"`
@@ -455,7 +460,7 @@ type Event struct {
 	Result             Result          `json:"result"`
 	Reason             ReasonClass     `json:"reason"`
 	OccurredAt         time.Time       `json:"occurred_at"`
-	Duration           Duration        `json:"duration_ns"`
+	Duration           *Duration       `json:"duration_ns,omitempty"`
 	Generation         uint64          `json:"generation,omitempty"`
 	ObservedGeneration uint64          `json:"observed_generation,omitempty"`
 	Details            json.RawMessage `json:"details,omitempty"`
@@ -466,12 +471,16 @@ func (e Event) Clone() Event {
 	clone := e
 	clone.Resources = append([]Target(nil), e.Resources...)
 	clone.Details = append(json.RawMessage(nil), e.Details...)
+	if e.Duration != nil {
+		duration := *e.Duration
+		clone.Duration = &duration
+	}
 	return clone
 }
 
 // Validate rejects unordered, unbounded, or internally inconsistent events.
 func (e Event) Validate() error {
-	if e.SchemaVersion != SchemaVersion {
+	if e.SchemaVersion != EventSchemaVersion {
 		return fmt.Errorf("unsupported event schema version %d", e.SchemaVersion)
 	}
 	if err := e.Sequence.Validate(); err != nil {
@@ -511,8 +520,10 @@ func (e Event) Validate() error {
 	if e.OccurredAt.IsZero() {
 		return errors.New("event wall-clock timestamp must not be zero")
 	}
-	if err := e.Duration.Validate(); err != nil {
-		return err
+	if e.Duration != nil {
+		if err := e.Duration.Validate(); err != nil {
+			return err
+		}
 	}
 	if e.ObservedGeneration > e.Generation {
 		return errors.New("event observed generation must not exceed generation")

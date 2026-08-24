@@ -4,9 +4,10 @@
 harness、cold/warm prepared-rootfs 场景、调用方单调时钟跨度、daemon stage-event
 关联、失败后清理尝试和逐行 JSONL 原始证据。当前仍没有真实 rootful benchmark
 运行、结果、profile 或性能结论；纯 Go 单元测试不能替代这些证据。
-生产 `LinuxShimLauncher` 仍返回 `ErrLauncherIncomplete`，使 `mydockerd` 在绑定 UDS
-之前失败关闭；因此 harness 命令和已签入场景当前是已测试的接口/证据
-生成契约，不是可立即执行的生产 benchmark 流程。
+生产 `LinuxShimLauncher` 已编码，但尚未通过一次性 VM 中的 rootful 正确性验收；
+M3 catalog 也只复用共享 prepared-rootfs，而不创建每 Attempt snapshot。因此 harness
+命令和已签入场景当前是已测试的接口/证据生成契约，不是可立即执行或可与 M4B
+snapshot 场景比较的生产 benchmark 流程。
 
 本文档是项目关于正确性、可靠性、测量和性能证据的主要契约。架构定义见
 [`docs/architecture.md`](../docs/architecture.md)，功能验收条件见
@@ -47,7 +48,7 @@ workload 或 profile 产物；M1/M2/M3 的组件正确性测试仍位于对应 G
 
 在隔离的一次性 Linux/VM 中完成 runtime preflight、启动可用的 `mydockerd`，并将场景中
 所有 `replace-*` 与 `unknown` 环境字段替换为本次实验的真实事实后，调用示例如下：
-这些是未来 launcher 完成且 rootful 正确性验收通过后的前置条件；当前仓库尚不满足。
+这些是 rootful 正确性验收通过后的前置条件；当前仓库尚未提供该验收证据。
 
 ```text
 go run ./evaluation/cmd/mydocker-eval \
@@ -73,6 +74,14 @@ FileStore 默认只保留最近 `8192` 个 event；若样本读取返回 `resume
   `CreateContainer` 前到明确投影 `Running`；
 - E2E 记录的 `operation_ids` 按请求顺序关联组成该跨度的多个 durable operation；
   daemon stage-event duration 仍单独记录，不能与调用方时间相减或混为一项。
+
+Event 的 `duration_ns` 是可选证据。Harness 原样保留缺失字段，不得将其变成零样本；
+新 intent 的同进程 provider stage/complete duration 可作为 daemon 侧分解，resume、
+recovery 与纯 persistence bookkeeping 可以没有 duration。exact replay 不产生新测量。
+FileStore schema-v3 会在完整校验后，把旧 schema-v1/v2 文件中由早期 writer 固定写出的
+`duration_ns: 0` 迁移为缺失，再以 event schema-v2 原子重写，因此 daemon API 不会把
+该占位值投影成零样本。脱离 FileStore 迁移链保存的旧 API/JSONL 原始证据仍无法事后
+区分“未测量”和“实测零”；除非 provenance 能证明来自新语义，否则必须排除出基准。
 
 Sandbox/Container ID 和 create operation ID 都在第一次发送前产生。Create 或 Start
 返回失败并不能证明服务端没有部分持久化，因此 harness 仍会用已知资源 ID 依次尝试

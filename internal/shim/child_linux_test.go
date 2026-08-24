@@ -7,8 +7,32 @@ import (
 	"io"
 	"testing"
 
+	"golang.org/x/sys/unix"
+
 	"mydocker/internal/domain"
 )
+
+// descendantWaitResult is one scripted wait4 result for PID1 reaper tests.
+type descendantWaitResult struct {
+	pid int
+	err error
+}
+
+// scriptedDescendantWaiter returns deterministic exit, interruption, and empty-tree results.
+type scriptedDescendantWaiter struct {
+	results []descendantWaitResult
+	calls   int
+}
+
+// WaitForExit returns the next scripted result without touching a real process table.
+func (waiter *scriptedDescendantWaiter) WaitForExit() (int, error) {
+	if waiter.calls >= len(waiter.results) {
+		return 0, errors.New("unexpected descendant wait")
+	}
+	result := waiter.results[waiter.calls]
+	waiter.calls++
+	return result.pid, result.err
+}
 
 // failingStreamWriter returns a configured write shape without performing host I/O.
 type failingStreamWriter struct {
@@ -54,5 +78,48 @@ func TestOutputFailureInvalidatesKnownExit(t *testing.T) {
 	markChildWaitFailure(&evidence, errors.New("durable output unavailable"))
 	if evidence.ExitCode != nil || evidence.Signal != "" || evidence.WaitError == "" {
 		t.Fatalf("evidence after output failure=%+v, want unknown wait outcome", evidence)
+	}
+}
+
+// TestReapDescendantsRetriesInterruptAndRequiresECHILD verifies PID1 drains
+// every adopted child and only treats the kernel's empty-child result as complete.
+func TestReapDescendantsRetriesInterruptAndRequiresECHILD(t *testing.T) {
+	waiter := &scriptedDescendantWaiter{results: []descendantWaitResult{
+		{err: unix.EINTR}, {pid: 17}, {pid: 19}, {err: unix.ECHILD},
+	}}
+	if err := reapDescendants(waiter); err != nil {
+		t.Fatalf("reapDescendants() error = %v", err)
+	}
+	if waiter.calls != 4 {
+		t.Fatalf("wait calls = %d, want 4", waiter.calls)
+	}
+}
+
+// TestReapDescendantsFailsClosedOnUnexpectedWait verifies an uncertain process
+// table cannot be treated as a fully drained Attempt.
+func TestReapDescendantsFailsClosedOnUnexpectedWait(t *testing.T) {
+	waiter := &scriptedDescendantWaiter{results: []descendantWaitResult{{err: unix.EIO}}}
+	if err := reapDescendants(waiter); !errors.Is(err, unix.EIO) {
+		t.Fatalf("reapDescendants() error = %v, want EIO", err)
+	}
+}
+
+// TestDescendantWaitOptionsIncludeCloneChildren verifies PID1 cannot interpret
+// ECHILD until Linux has considered both SIGCHLD and non-SIGCHLD clone children.
+func TestDescendantWaitOptionsIncludeCloneChildren(t *testing.T) {
+	if descendantWaitOptions != unix.WALL {
+		t.Fatalf("descendant wait options = %#x, want __WALL %#x", descendantWaitOptions, unix.WALL)
+	}
+}
+
+// TestSignalGateClosesWhenDirectChildExits verifies external signals cannot
+// race PID reuse after the direct workload status has been collected.
+func TestSignalGateClosesWhenDirectChildExits(t *testing.T) {
+	child := &osChild{
+		pidfd: 42, directExited: true,
+		identity: ChildIdentity{Handle: "pidfd-42", EvidenceSHA256: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	}
+	if _, err := child.SignalVerified(SignalTERM); err == nil {
+		t.Fatal("SignalVerified() after direct exit error = nil")
 	}
 }

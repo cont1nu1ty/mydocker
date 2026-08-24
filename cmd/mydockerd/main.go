@@ -110,7 +110,7 @@ type cgroupCapabilityInspector interface {
 }
 
 // isolationCapabilityInspector is the read-only portion of the isolation
-// provider used to reject the incomplete production launcher before serving.
+// provider used to reject unsupported host capabilities before serving.
 type isolationCapabilityInspector interface {
 	InspectIsolationCapabilities(context.Context, provider.IsolationRequirements) (provider.IsolationCapabilities, error)
 }
@@ -422,8 +422,7 @@ func removeCgroupReceipt(ctx context.Context, cgroups provider.CgroupProvider, o
 	}
 }
 
-// Preflight performs both provider checks read-only, checking isolation first
-// so the known incomplete Linux launcher cannot be hidden by cgroup state.
+// Preflight performs both provider checks read-only before recovery may mutate host state.
 func (runtime *productionRuntime) Preflight(ctx context.Context) error {
 	if runtime == nil {
 		return errors.New("production runtime must not be nil")
@@ -431,8 +430,7 @@ func (runtime *productionRuntime) Preflight(ctx context.Context) error {
 	return preflightHost(ctx, runtime.cgroup, runtime.isolation)
 }
 
-// preflightHost verifies the complete M2 capability set without mutating
-// persistence or host resources and preserves ErrLauncherIncomplete identity.
+// preflightHost verifies the complete M2 capability set without mutating persistence or host resources.
 func preflightHost(ctx context.Context, cgroups cgroupCapabilityInspector, isolationProvider isolationCapabilityInspector) error {
 	if ctx == nil {
 		return errors.New("host preflight context must not be nil")

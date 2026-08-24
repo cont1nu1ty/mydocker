@@ -201,6 +201,7 @@ type Operation struct {
 }
 
 // Event is one globally ordered lifecycle stage fact suitable for paged resume.
+// A missing duration means the daemon could not measure the stage in one process invocation.
 type Event struct {
 	Sequence            uint64          `json:"sequence"`
 	OperationID         string          `json:"operation_id"`
@@ -211,7 +212,7 @@ type Event struct {
 	Result              string          `json:"result"`
 	Reason              string          `json:"reason"`
 	OccurredAt          time.Time       `json:"occurred_at"`
-	DurationNanoseconds int64           `json:"duration_ns"`
+	DurationNanoseconds *int64          `json:"duration_ns,omitempty"`
 	Generation          uint64          `json:"generation,omitempty"`
 	ObservedGeneration  uint64          `json:"observed_generation,omitempty"`
 	Details             json.RawMessage `json:"details,omitempty"`

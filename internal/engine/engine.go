@@ -17,12 +17,14 @@ import (
 	"mydocker/internal/state"
 )
 
-// Clock supplies diagnostic wall facts at lifecycle confirmation boundaries.
+// Clock supplies diagnostic endpoints and same-process elapsed samples.
+// Production values carry Go's monotonic component; invalid injected samples
+// are retained only as unavailable timing evidence and never block journaling.
 type Clock interface {
 	Now() time.Time
 }
 
-// wallClock supplies production wall time without claiming cross-process monotonic semantics.
+// wallClock supplies production wall time with process-local monotonic readings.
 type wallClock struct{}
 
 // Now returns the current wall-clock diagnostic fact.

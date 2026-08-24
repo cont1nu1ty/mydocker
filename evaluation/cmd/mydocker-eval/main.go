@@ -31,6 +31,7 @@ const (
 	maxEventPages           = 1024
 	defaultEvaluationSocket = "/run/mydocker/mydockerd.sock"
 	unknownEvidence         = "unknown"
+	preparedRootfsSnapshot  = "not-created-prepared-rootfs-shared"
 	maxCommandEvidenceBytes = 1 << 20
 )
 
@@ -385,6 +386,9 @@ func (input scenario) Validate() error {
 	}
 	if strings.ContainsRune(input.Environment.Noise, '\x00') || strings.ContainsRune(input.Environment.Warmup, '\x00') {
 		return invalidArgument("environment", "background_noise and warmup must contain no NUL")
+	}
+	if input.Environment.Cache.Snapshot != preparedRootfsSnapshot {
+		return invalidArgument("environment.cache.snapshot", "M3 prepared-rootfs scenarios must declare that no per-Attempt snapshot is created")
 	}
 	for name, value := range map[string]string{
 		"content":          input.Environment.Cache.Content,

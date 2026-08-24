@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"mydocker/internal/domain"
 	"mydocker/internal/lifecycle"
@@ -273,7 +274,7 @@ func (engine *Engine) Reconcile(ctx context.Context) (RecoveryReport, error) {
 				if _, err := engine.lifecycle.FailActiveOperation(ctx, lifecycle.FailOperationRequest{
 					OperationID: active.ID, Target: active.Target, Fingerprint: active.Fingerprint,
 					Failure:   lifecycle.Failure{Reason: operation.ReasonCleanup, Message: evidence},
-					Condition: recoveryIssueCondition(active.Target, issues), ObservedAt: engine.clock.Now(),
+					Condition: recoveryIssueCondition(active.Target, issues), ObservedAt: engine.diagnosticNow(),
 				}); err != nil {
 					return report, err
 				}
@@ -301,7 +302,7 @@ func (engine *Engine) Reconcile(ctx context.Context) (RecoveryReport, error) {
 		evidence := recoveryIssueEvidence(issues)
 		request := lifecycle.ReconcileConditionRequest{
 			Target: target, Condition: conditionPointer(recoveryIssueCondition(target, issues)),
-			Evidence: evidence, ObservedAt: engine.clock.Now(),
+			Evidence: evidence, ObservedAt: engine.diagnosticNow(),
 		}
 		fingerprint, fingerprintErr := request.RequestFingerprint()
 		if fingerprintErr != nil {
@@ -343,7 +344,7 @@ func (engine *Engine) Reconcile(ctx context.Context) (RecoveryReport, error) {
 				Type: domain.ConditionProcessIdentityUnknown, Reason: "DaemonRestart",
 				Message: "workload state was observed read-only, but M3 does not claim a reconnectable supervisor channel",
 			},
-			Evidence: evidence, ObservedAt: engine.clock.Now(),
+			Evidence: evidence, ObservedAt: engine.diagnosticNow(),
 		}
 		fingerprint, fingerprintErr := request.RequestFingerprint()
 		if fingerprintErr != nil {
@@ -411,7 +412,7 @@ func (engine *Engine) checkpointRecoveryIssue(ctx context.Context, active operat
 		Stage: stage, RollbackCause: progress.RollbackCause, OOMBaseline: progress.OOMBaseline,
 		KillEscalationDeadline: progress.KillEscalationDeadline,
 		Rollback:               cloneRollback(progress.Rollback), Receipts: cloneReceipts(progress.Receipts),
-		Releases: cloneReleases(progress.Releases), OccurredAt: engine.clock.Now(),
+		Releases: cloneReleases(progress.Releases), OccurredAt: engine.diagnosticNow(),
 		Details:         map[string]string{"recovery": "owned resource observation remains unverified"},
 		UpsertCondition: &condition,
 	})
@@ -607,7 +608,7 @@ func (engine *Engine) reconcileActiveKill(ctx context.Context, active operation.
 	if progress.KillEscalationDeadline == nil {
 		return errors.New("active signaled Kill is missing its durable escalation deadline")
 	}
-	if !engine.clock.Now().Before(*progress.KillEscalationDeadline) {
+	if !engine.diagnosticNow().Before(*progress.KillEscalationDeadline) {
 		_, err = engine.KillContainer(ctx, lifecycle.KillRequest{
 			OperationID: active.ID, ContainerID: domain.ContainerID(active.Target.ID), Policy: policy,
 		})
@@ -676,14 +677,17 @@ func (engine *Engine) checkpointInitialKillDuringRecovery(ctx context.Context, a
 	if err != nil {
 		return err
 	}
+	signalStartedAt := engine.beginMeasurement()
 	delivery, signalErr := engine.providers.Isolation.SignalVerified(ctx, provider.SignalRequest{
 		Owner: process.Owner, Process: process, ActionOperationID: active.ID,
 		Step: provider.SignalStepInitial, Signal: signal,
 	})
+	signalMeasurement := engine.finishMeasurement(signalStartedAt)
 	if signalErr == nil {
-		_, err = engine.checkpointKillSignal(ctx, active.ID, target, active.Fingerprint, delivery, policy.GracePeriod)
+		_, err = engine.checkpointKillSignal(ctx, active.ID, target, active.Fingerprint, delivery, policy.GracePeriod, signalMeasurement)
 		return err
 	}
+	observationStartedAt := engine.beginMeasurement()
 	observation, observeErr := engine.observeAfterSignalError(ctx, process, signalErr)
 	if observeErr != nil {
 		if provider.IsObservationUnavailable(observeErr) {
@@ -691,17 +695,19 @@ func (engine *Engine) checkpointInitialKillDuringRecovery(ctx context.Context, a
 		}
 		return observeErr
 	}
-	return engine.recordRecoveredKillTerminalLocked(ctx, active, cgroup, observation)
+	return engine.recordRecoveredKillTerminalLocked(ctx, active, cgroup, observation, observationStartedAt)
 }
 
 // recordRecoveredKillTerminalLocked closes the natural-exit race discovered
 // while resuming a pre-deadline Kill without sending another physical signal.
-func (engine *Engine) recordRecoveredKillTerminalLocked(ctx context.Context, active operation.Operation, cgroup ownership.Receipt, observation AttemptObservation) error {
+// Its observation span includes the provider read needed for terminal OOM attribution.
+func (engine *Engine) recordRecoveredKillTerminalLocked(ctx context.Context, active operation.Operation, cgroup ownership.Receipt, observation AttemptObservation, observationStartedAt time.Time) error {
 	attributed, err := engine.attributeTerminalOOM(ctx, cgroup, observation)
 	if err != nil {
 		return err
 	}
-	if _, err = engine.checkpointProgress(ctx, active.ID, active.Target, active.Fingerprint, operation.StageObserveProcess, attributed); err != nil {
+	measurement := engine.finishMeasurement(observationStartedAt)
+	if _, err = engine.checkpointProgress(ctx, active.ID, active.Target, active.Fingerprint, operation.StageObserveProcess, attributed, measurement); err != nil {
 		return err
 	}
 	_, err = engine.lifecycle.RecordKillStopped(ctx, lifecycle.KillStoppedRequest{
@@ -709,7 +715,7 @@ func (engine *Engine) recordRecoveredKillTerminalLocked(ctx context.Context, act
 		Outcome: attributed.Outcome, Conditions: terminalConditions(attributed.Outcome),
 		Verification: lifecycle.Verification{
 			Kind: lifecycle.VerificationAttemptStopped, Verified: true,
-			Evidence: attributed.Evidence, ObservedAt: engine.clock.Now(),
+			Evidence: attributed.Evidence, ObservedAt: engine.diagnosticNow(),
 		},
 	})
 	return err
@@ -753,7 +759,7 @@ func (engine *Engine) checkpointStartingRecovery(ctx context.Context, active ope
 		Stage: progress.Operation.Stage, RollbackCause: progress.RollbackCause, OOMBaseline: progress.OOMBaseline,
 		KillEscalationDeadline: progress.KillEscalationDeadline,
 		Rollback:               cloneRollback(progress.Rollback), Receipts: cloneReceipts(progress.Receipts),
-		Releases: cloneReleases(progress.Releases), OccurredAt: engine.clock.Now(),
+		Releases: cloneReleases(progress.Releases), OccurredAt: engine.diagnosticNow(),
 		Details: map[string]string{"recovery": "workload start remains in progress"}, UpsertCondition: &condition,
 	})
 	return err

@@ -166,7 +166,7 @@ func (c *Coordinator) persistOperationConflict(tx state.Tx, binding operation.Bi
 		return resolvedOperation{}, err
 	}
 	event := operation.Event{
-		SchemaVersion: operation.SchemaVersion, OperationID: value.ID, Type: value.Type,
+		SchemaVersion: operation.EventSchemaVersion, OperationID: value.ID, Type: value.Type,
 		Target: value.Target, Resources: resources, Stage: value.Stage, Result: value.Result,
 		Reason: value.Reason, OccurredAt: c.clock.Now(),
 		Generation: uint64(generation), ObservedGeneration: uint64(observed),
@@ -406,7 +406,7 @@ func appendOperationEvent(
 	stage operation.Stage,
 	result operation.Result,
 	occurredAt time.Time,
-	duration operation.Duration,
+	duration *operation.Duration,
 	generation domain.Generation,
 	observed domain.Generation,
 	details any,
@@ -420,7 +420,7 @@ func appendOperationEvent(
 		resources = []operation.Target{value.Target}
 	}
 	event := operation.Event{
-		SchemaVersion:      operation.SchemaVersion,
+		SchemaVersion:      operation.EventSchemaVersion,
 		OperationID:        value.ID,
 		Type:               value.Type,
 		Target:             value.Target,

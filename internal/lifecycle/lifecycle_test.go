@@ -725,9 +725,10 @@ func testIdentity() domain.ProcessIdentity {
 
 // testVerification returns one explicit external observation at deterministic time and duration.
 func testVerification(kind VerificationKind, identity *domain.ProcessIdentity) Verification {
+	duration := operation.Duration(5 * time.Millisecond)
 	return Verification{
 		Kind: kind, Verified: true, Evidence: "test-provider-observed", ObservedAt: testWallTime(),
-		Duration: operation.Duration(5 * time.Millisecond), ProcessIdentity: identity,
+		Duration: &duration, ProcessIdentity: identity,
 		Streams: domain.StreamReferences{Stdout: "stream://stdout", Stderr: "stream://stderr"},
 	}
 }

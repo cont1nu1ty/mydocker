@@ -22,10 +22,11 @@ type fakeClock struct {
 }
 
 type fakeEvaluationClient struct {
-	calls     []string
-	events    []v1.Event
-	failPhase string
-	failures  map[string]v1.ErrorCode
+	calls             []string
+	events            []v1.Event
+	failPhase         string
+	failures          map[string]v1.ErrorCode
+	omitEventDuration bool
 }
 
 type sequentialIDs struct {
@@ -125,6 +126,11 @@ func (fake *fakeEvaluationClient) complete(phase, operationID string) error {
 		result = "failed"
 		err = v1.NewError(failureCode, phase, "injected fake lifecycle failure")
 	}
+	var duration *int64
+	if !fake.omitEventDuration {
+		measured := int64(time.Millisecond)
+		duration = &measured
+	}
 	fake.events = append(fake.events, v1.Event{
 		Sequence:            uint64(len(fake.events) + 1),
 		OperationID:         operationID,
@@ -134,7 +140,7 @@ func (fake *fakeEvaluationClient) complete(phase, operationID string) error {
 		Result:              result,
 		Reason:              "fake",
 		OccurredAt:          time.Unix(1700000000, 0).UTC(),
-		DurationNanoseconds: int64(time.Millisecond),
+		DurationNanoseconds: duration,
 	})
 	return err
 }
@@ -161,7 +167,7 @@ func validScenario(classification string, samples int) scenario {
 			Cache: scenarioCacheState{
 				Content:         "present-verified",
 				UnpackedChain:   "present-verified",
-				Snapshot:        "new-per-attempt",
+				Snapshot:        preparedRootfsSnapshot,
 				PageCache:       "unknown",
 				ImmutableLayers: "reused",
 			},
@@ -285,6 +291,28 @@ func TestWarmScenarioReusesSandboxAndEmitsRawJSONL(t *testing.T) {
 	}
 	if callerSpans != len(wantCalls)+2 || e2eSpans != 2 || stageEvents != len(wantCalls)-2 {
 		t.Fatalf("caller/E2E/event counts = %d/%d/%d", callerSpans, e2eSpans, stageEvents)
+	}
+}
+
+// TestEvaluatorPreservesMissingDaemonDuration verifies stage evidence remains unavailable instead of being normalized to a zero sample.
+func TestEvaluatorPreservesMissingDaemonDuration(t *testing.T) {
+	fake := &fakeEvaluationClient{omitEventDuration: true}
+	status, stdout, stderr := runFakeScenario(t, validScenario("cold", 1), fake)
+	if status != 0 {
+		t.Fatalf("status = %d, stderr = %s", status, stderr)
+	}
+	found := false
+	for _, record := range decodeRecords(t, stdout) {
+		if record.RecordType != "stage_event" {
+			continue
+		}
+		found = true
+		if record.Event == nil || record.Event.DurationNanoseconds != nil {
+			t.Fatalf("missing daemon duration became a sample: %#v", record.Event)
+		}
+	}
+	if !found {
+		t.Fatal("evaluator emitted no stage event fixture")
 	}
 }
 
@@ -432,6 +460,16 @@ func TestInvalidScenarioFailsBeforeClientConstruction(t *testing.T) {
 		}, (&sequentialIDs{}).Next, &fakeClock{now: time.Unix(1700000000, 0).UTC()}, fakeRecordedEnvironment)
 	if status != 2 || factoryCalled {
 		t.Fatalf("status/factory = %d/%v, stderr = %s", status, factoryCalled, stderr.String())
+	}
+}
+
+// TestScenarioRejectsInventedSnapshotEvidence verifies the M3 evaluator cannot
+// sign a per-Attempt snapshot claim while its provider uses one shared prepared rootfs.
+func TestScenarioRejectsInventedSnapshotEvidence(t *testing.T) {
+	input := validScenario("cold", 1)
+	input.Environment.Cache.Snapshot = "new-per-attempt"
+	if err := input.Validate(); err == nil {
+		t.Fatal("scenario with invented snapshot evidence was accepted")
 	}
 }
 

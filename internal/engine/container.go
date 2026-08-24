@@ -19,6 +19,7 @@ const escalationObservationTimeout = 5 * time.Second
 // CreateContainer persists a one-to-one Container/Attempt, checkpoints every
 // canonical host acquisition, confirms init membership, and only then marks it Created.
 func (engine *Engine) CreateContainer(ctx context.Context, request lifecycle.ContainerCreateRequest) (lifecycle.ContainerResult, error) {
+	operationStartedAt := engine.beginMeasurement()
 	target := operation.Target{Kind: operation.TargetContainer, ID: string(request.ContainerID)}
 	release := engine.targetLocks.lock(target)
 	defer release()
@@ -32,7 +33,9 @@ func (engine *Engine) CreateContainer(ctx context.Context, request lifecycle.Con
 		}
 		return engine.lifecycle.BeginContainerCreate(ctx, request)
 	}
+	preflightStartedAt := engine.beginMeasurement()
 	capabilities, err := engine.preflight(ctx)
+	preflightMeasurement := engine.finishMeasurement(preflightStartedAt)
 	if err != nil {
 		return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonPrecondition, err)
 	}
@@ -41,7 +44,7 @@ func (engine *Engine) CreateContainer(ctx context.Context, request lifecycle.Con
 		return result, err
 	}
 	if len(progress.Receipts) == 0 && progress.Operation.Stage == operation.StagePersistIntent {
-		if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageHostPreflight, capabilities); err != nil {
+		if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageHostPreflight, capabilities, preflightMeasurement); err != nil {
 			return result, err
 		}
 	}
@@ -73,14 +76,16 @@ func (engine *Engine) CreateContainer(ctx context.Context, request lifecycle.Con
 		if len(progress.Receipts) >= 7 {
 			break
 		}
+		acquireStartedAt := engine.beginMeasurement()
 		receipt, stage, acquireErr := engine.acquireContainerReceipt(ctx, owner, pair, sandboxNamespaces, retainedSandbox.Spec.DNS, progress.Receipts)
+		acquireMeasurement := engine.finishMeasurement(acquireStartedAt)
 		if acquireErr != nil {
 			if provider.IsNoEffect(acquireErr) || provider.IsRollbackRequired(acquireErr) {
 				return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonInternal, acquireErr)
 			}
 			return result, acquireErr
 		}
-		if _, err = engine.checkpointReceipt(ctx, request.OperationID, target, result.Fingerprint, stage, receipt); err != nil {
+		if _, err = engine.checkpointReceipt(ctx, request.OperationID, target, result.Fingerprint, stage, receipt, acquireMeasurement); err != nil {
 			return result, err
 		}
 	}
@@ -92,14 +97,16 @@ func (engine *Engine) CreateContainer(ctx context.Context, request lifecycle.Con
 	if err := engine.registerProcessIdentity(process); err != nil {
 		return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonInternal, err)
 	}
+	attachmentStartedAt := engine.beginMeasurement()
 	attachment, err := engine.providers.Cgroup.AttachAttemptProcess(ctx, provider.AttachProcessRequest{Owner: owner, Cgroup: cgroup, Process: process})
+	attachmentMeasurement := engine.finishMeasurement(attachmentStartedAt)
 	if err != nil {
 		return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonInternal, err)
 	}
 	if err := attachment.ValidateFor(provider.AttachProcessRequest{Owner: owner, Cgroup: cgroup, Process: process}); err != nil {
 		return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonInternal, err)
 	}
-	if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageAttachCgroup, attachment); err != nil {
+	if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageAttachCgroup, attachment, attachmentMeasurement); err != nil {
 		return result, err
 	}
 	progress, err = engine.lifecycle.GetOperationProgress(ctx, request.OperationID)
@@ -107,11 +114,13 @@ func (engine *Engine) CreateContainer(ctx context.Context, request lifecycle.Con
 		return result, err
 	}
 	if progress.OOMBaseline == nil {
+		baselineStartedAt := engine.beginMeasurement()
 		baseline, snapshotErr := engine.providers.Cgroup.SnapshotAttemptOOM(ctx, provider.OwnedReceiptRequest{Owner: owner, Receipt: cgroup})
+		baselineMeasurement := engine.finishMeasurement(baselineStartedAt)
 		if snapshotErr != nil {
 			return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonInternal, snapshotErr)
 		}
-		if _, err = engine.checkpointOOMBaseline(ctx, request.OperationID, target, result.Fingerprint, baseline); err != nil {
+		if _, err = engine.checkpointOOMBaseline(ctx, request.OperationID, target, result.Fingerprint, baseline, baselineMeasurement); err != nil {
 			return result, err
 		}
 	}
@@ -136,11 +145,12 @@ func (engine *Engine) CreateContainer(ctx context.Context, request lifecycle.Con
 	if err != nil {
 		return result, engine.failDefiniteCreateLocked(ctx, request.OperationID, operation.ReasonInternal, err)
 	}
+	completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 	return engine.lifecycle.ConfirmContainerCreate(ctx, lifecycle.ContainerConfirmRequest{
 		OperationID: request.OperationID, ContainerID: request.ContainerID, Fingerprint: result.Fingerprint,
 		Verification: lifecycle.Verification{
 			Kind: lifecycle.VerificationAttemptCreated, Verified: true, Evidence: evidence,
-			ObservedAt: engine.clock.Now(), ProcessIdentity: &identity, Streams: streams,
+			ObservedAt: completion.occurredAt, Duration: completion.duration, ProcessIdentity: &identity, Streams: streams,
 		},
 	})
 }
@@ -148,6 +158,7 @@ func (engine *Engine) CreateContainer(ctx context.Context, request lifecycle.Con
 // DeleteContainer removes the complete retained Attempt inventory in dependency order
 // and deletes metadata only after every exact absence receipt is durable.
 func (engine *Engine) DeleteContainer(ctx context.Context, request lifecycle.ContainerActionRequest) (lifecycle.ContainerResult, error) {
+	operationStartedAt := engine.beginMeasurement()
 	target := operation.Target{Kind: operation.TargetContainer, ID: string(request.ContainerID)}
 	releaseTarget := engine.targetLocks.lock(target)
 	defer releaseTarget()
@@ -158,9 +169,11 @@ func (engine *Engine) DeleteContainer(ctx context.Context, request lifecycle.Con
 	inventory, inventoryErr := engine.containerInventory(ctx, request.ContainerID)
 	if inventoryErr != nil {
 		if lifecycle.IsCheckpointNotFound(inventoryErr) {
+			completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 			return engine.lifecycle.ConfirmContainerDelete(ctx, lifecycle.ContainerConfirmRequest{
 				OperationID: request.OperationID, ContainerID: request.ContainerID, Fingerprint: result.Fingerprint,
-				Verification: lifecycle.Verification{Kind: lifecycle.VerificationAttemptAbsent, Verified: true, Evidence: "metadata_absent_without_owned_receipts", ObservedAt: engine.clock.Now()},
+				Verification: lifecycle.Verification{Kind: lifecycle.VerificationAttemptAbsent, Verified: true, Evidence: "metadata_absent_without_owned_receipts",
+					ObservedAt: completion.occurredAt, Duration: completion.duration},
 			})
 		}
 		return result, inventoryErr
@@ -184,7 +197,9 @@ func (engine *Engine) DeleteContainer(ctx context.Context, request lifecycle.Con
 		if releaseByKind(progress.Releases, kind) != nil {
 			continue
 		}
+		cleanupStartedAt := engine.beginMeasurement()
 		observation, cleanupErr := engine.cleanupReceipt(ctx, receipt)
+		cleanupMeasurement := engine.finishMeasurement(cleanupStartedAt)
 		if cleanupErr != nil {
 			return result, cleanupErr
 		}
@@ -192,7 +207,7 @@ func (engine *Engine) DeleteContainer(ctx context.Context, request lifecycle.Con
 		if releaseErr != nil {
 			return result, releaseErr
 		}
-		if _, checkpointErr := engine.checkpointRelease(ctx, request.OperationID, target, result.Fingerprint, release); checkpointErr != nil {
+		if _, checkpointErr := engine.checkpointRelease(ctx, request.OperationID, target, result.Fingerprint, release, cleanupMeasurement); checkpointErr != nil {
 			return result, checkpointErr
 		}
 		if kind == ownership.KindInitProcess {
@@ -207,14 +222,17 @@ func (engine *Engine) DeleteContainer(ctx context.Context, request lifecycle.Con
 	if err != nil {
 		return result, err
 	}
+	completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 	return engine.lifecycle.ConfirmContainerDelete(ctx, lifecycle.ContainerConfirmRequest{
 		OperationID: request.OperationID, ContainerID: request.ContainerID, Fingerprint: result.Fingerprint,
-		Verification: lifecycle.Verification{Kind: lifecycle.VerificationAttemptAbsent, Verified: true, Evidence: evidence, ObservedAt: engine.clock.Now()},
+		Verification: lifecycle.Verification{Kind: lifecycle.VerificationAttemptAbsent, Verified: true, Evidence: evidence,
+			ObservedAt: completion.occurredAt, Duration: completion.duration},
 	})
 }
 
 // KillContainer executes a side-effect-free lifecycle plan through the verified wrapper provider, persists a delivery-anchored absolute grace deadline, and records only a supervisor terminal fact.
 func (engine *Engine) KillContainer(ctx context.Context, request lifecycle.KillRequest) (lifecycle.KillResult, error) {
+	operationStartedAt := engine.beginMeasurement()
 	target := operation.Target{Kind: operation.TargetContainer, ID: string(request.ContainerID)}
 	releaseTarget := engine.targetLocks.lock(target)
 	defer releaseTarget()
@@ -239,6 +257,7 @@ func (engine *Engine) KillContainer(ctx context.Context, request lifecycle.KillR
 		return result, err
 	}
 	var observation AttemptObservation
+	var observationStartedAt time.Time
 	terminalAfterSignalError := false
 	switch progress.Operation.Stage {
 	case operation.StagePersistIntent:
@@ -246,11 +265,14 @@ func (engine *Engine) KillContainer(ctx context.Context, request lifecycle.KillR
 		if signalErr != nil {
 			return result, signalErr
 		}
+		signalStartedAt := engine.beginMeasurement()
 		delivery, signalErr := engine.providers.Isolation.SignalVerified(ctx, provider.SignalRequest{
 			Owner: process.Owner, Process: process, ActionOperationID: request.OperationID,
 			Step: provider.SignalStepInitial, Signal: initialSignal,
 		})
+		signalMeasurement := engine.finishMeasurement(signalStartedAt)
 		if signalErr != nil {
+			observationStartedAt = engine.beginMeasurement()
 			observation, err = engine.observeAfterSignalError(ctx, process, signalErr)
 			if err != nil {
 				return result, err
@@ -258,13 +280,16 @@ func (engine *Engine) KillContainer(ctx context.Context, request lifecycle.KillR
 			terminalAfterSignalError = true
 			break
 		}
-		progress, err = engine.checkpointKillSignal(ctx, request.OperationID, target, result.Fingerprint, delivery, result.Plan.GracePeriod)
+		progress, err = engine.checkpointKillSignal(ctx, request.OperationID, target, result.Fingerprint, delivery, result.Plan.GracePeriod, signalMeasurement)
 		if err != nil {
 			return result, err
 		}
+		observationStartedAt = engine.beginMeasurement()
 	case operation.StageSignalProcess:
 		// A confirmed initial delivery is never sent again; an unconfirmed response-loss retry uses the provider's durable action key above.
+		observationStartedAt = engine.beginMeasurement()
 	case operation.StageObserveProcess:
+		observationStartedAt = engine.beginMeasurement()
 		observation, err = engine.providers.Supervisor.ObserveAttempt(ctx, provider.OwnedReceiptRequest{Owner: process.Owner, Receipt: process})
 		if err != nil {
 			return result, err
@@ -313,14 +338,17 @@ func (engine *Engine) KillContainer(ctx context.Context, request lifecycle.KillR
 	if err != nil {
 		return result, err
 	}
-	if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageObserveProcess, observation); err != nil {
+	observationMeasurement := engine.finishMeasurement(observationStartedAt)
+	if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageObserveProcess, observation, observationMeasurement); err != nil {
 		return result, err
 	}
 	conditions := terminalConditions(observation.Outcome)
+	completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 	return engine.lifecycle.RecordKillStopped(ctx, lifecycle.KillStoppedRequest{
 		OperationID: request.OperationID, ContainerID: request.ContainerID, Fingerprint: result.Fingerprint,
 		Outcome: observation.Outcome, Conditions: conditions,
-		Verification: lifecycle.Verification{Kind: lifecycle.VerificationAttemptStopped, Verified: true, Evidence: observation.Evidence, ObservedAt: engine.clock.Now()},
+		Verification: lifecycle.Verification{Kind: lifecycle.VerificationAttemptStopped, Verified: true, Evidence: observation.Evidence,
+			ObservedAt: completion.occurredAt, Duration: completion.duration},
 	})
 }
 
@@ -370,17 +398,20 @@ func (engine *Engine) waitForConfirmedTerminal(ctx context.Context, process owne
 
 // RecordTerminal observes a naturally exited wrapper and persists the outcome through the two-stage Linux lifecycle boundary.
 func (engine *Engine) RecordTerminal(ctx context.Context, operationID operation.OperationID, containerID domain.ContainerID) (lifecycle.ContainerResult, error) {
+	operationStartedAt := engine.beginMeasurement()
 	target := operation.Target{Kind: operation.TargetContainer, ID: string(containerID)}
 	releaseTarget := engine.targetLocks.lock(target)
 	defer releaseTarget()
+	observationStartedAt := engine.beginMeasurement()
 	observation, err := engine.observeRetainedAttemptLocked(ctx, containerID)
+	observationMeasurement := engine.finishMeasurement(observationStartedAt)
 	if err != nil {
 		return lifecycle.ContainerResult{}, err
 	}
 	if !observation.Terminal {
 		return lifecycle.ContainerResult{}, errors.New("natural terminal record requires a terminal supervisor observation")
 	}
-	return engine.recordObservedTerminalLocked(ctx, operationID, containerID, observation)
+	return engine.recordObservedTerminalLocked(ctx, operationID, containerID, observation, observationMeasurement, operationStartedAt)
 }
 
 // observeRetainedAttemptLocked reads and validates one exact adopted wrapper
@@ -416,8 +447,9 @@ func (engine *Engine) observeRetainedAttemptLocked(ctx context.Context, containe
 }
 
 // recordObservedTerminalLocked persists one already validated terminal fact
-// without re-observing or reacquiring the Container target lock.
-func (engine *Engine) recordObservedTerminalLocked(ctx context.Context, operationID operation.OperationID, containerID domain.ContainerID, observation AttemptObservation) (lifecycle.ContainerResult, error) {
+// without re-observing or reacquiring the Container target lock. The supplied
+// operation start precedes the observation so a new complete span contains its stage.
+func (engine *Engine) recordObservedTerminalLocked(ctx context.Context, operationID operation.OperationID, containerID domain.ContainerID, observation AttemptObservation, measurement stageMeasurement, operationStartedAt time.Time) (lifecycle.ContainerResult, error) {
 	if err := observation.Validate(); err != nil {
 		return lifecycle.ContainerResult{}, err
 	}
@@ -430,9 +462,12 @@ func (engine *Engine) recordObservedTerminalLocked(ctx context.Context, operatio
 	if err != nil || begin.Operation.State.Terminal() {
 		return begin, err
 	}
-	if _, err = engine.checkpointProgress(ctx, operationID, target, begin.Fingerprint, operation.StageObserveProcess, observation); err != nil {
+	if _, err = engine.checkpointProgress(ctx, operationID, target, begin.Fingerprint, operation.StageObserveProcess, observation, measurement); err != nil {
 		return begin, err
 	}
+	completion := engine.finishOperationMeasurement(operationStartedAt, begin.Resolution)
+	request.Verification.ObservedAt = completion.occurredAt
+	request.Verification.Duration = completion.duration
 	return engine.lifecycle.RecordStopped(ctx, request)
 }
 
@@ -444,7 +479,7 @@ func (engine *Engine) terminalRecordRequest(operationID operation.OperationID, c
 		Conditions: terminalConditions(observation.Outcome),
 		Verification: lifecycle.Verification{
 			Kind: lifecycle.VerificationAttemptStopped, Verified: true,
-			Evidence: observation.Evidence, ObservedAt: engine.clock.Now(),
+			Evidence: observation.Evidence, ObservedAt: engine.diagnosticNow(),
 		},
 	}
 }
@@ -500,7 +535,7 @@ func (engine *Engine) waitForTerminalUntil(ctx context.Context, process ownershi
 		if err := observation.Validate(); err != nil {
 			return AttemptObservation{}, err
 		}
-		now := engine.clock.Now()
+		now := engine.diagnosticNow()
 		if observation.Terminal || !now.Before(deadline) {
 			return observation, nil
 		}
@@ -606,6 +641,7 @@ func sandboxNamespaces(receipts []ownership.Receipt) (provider.SandboxNamespaces
 // StartContainer verifies adopted preparation, persists attach/release/observe in order,
 // and confirms Running only from an explicit workload-child observation.
 func (engine *Engine) StartContainer(ctx context.Context, request lifecycle.ContainerActionRequest) (lifecycle.ContainerResult, error) {
+	operationStartedAt := engine.beginMeasurement()
 	target := operation.Target{Kind: operation.TargetContainer, ID: string(request.ContainerID)}
 	release := engine.targetLocks.lock(target)
 	defer release()
@@ -635,11 +671,13 @@ func (engine *Engine) StartContainer(ctx context.Context, request lifecycle.Cont
 		return result, err
 	}
 	if progress.Operation.Stage == operation.StagePersistIntent {
+		attachmentStartedAt := engine.beginMeasurement()
 		attachment, attachErr := engine.providers.Cgroup.AttachAttemptProcess(ctx, provider.AttachProcessRequest{Owner: resourceOwner, Cgroup: cgroup, Process: process})
+		attachmentMeasurement := engine.finishMeasurement(attachmentStartedAt)
 		if attachErr != nil {
 			return result, attachErr
 		}
-		if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageAttachCgroup, attachment); err != nil {
+		if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageAttachCgroup, attachment, attachmentMeasurement); err != nil {
 			return result, err
 		}
 		progress, err = engine.lifecycle.GetOperationProgress(ctx, request.OperationID)
@@ -648,6 +686,7 @@ func (engine *Engine) StartContainer(ctx context.Context, request lifecycle.Cont
 		}
 	}
 	if progress.Operation.Stage == operation.StageAttachCgroup {
+		releaseStartedAt := engine.beginMeasurement()
 		attachment, attachErr := engine.providers.Cgroup.AttachAttemptProcess(ctx, provider.AttachProcessRequest{Owner: resourceOwner, Cgroup: cgroup, Process: process})
 		if attachErr != nil {
 			return result, attachErr
@@ -683,10 +722,12 @@ func (engine *Engine) StartContainer(ctx context.Context, request lifecycle.Cont
 				releaseEvidence = afterRelease
 			}
 		}
-		if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageReleaseStartGate, releaseEvidence); err != nil {
+		releaseMeasurement := engine.finishMeasurement(releaseStartedAt)
+		if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageReleaseStartGate, releaseEvidence, releaseMeasurement); err != nil {
 			return result, err
 		}
 	}
+	observationStartedAt := engine.beginMeasurement()
 	workload, err := engine.providers.Supervisor.ObserveAttempt(ctx, provider.OwnedReceiptRequest{Owner: resourceOwner, Receipt: process})
 	if err != nil {
 		return result, err
@@ -698,7 +739,8 @@ func (engine *Engine) StartContainer(ctx context.Context, request lifecycle.Cont
 	if err != nil {
 		return result, err
 	}
-	if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageObserveProcess, workload); err != nil {
+	observationMeasurement := engine.finishMeasurement(observationStartedAt)
+	if _, err = engine.checkpointProgress(ctx, request.OperationID, target, result.Fingerprint, operation.StageObserveProcess, workload, observationMeasurement); err != nil {
 		return result, err
 	}
 	progress, err = engine.lifecycle.GetOperationProgress(ctx, request.OperationID)
@@ -710,11 +752,13 @@ func (engine *Engine) StartContainer(ctx context.Context, request lifecycle.Cont
 		return result, err
 	}
 	if workload.Terminal {
+		completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 		return engine.lifecycle.RecordContainerStartTerminal(ctx, lifecycle.ContainerStartTerminalRequest{
 			OperationID: request.OperationID, ContainerID: request.ContainerID, Fingerprint: result.Fingerprint,
 			Outcome: workload.Outcome, Conditions: terminalConditions(workload.Outcome),
 			Verification: lifecycle.Verification{
-				Kind: lifecycle.VerificationAttemptStopped, Verified: true, Evidence: workload.Evidence, ObservedAt: engine.clock.Now(),
+				Kind: lifecycle.VerificationAttemptStopped, Verified: true, Evidence: workload.Evidence,
+				ObservedAt: completion.occurredAt, Duration: completion.duration,
 			},
 		})
 	}
@@ -726,11 +770,12 @@ func (engine *Engine) StartContainer(ctx context.Context, request lifecycle.Cont
 		return result, err
 	}
 	identity := domain.ProcessIdentity{Verified: true, Handle: processIdentityHandle(process), Evidence: process.EvidenceSHA256}
+	completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 	return engine.lifecycle.ConfirmContainerStart(ctx, lifecycle.ContainerConfirmRequest{
 		OperationID: request.OperationID, ContainerID: request.ContainerID, Fingerprint: result.Fingerprint,
 		Verification: lifecycle.Verification{
 			Kind: lifecycle.VerificationAttemptRunning, Verified: true, Evidence: workload.Evidence,
-			ObservedAt: engine.clock.Now(), ProcessIdentity: &identity, Streams: pair.Attempt.Streams,
+			ObservedAt: completion.occurredAt, Duration: completion.duration, ProcessIdentity: &identity, Streams: pair.Attempt.Streams,
 		},
 	})
 }

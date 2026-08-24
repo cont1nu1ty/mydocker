@@ -273,8 +273,8 @@ func TestIsolationProviderRejectsEnvironmentBeforeLauncherEffects(t *testing.T) 
 }
 
 // TestInspectLauncherPreservesObservationClassification verifies a temporary
-// read outage passes through exactly while launcher incompleteness remains a
-// distinct permanent fail-closed error rather than being generalized.
+// read outage passes through exactly while an unrelated permanent launcher
+// failure remains distinct rather than being generalized.
 func TestInspectLauncherPreservesObservationClassification(t *testing.T) {
 	launcher := &fakeLauncher{runtime: newFakeRuntime()}
 	fixture := newSlimFixture(t, launcher)
@@ -292,10 +292,11 @@ func TestInspectLauncherPreservesObservationClassification(t *testing.T) {
 	if err != classified {
 		t.Fatalf("InspectProcess() error = %v, want exact classified outage", err)
 	}
-	launcher.inspectErr = ErrLauncherIncomplete
+	permanentFailure := errors.New("injected permanent launcher failure")
+	launcher.inspectErr = permanentFailure
 	_, err = fixture.provider.InspectProcess(context.Background(), providerapi.OwnedReceiptRequest{Owner: owner, Receipt: keeper})
-	if !errors.Is(err, ErrLauncherIncomplete) || providerapi.IsObservationUnavailable(err) {
-		t.Fatalf("InspectProcess(incomplete) error = %v, want distinct launcher failure", err)
+	if !errors.Is(err, permanentFailure) || providerapi.IsObservationUnavailable(err) {
+		t.Fatalf("InspectProcess(permanent) error = %v, want distinct launcher failure", err)
 	}
 }
 

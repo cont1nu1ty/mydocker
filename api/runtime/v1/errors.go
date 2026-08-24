@@ -28,7 +28,7 @@ const (
 	CodeConflict ErrorCode = "conflict"
 	// CodeOperationExpired reports a remembered operation whose exact response left the replay window.
 	CodeOperationExpired ErrorCode = "operation_expired"
-	// CodeResumeGap reports an event cursor older than the retained contiguous suffix.
+	// CodeResumeGap reports an event or log cursor outside the committed resumable boundary.
 	CodeResumeGap ErrorCode = "resume_gap"
 	// CodeResourceExhausted reports a hard bounded-state capacity that requires operator action.
 	CodeResourceExhausted ErrorCode = "resource_exhausted"

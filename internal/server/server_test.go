@@ -29,6 +29,7 @@ type fakeService struct {
 	createHook      func(context.Context, v1.RequestContext, v1.CreateSandboxRequest) (v1.SandboxResponse, error)
 	getSandboxHook  func(context.Context, v1.RequestContext, string) (v1.SandboxResponse, error)
 	eventsHook      func(context.Context, v1.RequestContext, v1.ListEventsRequest) ([]v1.Event, error)
+	logsHook        func(context.Context, v1.RequestContext, v1.ListLogsRequest) ([]v1.LogFrame, error)
 	events          []v1.Event
 	logs            []v1.LogFrame
 }
@@ -143,8 +144,11 @@ func (service *fakeService) EventsAfter(ctx context.Context, requestContext v1.R
 	return result, nil
 }
 
-// LogsAfter returns a bounded identity-scoped suffix suitable for API pagination tests.
-func (service *fakeService) LogsAfter(_ context.Context, _ v1.RequestContext, input v1.ListLogsRequest) ([]v1.LogFrame, error) {
+// LogsAfter delegates to an injected cursor outcome or returns a bounded identity-scoped suffix suitable for API pagination tests.
+func (service *fakeService) LogsAfter(ctx context.Context, requestContext v1.RequestContext, input v1.ListLogsRequest) ([]v1.LogFrame, error) {
+	if service.logsHook != nil {
+		return service.logsHook(ctx, requestContext, input)
+	}
 	service.mu.Lock()
 	defer service.mu.Unlock()
 	result := make([]v1.LogFrame, 0, input.Limit)
@@ -346,6 +350,27 @@ func TestLogPaginationBindsAttemptAndPreservesStreams(t *testing.T) {
 	}
 	if _, err := apiClient.Logs(context.Background(), "container-one", "attempt-two", first.NextCursor, 2); client.CodeOf(err) != v1.CodeInvalidArgument {
 		t.Fatalf("cross-Attempt cursor error = %v, want invalid_argument", err)
+	}
+}
+
+// TestLogFutureCursorGapCrossesUDSTransport verifies a valid identity-bound but ahead-of-stream cursor remains resume_gap while a cross-Attempt cursor remains invalid_argument.
+func TestLogFutureCursorGapCrossesUDSTransport(t *testing.T) {
+	service := newFakeService()
+	service.logsHook = func(context.Context, v1.RequestContext, v1.ListLogsRequest) ([]v1.LogFrame, error) {
+		return nil, v1.NewError(v1.CodeResumeGap, "after", "restart with an empty log cursor")
+	}
+	_, apiClient, _ := startTestServer(t, service, Config{})
+	future, err := v1.NewLogCursor("container-one", "attempt-one", 2)
+	if err != nil {
+		t.Fatalf("NewLogCursor(future) error = %v", err)
+	}
+	_, err = apiClient.Logs(context.Background(), "container-one", "attempt-one", future, 2)
+	if !client.IsResumeGap(err) || client.CodeOf(err) != v1.CodeResumeGap || client.ExitStatus(err) != 4 {
+		t.Fatalf("Logs(future) code/status = %q/%d for %v, want resume_gap/4", client.CodeOf(err), client.ExitStatus(err), err)
+	}
+	_, err = apiClient.Logs(context.Background(), "container-one", "attempt-two", future, 2)
+	if client.CodeOf(err) != v1.CodeInvalidArgument || client.ExitStatus(err) != 2 {
+		t.Fatalf("Logs(cross-Attempt cursor) code/status = %q/%d for %v, want invalid_argument/2", client.CodeOf(err), client.ExitStatus(err), err)
 	}
 }
 

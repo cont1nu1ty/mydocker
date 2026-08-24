@@ -910,8 +910,9 @@ func testOperation(id, targetID string) operation.Operation {
 // testEvent builds an unsequenced valid event payload; AppendEvent is expected
 // to assign its authoritative global sequence before model validation.
 func testEvent(op operation.Operation) operation.Event {
+	duration := operation.Duration(time.Millisecond)
 	return operation.Event{
-		SchemaVersion: operation.SchemaVersion,
+		SchemaVersion: operation.EventSchemaVersion,
 		OperationID:   op.ID,
 		Type:          op.Type,
 		Target:        op.Target,
@@ -920,7 +921,7 @@ func testEvent(op operation.Operation) operation.Event {
 		Result:        operation.ResultPending,
 		Reason:        operation.ReasonNone,
 		OccurredAt:    time.Date(2026, time.August, 20, 0, 0, 0, 0, time.UTC),
-		Duration:      operation.Duration(time.Millisecond),
+		Duration:      &duration,
 	}
 }
 

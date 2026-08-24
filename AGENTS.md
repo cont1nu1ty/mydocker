@@ -10,7 +10,8 @@
 
 - mydocker 2.0 是一次彻底重写，而不是渐进式兼容版本。
 - 目标是实现一个仅支持 Linux、以 rootful 模式运行的单节点容器执行引擎。
-- mydocker 消费 OCI 镜像并负责 image-to-process 链路；它不构建镜像。
+- mydocker 2.0 的完整目标是消费 OCI 镜像并负责 image-to-process 链路；它不构建镜像。
+  当前里程碑的实际能力以 `README.md` 和 `docs/roadmap.md` 为准。
 - `Sandbox` 是一等资源，而不是 ID 包装器。
 - `Container Attempt` 表示稳定 Sandbox 中的一次执行。
 - 正确性优先于可靠性、度量、优化和功能数量。
@@ -32,10 +33,19 @@
 
 - CLI 是客户端；它不得拥有 detached workload 的生命周期。
 - `mydockerd` 是单节点生命周期和元数据的权威来源。
-- Sandbox 拥有稳定身份、网络身份、共享 UTS/IPC/network namespaces、
-  hostname/DNS 配置、labels、port mappings 和父 cgroup。
-- Container Attempt 拥有其进程、rootfs/snapshot、PID 和 mount namespaces、
-  子 cgroup、输出流、退出码、信号和 OOM 结果。
+- 运行时交付面只有 `mydocker`、`mydockerd` 和 `mydocker-shim` 三个程序入口；
+  `mydocker-eval` 是只通过 `pkg/client` 调用公共 API 的独立评测程序，不是运行时层。
+- `internal/engine` 是 `mydockerd` 内的 Go package，`Container Attempt` 是持久领域对象；
+  低层 runtime 是分布于 slim/isolation/cgroupv2/shim 的职责边界，当前没有
+  `mydocker-runtime` 二进制。
+- image/content/unpack/snapshot/mount/bundle 和完整 network 是 M4+ 目标能力；不得将
+  目标 package、职责边界或图中的方框描述成当前已存在的进程或实现。
+- Sandbox 领域边界拥有稳定身份、共享 UTS/IPC/network namespaces、hostname/DNS、
+  labels 和父 cgroup；M3 网络只实现 none/loopback，完整网络身份、IP 和 port mappings
+  是 M4+ 目标。
+- Container Attempt 拥有其进程、PID 和 mount namespaces、子 cgroup、输出流、
+  退出码、信号和 OOM 结果；M3 只拥有 prepared-rootfs 的 mount 视图与 receipt，
+  M4+ 才拥有每个 Attempt 独享的 snapshot。
 - 初期每个 API Container 恰好对应一个 Attempt；workload retry 会在同一
   Sandbox 下创建一组新的 Container/Attempt，而 transport retry 会复用原 operation。
 - 初期，一个 Ready Sandbox 最多只能有一个 active Container Attempt。

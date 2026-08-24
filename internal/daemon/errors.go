@@ -14,7 +14,6 @@ import (
 	"mydocker/internal/provider"
 	"mydocker/internal/rollback"
 	"mydocker/internal/shim"
-	"mydocker/internal/slim"
 	"mydocker/internal/state"
 )
 
@@ -54,6 +53,9 @@ func MapError(err error) error {
 	if errors.Is(err, state.ErrEventResumeGap) {
 		return v1.WrapError(v1.CodeResumeGap, "resume_token", "the requested position is outside the retained committed event stream; restart with an empty resume token", false, err)
 	}
+	if errors.Is(err, logstore.ErrCursorGap) {
+		return v1.WrapError(v1.CodeResumeGap, "after", "the requested position is outside the committed workload log stream; restart with an empty log cursor", false, err)
+	}
 	if errors.Is(err, state.ErrRetentionCapacity) {
 		return v1.WrapError(v1.CodeResourceExhausted, "operation_id", "the bounded operation identity capacity is exhausted and requires operator state rotation", false, err)
 	}
@@ -62,9 +64,6 @@ func MapError(err error) error {
 	}
 	if errors.Is(err, state.ErrRevisionConflict) {
 		return v1.WrapError(v1.CodeConflict, "", "authoritative state changed concurrently", true, err)
-	}
-	if errors.Is(err, slim.ErrLauncherIncomplete) {
-		return v1.WrapError(v1.CodeUnavailable, "", "Linux workload launcher is not available in this build", false, err)
 	}
 	var shimError *shim.Error
 	if errors.As(err, &shimError) {

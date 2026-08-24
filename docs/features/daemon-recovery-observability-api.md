@@ -7,10 +7,10 @@ API、`pkg/client`、JSON CLI、operation/event/log 查询、启动恢复、终�
 kill-deadline watcher 和只调用公共 API 的评测工具，并具有纯 Go/注入依赖测试。
 FileStore 已实现有界 operation/event retention、原子 compaction 和显式 resume gap。
 
-这仍不是生产可用声明：`LinuxShimLauncher` 在 UDS 绑定前明确以
-`ErrLauncherIncomplete` 失败关闭，真实 rootful lifecycle/daemon restart 尚未在一次性
-VM 上验收，固定 identity/envelope 上限也尚无在线 rollover。metrics、stats、tracing
-和 Image API 仍是后续 Proposed/Planned 能力。
+这仍不是生产可用声明：`LinuxShimLauncher` 已编码完整 process factory 与恢复所需
+证据，但真实 rootful lifecycle/daemon restart 尚未在一次性 VM 上验收，M3 的共享
+prepared-rootfs 也不是每 Attempt snapshot，固定 identity/envelope 上限尚无在线
+rollover。metrics、stats、tracing 和 Image API 仍是后续 Proposed/Planned 能力。
 
 ## 目的
 
@@ -44,6 +44,31 @@ namespace/cgroup/网络。
 以及客户端生成的 operation ID，串行化资源操作、持久化意图、调用 engine 服务，
 并返回类型化状态/错误。
 
+UDS 发布不依赖进程级 `umask`。server 以 `O_NOFOLLOW` 打开配置路径的父目录，验证该路径
+仍指向同一真实目录 inode、目录属于当前 euid，且 mode 不允许 group/other 写入；随后从
+启动前清理一直到 listener 关闭，对这个目录 inode 持有非阻塞 `flock`。这是一把父目录
+级的全生命周期租约：使用同一实现的 daemon 在该目录中的发布和清理会被串行化，第二个
+listener 必须等租约释放后才能启动。
+
+server 先在父目录下创建权限为 `0700` 的私有 staging 目录并 bind。若父目录带 setgid，
+staging 会保留 setgid 位，socket 的预期 GID 取父目录 GID；否则预期 GID 取 daemon 的
+effective GID。socket 通过父目录 descriptor 收紧为配置 mode（`mydockerd` 当前为
+`0660`），并验证 socket 类型、精确 mode、euid、预期 GID 和 inode，再用 Linux
+`renameat2(RENAME_NOREPLACE)` 原子发布。宽松 `umask` 产生的临时 mode 因而不会出现在
+公共路径，并发出现的 socket、普通文件或 symlink 也不会被覆盖。
+
+启动时清理 stale socket、发布失败回滚和 listener 关闭都不采用“先检查再 unlink”。
+server 会先把公共名称原子移动到新建的私有 quarantine，再通过 descriptor 比较 inode；
+只有仍是预期 inode 时才在 quarantine 内 unlink。若 inode 已被替换，则用
+`RENAME_NOREPLACE` 恢复它；如果公共名称又被占用，也会把替换 inode 保留在 quarantine
+并失败关闭，旧 listener 绝不会删除新 socket。
+
+当前只支持 Linux pathname UDS，不支持 abstract socket。正式绝对路径与实际生成的
+staging bind 路径分别按字节校验 `sun_path`：都不得超过 `107` 字节。正式路径恰为
+`107` 字节本身合法，但若同一父目录下的 staging 路径超限，启动仍会失败并清理 staging；
+正式路径超过上限则在创建 staging 前失败。原子发布后 server 还会通过正式路径自连接，
+只有该路径确实可达 listener 时才报告启动成功。
+
 engine 协调：
 
 - `SandboxService`：管理稳定环境的生命周期；
@@ -56,8 +81,8 @@ engine 协调：
 
 以下 Sandbox/Container 调用、`GetOperation`、分页 `EventsAfter` 和按
 Container/Attempt 绑定的 `LogsAfter` 已由 HTTP/JSON UDS v1、公共客户端和 CLI 实现；
-生产 launcher 未完成，因此这里只声明传输/服务契约通过纯测试，不声明真实 workload
-已经运行。
+生产 launcher 已编码，但这里只声明传输/服务契约和非特权组合测试通过，不声明真实
+rootful workload 已经运行。
 
 Sandbox 服务：
 
@@ -109,6 +134,18 @@ RemoveImage
 API 从首次实现起即带版本。版本化不仅针对路径字符串，还覆盖字段含义、state enum、
 重试/幂等行为、error code 和流式恢复语义。
 
+所有 JSON 边界都采用同一严格语义：请求/响应必须先受调用方字节上限约束，只允许一个
+完整 JSON 值，原始字节必须是合法 UTF-8，任何深度的 object 都不得出现解码后同名键
+（包括转义后等价的键）。对于解码到固定 struct wire schema 的 object，每个字段名还
+必须与声明的 JSON 名称精确匹配大小写；例如只声明 `mode` 时，`Mode` 或 `MODE` 都会被
+拒绝，不能利用标准库的大小写不敏感匹配覆盖规范字段。未知字段同样会被拒绝。
+
+map 的 object key 不套用 struct 字段规则，仍保持 JSON 的大小写敏感语义：`"Role"` 与
+`"role"` 是两个不同且可以同时存在的键，只有完全相同的重复键才会被拒绝；若 map 的
+value 本身解码到 struct，则 value 内继续递归执行精确 wire 字段规则。server 请求、CLI
+输入和 `pkg/client` 响应使用同一解码器；客户端收到完整但字段别名、重复键或非法 UTF-8
+的响应时将其视为不可重试的协议错误，而不是可信的远端结果或可自动重发的传输中断。
+
 初期，`CreateContainer` 创建一个 API/持久化 Container 聚合体和恰好一个
 面向内核的 Attempt，并返回两者的 ID。Container 查询、列表项、log、stats
 和 event 均暴露这两个身份。工作负载在终态之后重试时会发起新的
@@ -131,6 +168,11 @@ API 从首次实现起即带版本。版本化不仅针对路径字符串，还�
 
 一个操作可以发出多个 stage event，其中包含 operation type、stage、result、
 有界 reason class、wall-clock timestamp，以及在有效情况下使用的 monotonic duration。
+`duration_ns` 缺失表示未在同一进程调用内测量，不能归一化为零；显式 `0` 表示实测零。
+Provider action 分别计时，`persist_intent`/恢复 bookkeeping 留空；只有新接受 intent 的
+complete event 带本次调用总跨度，resume/recovery 留空，exact replay 保留原事件。
+当前 event schema-v2 将该时长建模为可选字段；FileStore schema-v3 加载旧 v1/v2
+snapshot 时，把历史 writer 的占位零迁移为缺失，再原子发布当前格式。
 
 ### M3 operation/event 保留与 resume gap
 
@@ -155,19 +197,23 @@ event API 使用 opaque resume token。空 token 是显式 reset，从当前最�
 token 重新观察，但不能把该错误当作“没有新事件”。
 
 compaction、event base sequence、terminal order、tombstone 与资源状态一起进入同一个
-copy-on-write FileStore snapshot，只有原子替换和目录持久化成功后才可见。旧 schema-v1
-snapshot 经完整校验后原子迁移到 schema v2。达到 `65536` identity 时，新 intent 在任何
+copy-on-write FileStore snapshot，只有原子替换和目录持久化成功后才可见。旧 FileStore
+schema-v1/v2 snapshot 经 checksum、结构与不变量完整校验后，原子迁移到 schema-v3；
+其中旧 event 的 `duration_ns: 0` 占位值转为缺失，event schema 独立升级为 v2。
+达到 `65536` identity 时，新 intent 在任何
 宿主机副作用前返回非 retryable `resource_exhausted`（HTTP `507`、CLI exit `5`）；达到
 `64 MiB` 时整个 candidate commit 也原子拒绝。当前没有在线 rollover/归档，所以这些
 上限消除了无界增长，却也构成明确的 daemon 生命周期边界。
 
 ### Supervisor 与进程身份
 
-目标拓扑由每个 Sandbox 独享的 shim/supervisor（或其控制的 keeper）保留共享
-namespace、监管活跃 Attempt、捕获退出状态并支持 daemon 重连。当前已实现 shim 协议、
-owner-bound config/artifact、终态读取、deferred-rootfs ACK、namespace reattach 和注入
-launcher 测试；生产 process factory 的启动/readiness/crash-rediscovery/作用时控制闭环
-与 M5 无缝重连尚未完成。最终进程拓扑不能仅依赖 daemon 或用户进程持续存活。
+当前拓扑使用同一个 `mydocker-shim` 可执行文件的两类进程：每个 Sandbox 一个 keeper
+保留共享 namespace，每个 Attempt 一个 init/PID 1 wrapper 监管 workload、捕获退出状态
+并提供 daemon 重启后的重新校验证据。shim 协议、owner-bound config/artifact、终态读取、
+deferred-rootfs ACK、namespace reattach，以及生产 process factory 的
+启动/readiness/crash-rediscovery/作用时控制闭环已经编码并有非特权测试；真实 rootful
+daemon restart 与 M5 更完整的无缝重连仍未验收。最终进程拓扑不能仅依赖 daemon 或用户
+进程持续存活。
 
 在可用时使用 pidfd；否则使用包含进程启动信息和所有权、且经过同等强度验证的身份。
 仅凭持久化的整数 PID，不能授权发送 signal、加入 namespace、接管或删除。
@@ -200,6 +246,11 @@ daemon reader 不获取 shim 的 lifetime writer 锁，也不把 path 或 fd 暴
 重新打开后可见新的已提交帧。完整 corruption 作为有界
 `internal` Log API 错误返回，响应只包含 Container/Attempt、stream、cursor、sequence、
 payload 和 checksum。
+
+日志 cursor 也采用 fail-closed resume 语义：`after` 等于最新已提交 cursor 时返回正常
+空页；语法错误、非 canonical 编码或跨 Attempt 身份返回 `invalid_argument`；编码合法但
+超过最新已提交 cursor（包括 daemon 重启后重新发现的空日志）返回 `resume_gap`
+（HTTP `410`、CLI exit `4`），不能伪装成“当前没有新日志”。
 
 `DeleteContainer` 在 mutation 前捕获权威 `ContainerID + AttemptID`；成功及其 terminal
 replay 仅幂等清除这个精确的进程内 log owner/source 映射，避免已删除 Attempt 持续占用
@@ -279,8 +330,9 @@ Sandbox ID、Container/Attempt ID、Task ID、operation ID、image digest 和完
 字符串用作 label。详细身份应记录在 log/trace 中。
 
 指标提供聚合趋势；由于抓取时机和聚合会改变语义，它们不是精确基准测试样本的唯一
-来源。评测工具使用自己的单调时钟测量调用方可见的 API 延迟。Proposed 耗时指标使用
-daemon 时钟测量 daemon operation/stage 时间；两类数据分别报告。
+来源。评测工具使用自己的单调时钟测量调用方可见的 API 延迟。Proposed 耗时指标只
+使用 daemon 明确提供的同进程 operation/stage duration；缺失样本不补零，两类数据
+分别报告。
 
 ### 必测场景
 

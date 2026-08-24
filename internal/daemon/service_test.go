@@ -20,7 +20,6 @@ import (
 	"mydocker/internal/operation"
 	"mydocker/internal/provider"
 	"mydocker/internal/shim"
-	"mydocker/internal/slim"
 	"mydocker/internal/state"
 )
 
@@ -261,6 +260,12 @@ func TestLogsAfterUsesAuthoritativeAttemptAndIdentityRegistry(t *testing.T) {
 		ContainerID: "container-1", AttemptID: "attempt-other", Limit: 1,
 	})
 	assertV1Error(t, err, v1.CodeFailedPrecondition, false)
+
+	source.err = &logstore.CursorGapError{Requested: 2, LastAvailable: 1}
+	_, err = service.LogsAfter(context.Background(), requestContext, v1.ListLogsRequest{
+		ContainerID: "container-1", AttemptID: "attempt-1", AfterCursor: 2, Limit: 1,
+	})
+	assertV1Error(t, err, v1.CodeResumeGap, false)
 }
 
 // TestLogRegistryRejectsReplacementAndSupportsIdempotentRemoval verifies identity collisions never switch readers silently.
@@ -331,7 +336,7 @@ func TestMapErrorClassifiesStableInternalFamilies(t *testing.T) {
 		{name: "isolation ownership", err: isolation.ErrUnsafeIdentity, code: v1.CodeUnsafeIdentity},
 		{name: "cgroup unknown", err: cgroupv2.ErrUnknownState, code: v1.CodeUnavailable, retryable: true},
 		{name: "shim unavailable", err: &shim.Error{Code: shim.CodeUnavailable, Message: "socket lost"}, code: v1.CodeUnavailable, retryable: true},
-		{name: "launcher incomplete", err: slim.ErrLauncherIncomplete, code: v1.CodeUnavailable},
+		{name: "log cursor gap", err: &logstore.CursorGapError{Requested: 2, LastAvailable: 1}, code: v1.CodeResumeGap},
 		{name: "log commit pending", err: logstore.ErrReadUnavailable, code: v1.CodeUnavailable, retryable: true},
 		{name: "log corruption", err: logstore.ErrCorrupt, code: v1.CodeInternal},
 		{name: "unknown", err: errors.New("private implementation detail"), code: v1.CodeInternal},

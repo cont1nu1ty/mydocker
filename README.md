@@ -1,13 +1,14 @@
-# Node-local Container Runtime & Execution Engine — mydocker 2.0
+# mydocker 2.0：单节点容器运行时与执行引擎
 
 mydocker 2.0 计划实现为一个仅支持 Linux、以 rootful 模式运行的**单节点容器执行引擎**
 （Node-local Container Execution Engine）。它是容器化 workload 的节点执行面：给定镜像
 digest、命令、资源限制和网络配置，负责在一台 Linux 节点上准备 rootfs、创建 Sandbox、
 执行并监督进程、维护状态、处理失败、恢复 daemon、清理资源，并以可复现方式度量结果。
 
-**mydocker consumes OCI images; it does not build them.** 它实现的是
-`OCI image -> rootfs/snapshot -> container process` 的镜像消费链路，不实现 Dockerfile
-构建、`docker commit`、镜像 push 或 registry server。未来的 mycluster 是独立的
+**mydocker 2.0 的完整目标只消费 OCI 镜像，不负责构建镜像。** M4+ 计划实现
+`OCI image -> rootfs/snapshot -> container process` 的镜像消费链路；当前 M3 只接收
+daemon 配置的 prepared-rootfs ID，尚未实现镜像导入、内容存储或 snapshot。项目不实现
+Dockerfile 构建、`docker commit`、镜像 push 或 registry server。未来的 mycluster 是独立的
 Distributed Workload Control Plane（分布式工作负载控制面），负责跨节点的放置、期望
 状态调谐和故障恢复；mydocker 不承担这些全局控制面职责。
 
@@ -33,10 +34,12 @@ operations/events/logs 查询、daemon 重启协调、终态观测及 kill deadl
 以及只调用公共 API 的 `mydocker-eval` 评测工具。这些组件有纯 Go、临时
 文件系统和注入 provider 测试，但不等于真实容器已经运行。
 
-生产 `LinuxShimLauncher` 仍明确返回 `ErrLauncherIncomplete`；`mydockerd` 会在
-绑定 UDS 之前的只读 preflight 失败关闭，因此当前生产命令尚不能启动一个
-可服务的 daemon。`FileStore` 已实现按数量的 operation/event retention、原子
-compaction 和版本化 resume-gap 错误，但默认 `65536` 个 operation identity 是
+生产 `LinuxShimLauncher` 已组合持久 launch intent、cgroup-at-fork、pidfd、
+namespace reattach、keeper/init bootstrap、作用时校验与控制协议；兼容宿主机上的
+只读 preflight 和恢复会在 UDS 绑定前完成。该生产组合尚未在一次性 rootful VM 中
+完成真实内核和 daemon restart 验收，不能把纯测试通过写成“生产可用”。
+`FileStore` 已实现按数量的 operation/event retention、原子 compaction 和版本化
+resume-gap 错误，但默认 `65536` 个 operation identity 是
 fail-closed 的硬生命周期上限，尚无在线 rollover/归档流程；这不是“无限历史”的
 生产方案。本次未在真实 kernel 上
 运行 namespace、mount、cgroup/OOM/quota、PID 1、hostname/DNS 或 loopback 特权
@@ -85,8 +88,12 @@ go vet ./...
 | `--prepared-rootfs ID=/absolute/path` | 可重复；将 API 中的 opaque rootfs ID 绑定到受信路径 |
 | `--shutdown-timeout` | UDS 优雅停止上限，默认 `15s` |
 
-当使用注入 provider 的测试 server，或未来完成生产 launcher 后，CLI 请求
-可以使用严格 JSON 文件。例如 `sandbox.json`：
+CLI 请求使用严格 JSON 文件。固定 wire 字段名必须与 API 声明精确匹配大小写，不能把
+`mode` 写成 `Mode` 或 `MODE`；map key 则保持大小写敏感，大小写不同的键可以同时存在。
+完整边界见
+[Daemon、恢复、可观测性与本地 API](docs/features/daemon-recovery-observability-api.md)。
+以下示例可连接注入 provider 的测试 server；若连接生产 `mydockerd`，只能在已完成
+preflight 的一次性 rootful 验收环境中使用。例如 `sandbox.json`：
 
 ```json
 {
@@ -139,8 +146,8 @@ go run ./cmd/mydocker --socket /run/mydocker/mydockerd.sock \
 可变操作的 `--operation-id` 必须在首次发送前产生，并在传输重试时保持不变；
 不同请求体不得复用同一 ID。CLI 也支持 `sandbox get/list/stop/delete`、
 `container get/list/kill/delete`、`operation get`、events resume 和 identity-bound log cursor。
-当前这些 CLI 示例只说明编码与操作契约；直接启动生产 `mydockerd` 仍会在 UDS 服务前
-因 `ErrLauncherIncomplete` 终止。
+当前这些 CLI 示例只说明编码与操作契约；生产 launcher 已编码并不等于其真实内核路径
+已经验收，普通开发主机上不得用 `sudo` 试跑。
 
 默认状态保留策略保存最近 `1024` 个终态 operation 的完整响应、最多 `65536` 个
 完整 operation 或已过期 identity tombstone，以及最近 `8192` 个 event。过期
@@ -159,20 +166,22 @@ controllers、OverlayFS 工作区配置、bridge/veth 网络、本地 IPAM，以
 mydocker 2.0 将围绕显式状态机、rollback、daemon recovery、cgroup v2、稳定的
 Sandbox 身份、版本化本地 API 和可复现评测进行彻底重写。M0 不迁移 legacy 业务代码。
 
-它不是“小 Docker”或 Docker API 替代品。镜像生产由外部 builder 完成；mydocker
-消费 OCI Image Layout，验证并保存内容，解包 layers，为每个 Attempt 准备可写
-snapshot/rootfs，再构建底层 runtime 可消费的 bundle。
+它不是“小 Docker”或 Docker API 替代品。在完整的 2.0 目标中，镜像生产由外部 builder
+完成；M4+ 的 mydocker 将消费 OCI Image Layout，验证并保存内容，解包 layers，为每个
+Attempt 准备可写 snapshot/rootfs，再构建底层 runtime 能力边界可消费的 bundle。当前
+M3 只有 prepared-rootfs 路径，不包含这条镜像、snapshot 或 bundle 链路。
 
 ## 以 Sandbox 为核心的模型
 
-**Sandbox** 拥有稳定的 workload 边界：身份、生命周期、network namespace 和地址、
-UTS/IPC namespaces、hostname/DNS 设置、port mappings、labels、父 cgroup，以及
-namespace keeper 或 supervisor 的身份。
+**Sandbox** 拥有稳定的 workload 边界：身份、生命周期、UTS/IPC/network namespaces、
+hostname/DNS 设置、labels、父 cgroup，以及 namespace keeper 或 supervisor 的身份。
+当前 M3 的网络模式只有 none/loopback；地址、bridge/veth、IPAM 和 port mappings 是 M4+
+的完整网络目标。
 
-**Container Attempt** 拥有一次执行：进程、受 OCI 启发的 bundle、rootfs/snapshot、
-mount 和 PID namespaces、子 cgroup、logs、退出码、信号和 OOM 结果。初期，一个
-Ready Sandbox 最多只能有一个 active Attempt，但在保持稳定网络身份的同时，可以承载
-多个连续的 Attempts。
+**Container Attempt** 拥有一次执行：进程、mount 和 PID namespaces、子 cgroup、
+logs、退出码、信号、OOM 结果，以及当前 prepared-rootfs 的 mount 视图与 receipt。
+M3 不创建每 Attempt 独享 snapshot；那是 M4+ 目标。初期，一个 Ready Sandbox 最多只能
+有一个 active Attempt，但在保持稳定网络身份的同时，可以承载多个连续的 Attempts。
 
 在首版 API 中，每条用户可见的 `Container` 记录恰好对应一个 Attempt，并会返回两个
 ID。terminal outcome 之后的 workload retry 会在同一 Sandbox 中创建新的 pair；
@@ -191,33 +200,37 @@ benchmarks 和 profiling 各自回答不同问题。
 当前没有任何性能结果。只有在建立可复现且经过正确性检查的基线后，才会开始优化。
 度量契约见 [evaluation/README.md](evaluation/README.md)。
 
-## 目标架构
+## 当前进程与目标能力边界
+
+运行时交付面只有三个程序入口：`mydocker` CLI、常驻的 `mydockerd`，以及由 daemon
+启动的 `mydocker-shim`；此外还有直接使用 `pkg/client` 的独立评测程序
+`mydocker-eval`。它只通过公共 API 定义 sample 边界并写出原始证据，不是 daemon、
+provider 或生产运行时层。`engine` 是 `mydockerd` 内的 Go package；`Container Attempt`
+是一次执行的持久领域记录；低层 runtime 是职责边界，当前并不存在
+`cmd/mydocker-runtime` 二进制。完整的当前进程图和 Docker/containerd/runc 对照见
+[组件模型](docs/architecture.md#2-组件模型)。
 
 ```mermaid
-flowchart TD
-    CLI[mydocker CLI] -->|versioned API over UDS| Daemon[mydockerd]
-    Daemon --> Engine[engine]
-    Engine --> Sandbox[Sandbox service]
-    Engine --> Container[Container service]
-    Engine --> Image[ImageService]
-    Image --> Content[ContentStore]
-    Content --> Unpack[LayerUnpacker]
-    Unpack --> Snapshot[Snapshotter]
-    Snapshot --> Mount[MountManager]
-    Mount --> Bundle[BundleBuilder]
-    Bundle --> Runtime[mydocker-runtime]
-    Sandbox --> Runtime
-    Container --> Runtime
-    Engine --> State[state / events / logs / metrics]
-    Runtime --> Linux[namespaces / mounts / cgroup v2]
-    Sandbox --> Network[Sandbox network]
-    Agent[future mydocker-agent] -.->|same versioned local API| Daemon
+flowchart LR
+    User[用户] --> CLI[mydocker CLI]
+    Eval[mydocker-eval]
+    subgraph DaemonProcess[mydockerd 进程内]
+        Daemon[internal/server + internal/daemon<br/>传输与 DTO 适配] --> Engine[internal/engine]
+        Engine <--> State[FileStore]
+        Engine --> Provider[provider / slim / isolation / cgroupv2]
+    end
+    CLI -->|versioned API over UDS| Daemon
+    Eval -->|pkg/client over UDS| Daemon
+    Provider --> Keeper[mydocker-shim<br/>Sandbox keeper]
+    Provider --> Init[mydocker-shim<br/>Attempt PID 1]
+    Init --> Workload[workload 进程树]
 ```
 
-CLI 不会拥有 detached workloads。`mydockerd` 将协调单节点状态；低层 runtime 代码
-只理解 process、namespace、mount、rootfs、bundle 和 cgroup 原语，不理解镜像 tag、
-registry、layer 下载或 cache。未来的 agent 必须使用公共本地 API，且不得导入 runtime
-内部实现。
+CLI 不会拥有 detached workloads。`mydockerd` 协调单节点状态；当前低层实现只处理
+process、namespace、mount、prepared rootfs 和 cgroup 原语，不理解镜像 tag、registry、
+layer 下载或 cache。Image/content/snapshot/bundle/network 的完整路径是 M4+ 目标；未来
+bundle 到进程的职责仍止于这一低层能力边界。未来的 agent 必须使用公共本地 API，且
+不得导入 runtime 内部实现。
 
 ## 范围
 
@@ -275,6 +288,6 @@ controllers，所以 M2 特权集成验收已按安全契约跳过。
 
 实现顺序和 milestone gates 仅由[路线图](docs/roadmap.md)定义。M1 已验证纯领域与
 协调契约；M2 已实现宿主机原语与 provider 边界，但在特权集成 gate 完成前
-仍不是 `Verified`。M3 的纯测试基础为 `In progress`，生产 launcher、
-有界状态的在线轮换策略和 rootful 验收完成前不可用。M4 以后的设计在相关 milestone
-达到 Verified 前仍是 **Proposed** 或 **Planned**，不代表相应行为已经可用。
+仍不是 `Verified`。M3 的生产组合已编码但状态仍为 `In progress`；rootful 验收、
+有界状态的在线轮换策略和 prepared-rootfs 隔离完成前不可称生产可用。M4+ 设计在相关
+milestone 达到 Verified 前仍是 **Proposed** 或 **Planned**，不代表相应行为已经可用。

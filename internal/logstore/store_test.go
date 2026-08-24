@@ -81,6 +81,44 @@ func TestAppendReadAndReopen(t *testing.T) {
 	}
 }
 
+// TestReadRejectsFutureCursorAcrossEmptyAndReopen verifies empty logs and durable reopen never turn an ahead-of-stream position into a successful empty page.
+func TestReadRejectsFutureCursorAcrossEmptyAndReopen(t *testing.T) {
+	path := newLogPath(t)
+	identity := testIdentity()
+	store := openTestStore(t, path, identity)
+
+	_, err := store.Read(1, 10)
+	var gap *CursorGapError
+	if !errors.Is(err, ErrCursorGap) || !errors.As(err, &gap) || gap.Requested != 1 || gap.LastAvailable != 0 {
+		t.Fatalf("empty Store.Read(future) gap = (%#v, %v), want requested 1 and last available 0", gap, err)
+	}
+
+	frame, err := store.Append(StreamStdout, []byte("committed"))
+	if err != nil {
+		t.Fatalf("append committed frame: %v", err)
+	}
+	frames, err := store.Read(frame.Cursor, 10)
+	if err != nil || len(frames) != 0 {
+		t.Fatalf("Store.Read(exact tail) = (%+v, %v), want successful empty page", frames, err)
+	}
+	_, err = store.Read(frame.Cursor+1, 10)
+	gap = nil
+	if !errors.Is(err, ErrCursorGap) || !errors.As(err, &gap) || gap.Requested != frame.Cursor+1 || gap.LastAvailable != frame.Cursor {
+		t.Fatalf("Store.Read(future) gap = (%#v, %v), want requested %d and last available %d", gap, err, frame.Cursor+1, frame.Cursor)
+	}
+	closeTestStore(t, store)
+
+	reader, err := OpenReader(path, identity)
+	if err != nil {
+		t.Fatalf("OpenReader() after writer close: %v", err)
+	}
+	_, err = reader.Read(frame.Cursor+1, 10)
+	gap = nil
+	if !errors.Is(err, ErrCursorGap) || !errors.As(err, &gap) || gap.Requested != frame.Cursor+1 || gap.LastAvailable != frame.Cursor {
+		t.Fatalf("reopened Reader.Read(future) gap = (%#v, %v), want requested %d and last available %d", gap, err, frame.Cursor+1, frame.Cursor)
+	}
+}
+
 // TestReadAndAppendAfterClose verifies that descriptor ownership ends at Close while repeated Close remains harmless.
 func TestReadAndAppendAfterClose(t *testing.T) {
 	store := openTestStore(t, newLogPath(t), testIdentity())

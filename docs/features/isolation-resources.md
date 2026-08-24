@@ -63,6 +63,18 @@ strong identity、start gate、cgroup 和 provider 边界；M3 才交付具体 w
 `exec` 改写成可变 receipt。这样 gated start 之后 `/proc/<pid>/exe` 不会变化并使
 wrapper 的 strong identity 失效。
 
+当前 PID 1 wrapper 将 direct workload 的终态与整个 PID namespace 的静止分开处理：
+direct child 退出后先关闭外部 signal gate，再对仍存活的 namespace descendants 发送
+`SIGKILL`，并用 `wait4(-1, __WALL)` 循环处理 `EINTR`、同时回收普通 child 与
+非 `SIGCHLD` clone child，直到 `ECHILD`；stdout/stderr 复制也完成后才允许提交
+Attempt terminal outcome。这样 daemonize/fork/clone 的后代不能在
+Attempt 已报告 `stopped` 后继续运行，且 direct workload 的退出结果不会被清理信号
+覆盖。direct child 的 `FinishedAt`/running duration 在其 `Wait` 返回时立即截取，不包含
+随后后代清理和日志排空耗时；Attempt terminal record 则只在整棵树静止后生成。若
+`wait4` 未能明确到达 `ECHILD`，wrapper 不提交 terminal，Inspect 返回 unavailable，
+由 daemon 的显式 teardown 收敛。该顺序已有非特权 seam/race 测试，真实 PID namespace
+行为仍待一次性 VM 验收。
+
 PID 1 child 的 readiness 分成两个持久边界。child 首先只验证自己确实是 PID 1，且
 active PID/mount namespace inode 与 bootstrap 一致；此时不得 mount 或 pivot。daemon
 必须把 init、PID namespace 和 mount namespace receipt 分别原子 checkpoint 后，才可
@@ -211,10 +223,10 @@ host 文件来处理。Reconciliation 只枚举配置 root 下自有的 paths/ha
 state 进行验证，并且绝不删除未知的 cgroup 或 namespace。
 
 M2 本身只交付 checkpoint/receipt/reverification 与 Linux 原语，不交付 daemon。
-M3 已有经过纯测试的 daemon/engine/shim 协调与启动恢复，但生产 Linux launcher、
-可无缝重连 supervisor 和真实 rootful restart 验收仍未完成，因此不声称已经接管
-真实 workload。恢复只使用已持久 receipt 重新发现并作用时验证资源；无法证明身份时
-报告显式的 `unknown`/`orphan` condition，而不是信任裸 PID 或可变路径。
+M3 已有 daemon/engine/shim 协调、生产 Linux launcher 与启动恢复的非特权/注入测试，
+但真实 rootful restart 验收仍未完成，因此不声称已经验证接管真实 workload。恢复只
+使用已持久 receipt 重新发现并作用时验证资源；无法证明身份时报告显式的
+`unknown`/`orphan` condition，而不是信任裸 PID 或可变路径。
 
 ## 可观测性与评测点
 

@@ -19,6 +19,7 @@ import (
 	"time"
 
 	v1 "mydocker/api/runtime/v1"
+	"mydocker/internal/strictjson"
 )
 
 const (
@@ -660,19 +661,7 @@ func isTruncatedJSONError(err error) bool {
 	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
-// decodeStrict rejects unknown response fields and any second JSON value.
+// decodeStrict rejects lossy UTF-8, unknown fields, duplicate keys, and any second JSON value.
 func decodeStrict(payload []byte, destination any) error {
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
-		return err
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return errors.New("response contains more than one JSON value")
-		}
-		return err
-	}
-	return nil
+	return strictjson.Decode(payload, destination)
 }

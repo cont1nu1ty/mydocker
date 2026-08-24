@@ -1127,17 +1127,3 @@ func validateLauncherCall(ctx context.Context, launcher *LinuxShimLauncher, requ
 	}
 	return requirements.Validate()
 }
-
-// launcherUnavailable applies context validation before every not-yet-composed production operation.
-func launcherUnavailable(ctx context.Context, launcher *LinuxShimLauncher) error {
-	if ctx == nil {
-		return errors.New("Linux shim launcher context must not be nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if launcher == nil || launcher.executable == "" {
-		return errors.New("Linux shim launcher is not configured")
-	}
-	return ErrLauncherIncomplete
-}

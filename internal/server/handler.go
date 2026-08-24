@@ -3,7 +3,6 @@ package server
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +13,7 @@ import (
 	"strings"
 
 	v1 "mydocker/api/runtime/v1"
+	"mydocker/internal/strictjson"
 )
 
 const (
@@ -577,25 +577,19 @@ func (s *Server) decodeJSON(writer http.ResponseWriter, request *http.Request, d
 		return v1.NewError(v1.CodeInvalidArgument, "content_type", "must be application/json")
 	}
 	request.Body = http.MaxBytesReader(writer, request.Body, s.config.MaxRequestBytes)
-	decoder := json.NewDecoder(request.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
+	payload, err := io.ReadAll(request.Body)
+	if err != nil {
 		var maximum *http.MaxBytesError
 		if errors.As(err, &maximum) {
 			return v1.NewError(v1.CodeRequestTooLarge, "body", "exceeds the configured request size limit")
 		}
-		return v1.NewError(v1.CodeInvalidArgument, "body", fmt.Sprintf("must contain one strict JSON object: %v", err))
+		return v1.NewError(v1.CodeInvalidArgument, "body", fmt.Sprintf("cannot read strict JSON object: %v", err))
 	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
+	if err := strictjson.Decode(payload, destination); err != nil {
+		if errors.Is(err, strictjson.ErrMultipleValues) {
 			return v1.NewError(v1.CodeInvalidArgument, "body", "must contain exactly one JSON value")
 		}
-		var maximum *http.MaxBytesError
-		if errors.As(err, &maximum) {
-			return v1.NewError(v1.CodeRequestTooLarge, "body", "exceeds the configured request size limit")
-		}
-		return v1.NewError(v1.CodeInvalidArgument, "body", "contains invalid trailing data")
+		return v1.NewError(v1.CodeInvalidArgument, "body", fmt.Sprintf("must contain one strict JSON object: %v", err))
 	}
 	return nil
 }

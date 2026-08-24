@@ -36,6 +36,6 @@ type Service interface {
 	GetOperation(context.Context, v1.RequestContext, v1.GetOperationRequest) (v1.OperationResponse, error)
 	// EventsAfter returns globally ordered events strictly after a sequence, up to limit.
 	EventsAfter(context.Context, v1.RequestContext, v1.ListEventsRequest) ([]v1.Event, error)
-	// LogsAfter returns output frames for exactly one Container/Attempt identity after a durable cursor.
+	// LogsAfter returns output frames for exactly one Container/Attempt identity after a durable cursor and rejects positions beyond committed history with resume_gap.
 	LogsAfter(context.Context, v1.RequestContext, v1.ListLogsRequest) ([]v1.LogFrame, error)
 }

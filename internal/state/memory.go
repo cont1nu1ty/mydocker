@@ -1870,7 +1870,7 @@ func operationStageRank(stage operation.Stage) int {
 // validateEvent distinguishes unsupported persisted event schemas from other
 // malformed event fields so recovery callers can make a safe typed decision.
 func validateEvent(event operation.Event) error {
-	if event.SchemaVersion != operation.SchemaVersion {
+	if event.SchemaVersion != operation.EventSchemaVersion {
 		return fmt.Errorf("event schema %d: %w", event.SchemaVersion, ErrUnsupportedSchema)
 	}
 	if err := event.Validate(); err != nil {

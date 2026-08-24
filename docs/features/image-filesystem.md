@@ -8,7 +8,8 @@
 
 mydocker 是单节点容器执行引擎。它接收外部 builder 产出的 OCI Image，把已验证的
 镜像内容转换为单个 Container Attempt 可使用的 rootfs 和 bundle，再交给
-`mydocker-runtime` 创建 Linux 进程。
+低层 runtime 能力边界创建 Linux 进程。该名称描述职责；当前仓库没有独立的
+`mydocker-runtime` 二进制。
 
 本功能负责把“镜像可用”与“Attempt 文件系统已准备”变成可持久恢复、可幂等重试、
 可逆序清理且可分阶段度量的事实。
@@ -51,7 +52,7 @@ Experiment**，先定义冻结/一致性、OCI whiteout 转换、volume 排除�
 -> Snapshotter
 -> MountManager
 -> BundleBuilder
--> mydocker-runtime
+-> 低层 runtime 能力边界
 -> Linux process
 ```
 
@@ -70,7 +71,7 @@ CreateContainer
 -> 获取并应用 MountSpecs
 -> 挂载 rootfs 和嵌套 mounts
 -> 构建带版本 bundle
--> mydocker-runtime create（进程仍受 start gate 约束）
+-> runtime create（进程仍受 start gate 约束）
 ```
 
 `ImportImage` 与 `CreateContainer` 使用各自的 operation ID 和阶段事件。导入成功不
@@ -212,7 +213,7 @@ MountManager 执行实际 mount/unmount，并维护 owner、target 与依赖顺�
 
 ### BundleBuilder
 
-BundleBuilder 将已经准备好的执行输入转换为 `mydocker-runtime` 能消费的 bundle。它
+BundleBuilder 将已经准备好的执行输入转换为低层 runtime 能力边界可消费的 bundle。它
 不获取/解包镜像，不执行 mount，不创建 namespace/cgroup，也不启动进程。
 
 最小内部接口：
@@ -228,9 +229,10 @@ environment 始终保持结构化，不能经 shell 字符串拼接再解析。S
 IPC/network namespace 输入和 Attempt 所有的 PID/mount namespace、子 cgroup path 由
 engine 提供，而不是从镜像推导。
 
-`mydocker-runtime` 最终只接收 bundle、rootfs、process args、mounts、namespaces 和
-cgroup path。`ubuntu:24.04`、registry、tag、layer 下载和 image cache 永远不能穿透
-这一边界。
+低层 runtime 能力边界最终只接收 bundle、rootfs、process args、mounts、namespaces
+和 cgroup path。当前这些职责由进程内 slim/isolation/cgroupv2 package 与
+`mydocker-shim` 协作承担；如果未来拆出独立 runtime 二进制，`ubuntu:24.04`、registry、
+tag、layer 下载和 image cache 仍不能穿透这一边界。
 
 ## 主机数据边界
 

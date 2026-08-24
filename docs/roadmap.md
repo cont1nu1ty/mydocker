@@ -15,7 +15,7 @@
 | M0 仓库初始化 | Verified | 已审计的基线与可度量架构契约 |
 | M1 生命周期基础 | Verified | 纯领域模型、状态及 operation 契约 |
 | M2 隔离与 cgroup v2 | Implemented | rootful 隔离与资源强制执行；特权验收待完成 |
-| M3 守护进程与本地 API | In progress | daemon/API/CLI/恢复/评测基础已有纯测试；生产 launcher 和特权验收待完成 |
+| M3 守护进程与本地 API | In progress | daemon/API/CLI/launcher/恢复/评测基础已编码；特权验收与 prepared-rootfs 隔离待完成 |
 | M4A 镜像与内容 | Not started | OCI Image Layout 导入、内容寻址与 layer unpack |
 | M4B 文件系统与 Snapshot | Not started | OverlayFS snapshot、rootfs、mount 与 bundle |
 | M4C Sandbox 网络 | Not started | 稳定的 netns、veth/bridge、IPAM 与 port mapping |
@@ -214,9 +214,9 @@
 
 ## M3：守护进程与本地 API
 
-**状态：** In progress。纯 Go 和注入 provider 实现已组成，但生产
-Linux launcher 和真实 rootful lifecycle 尚未通过，因此不得标记为
-`Implemented` 或 `Verified`。
+**状态：** In progress。纯 Go、注入 provider 与生产 Linux launcher 已组成，但真实
+rootful lifecycle、daemon restart 和 prepared-rootfs 隔离尚未通过，因此不得标记为
+`Verified`。
 
 ### 功能目标
 
@@ -239,7 +239,7 @@ Linux launcher 和真实 rootful lifecycle 尚未通过，因此不得标记为
 - `internal/state.FileStore` 已为 schema/CAS、Sandbox/Container/Attempt、operation、
   rollback 和事件提供独占锁与原子持久边界，并覆盖 close/reopen、
   失败注入和不确定 commit 恢复测试。
-- FileStore schema v2 已实现确定性的 count-based retention：active operation 永不淘汰；
+- FileStore schema v3 已实现确定性的 count-based retention 与旧 event 计时语义迁移：active operation 永不淘汰；
   最近 `1024` 个终态 operation 保留完整响应，更早记录转换为防 ID 复用的 tombstone；
   最近 `8192` 个 event 构成连续 suffix，过旧或超前的非空 cursor 返回版本化 `resume_gap`。
   完整 identity+tombstone 总数默认最多 `65536`，状态 envelope 最多 `64 MiB`；达到上限
@@ -261,13 +261,16 @@ Linux launcher 和真实 rootful lifecycle 尚未通过，因此不得标记为
 
 ### 当前 blocker
 
-- 生产 `LinuxShimLauncher` 仍以 `ErrLauncherIncomplete` 失败关闭。底层已具备
-  cgroup-at-fork/pidfd、namespace reattach、UTS/none/loopback 配置、deferred-rootfs
-  ACK、DNS 绑定和跨 pivot 保留 artifact descriptor 的协议与纯测试；尚缺的是把这些
-  原语组合成生产 process factory，包括 immutable launch intent、keeper/init bounded
-  readiness、crash rediscovery，以及作用时验证的 inspect/remove/signal/resolve。
-  `mydockerd` 在绑定 UDS 前的只读 preflight 直接返回该错误，所以当前没有可供生产
-  使用的本地 daemon。
+- 生产 `LinuxShimLauncher` 已把 cgroup-at-fork/pidfd、namespace reattach、
+  UTS/none/loopback 配置、deferred-rootfs ACK、DNS 绑定、跨 pivot artifact descriptor、
+  immutable launch intent、keeper/init readiness、crash rediscovery 和作用时
+  inspect/remove/signal/resolve 组合为 process factory，并有非特权/注入 seam 测试。
+  但这些测试不能证明真实 namespace、PID 1、mount、cgroup 与 daemon crash 组合正确；
+  仍需在一次性 rootful VM 中逐项验收。
+- M3 的 prepared-rootfs catalog 目前只把 opaque ID 映射到一个受信但共享的目录；它不
+  创建每 Attempt snapshot，也没有证明并发/连续 Attempt 之间写入隔离。签入的 M3
+  场景必须如实记录 `not-created-prepared-rootfs-shared`，不能将其作为 M4B snapshot
+  性能或正确性证据。
 - operation/event 的无界增长已由固定窗口、tombstone、原子 compaction 和显式 gap
   消除；但达到 `65536` identity 或 `64 MiB` envelope 后尚无在线 rollover/归档/迁移
   流程。当前会安全拒绝新 intent，而不是无限增长；仍不得据此声称长期生产可用。
@@ -293,7 +296,8 @@ Linux launcher 和真实 rootful lifecycle 尚未通过，因此不得标记为
 - 部分请求或重复请求不会造成副作用重复。
 - 原子元数据测试覆盖写入失败和无效 schema。
 - retention 测试覆盖 exact replay window、过期 ID、active intent、容量拒绝、event gap、
-  v1→v2 重启迁移、oversized 文件和 checksum 正确但 retention binding 被篡改的文件。
+  FileStore v1/v2→v3 与 event-v2 计时语义迁移、oversized 文件，以及 checksum 正确但
+  retention binding 被篡改的文件。
 
 ### 度量准备
 

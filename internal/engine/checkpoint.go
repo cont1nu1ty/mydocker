@@ -21,6 +21,7 @@ func (engine *Engine) checkpointProgress(
 	fingerprint operation.RequestFingerprint,
 	stage operation.Stage,
 	details any,
+	measurement stageMeasurement,
 ) (lifecycle.OperationProgress, error) {
 	progress, err := engine.lifecycle.GetOperationProgress(ctx, operationID)
 	if err != nil {
@@ -30,7 +31,7 @@ func (engine *Engine) checkpointProgress(
 		OperationID: operationID, Target: target, Fingerprint: fingerprint, Stage: stage,
 		KillEscalationDeadline: progress.KillEscalationDeadline,
 		Rollback:               progress.Rollback, Receipts: progress.Receipts, Releases: progress.Releases,
-		OccurredAt: engine.clock.Now(), Details: details,
+		OccurredAt: measurement.occurredAt, Duration: measurement.duration, Details: details,
 	})
 	if err != nil {
 		return lifecycle.OperationProgress{}, err
@@ -53,7 +54,7 @@ func (engine *Engine) checkpointClearCondition(
 		Stage: progress.Operation.Stage, RollbackCause: progress.RollbackCause,
 		OOMBaseline: progress.OOMBaseline, KillEscalationDeadline: progress.KillEscalationDeadline,
 		Rollback: progress.Rollback, Receipts: progress.Receipts, Releases: progress.Releases,
-		OccurredAt: engine.clock.Now(), Details: details, ClearCondition: conditionType,
+		OccurredAt: engine.diagnosticNow(), Details: details, ClearCondition: conditionType,
 	})
 	return err
 }
@@ -66,6 +67,7 @@ func (engine *Engine) checkpointKillSignal(
 	fingerprint operation.RequestFingerprint,
 	delivery provider.SignalObservation,
 	grace time.Duration,
+	measurement stageMeasurement,
 ) (lifecycle.OperationProgress, error) {
 	if err := delivery.Validate(); err != nil {
 		return lifecycle.OperationProgress{}, err
@@ -85,7 +87,7 @@ func (engine *Engine) checkpointKillSignal(
 		OperationID: operationID, Target: target, Fingerprint: fingerprint,
 		Stage: operation.StageSignalProcess, KillEscalationDeadline: &deadline,
 		Rollback: progress.Rollback, Receipts: progress.Receipts, Releases: progress.Releases,
-		OccurredAt: engine.clock.Now(), Details: delivery,
+		OccurredAt: measurement.occurredAt, Duration: measurement.duration, Details: delivery,
 	})
 	if err != nil {
 		return lifecycle.OperationProgress{}, err
@@ -102,6 +104,7 @@ func (engine *Engine) checkpointReceipt(
 	fingerprint operation.RequestFingerprint,
 	stage operation.Stage,
 	receipt ownership.Receipt,
+	measurement stageMeasurement,
 ) (lifecycle.OperationProgress, error) {
 	if err := receipt.Validate(); err != nil {
 		return lifecycle.OperationProgress{}, fmt.Errorf("provider receipt: %w", err)
@@ -133,7 +136,7 @@ func (engine *Engine) checkpointReceipt(
 	_, err = engine.lifecycle.CheckpointOperation(ctx, lifecycle.CheckpointRequest{
 		OperationID: operationID, Target: target, Fingerprint: fingerprint, Stage: stage,
 		Rollback: progress.Rollback, Receipts: progress.Receipts, Releases: progress.Releases,
-		OccurredAt: engine.clock.Now(), Details: receipt,
+		OccurredAt: measurement.occurredAt, Duration: measurement.duration, Details: receipt,
 	})
 	if err != nil {
 		return lifecycle.OperationProgress{}, err
@@ -149,6 +152,7 @@ func (engine *Engine) checkpointOOMBaseline(
 	target operation.Target,
 	fingerprint operation.RequestFingerprint,
 	baseline provider.OOMSnapshot,
+	measurement stageMeasurement,
 ) (lifecycle.OperationProgress, error) {
 	if err := baseline.Validate(); err != nil {
 		return lifecycle.OperationProgress{}, err
@@ -166,7 +170,7 @@ func (engine *Engine) checkpointOOMBaseline(
 	_, err = engine.lifecycle.CheckpointOperation(ctx, lifecycle.CheckpointRequest{
 		OperationID: operationID, Target: target, Fingerprint: fingerprint, Stage: operation.StageAttachCgroup,
 		OOMBaseline: &baseline, Rollback: progress.Rollback, Receipts: progress.Receipts, Releases: progress.Releases,
-		OccurredAt: engine.clock.Now(), Details: baseline,
+		OccurredAt: measurement.occurredAt, Duration: measurement.duration, Details: baseline,
 	})
 	if err != nil {
 		return lifecycle.OperationProgress{}, err
@@ -209,6 +213,7 @@ func (engine *Engine) checkpointRelease(
 	target operation.Target,
 	fingerprint operation.RequestFingerprint,
 	release ownership.Release,
+	measurement stageMeasurement,
 ) (lifecycle.OperationProgress, error) {
 	if err := release.Validate(); err != nil {
 		return lifecycle.OperationProgress{}, err
@@ -232,7 +237,7 @@ func (engine *Engine) checkpointRelease(
 	_, err = engine.lifecycle.CheckpointOperation(ctx, lifecycle.CheckpointRequest{
 		OperationID: operationID, Target: target, Fingerprint: fingerprint, Stage: operation.StageTeardown,
 		Rollback: progress.Rollback, Receipts: progress.Receipts, Releases: progress.Releases,
-		OccurredAt: engine.clock.Now(), Details: release,
+		OccurredAt: measurement.occurredAt, Duration: measurement.duration, Details: release,
 	})
 	if err != nil {
 		return lifecycle.OperationProgress{}, err

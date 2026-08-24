@@ -57,6 +57,7 @@ type fakeHost struct {
 	oom                     uint64
 	oomKill                 uint64
 	oomGroupKill            uint64
+	snapshotOOMHook         func()
 }
 
 // newFakeHost returns a provider whose shim starts prepared and changes state only through gate or signal calls.
@@ -138,6 +139,22 @@ func (fixedClock) Now() time.Time {
 type manualClock struct {
 	mu  sync.RWMutex
 	now time.Time
+}
+
+// scriptedClock advances by one deterministic step per observation so tests can distinguish measured zero, positive spans, and missing spans.
+type scriptedClock struct {
+	mu   sync.Mutex
+	now  time.Time
+	step time.Duration
+}
+
+// Now returns the current scripted instant and advances the next observation without sleeping.
+func (clock *scriptedClock) Now() time.Time {
+	clock.mu.Lock()
+	defer clock.mu.Unlock()
+	now := clock.now
+	clock.now = clock.now.Add(clock.step)
+	return now
 }
 
 // Now returns the current test-controlled instant without advancing it implicitly.
@@ -246,6 +263,194 @@ func TestEngineRunsFullLifecycleThroughCheckpointedProviders(t *testing.T) {
 	}
 	if eventCount < 20 {
 		t.Fatalf("event count = %d, want checkpointed lifecycle history", eventCount)
+	}
+}
+
+// TestEngineMeasuresProviderStagesAndNewOperationMonotonically verifies direct provider actions carry same-process spans, persist intent remains unmeasured, and exact replay preserves the original samples.
+func TestEngineMeasuresProviderStagesAndNewOperationMonotonically(t *testing.T) {
+	host := newFakeHost()
+	store := state.NewMemoryStore()
+	step := 3 * time.Millisecond
+	clock := &scriptedClock{now: time.Date(2026, 8, 24, 9, 0, 0, 0, time.UTC), step: step}
+	engine, err := NewWithClock(store, testProviders(t, host), clock)
+	if err != nil {
+		t.Fatalf("NewWithClock() error = %v", err)
+	}
+	request := lifecycle.SandboxCreateRequest{
+		OperationID: "op-stage-duration", SandboxID: "sandbox-stage-duration",
+		Spec: domain.SandboxSpec{Network: domain.NetworkIntent{Mode: "none"}},
+	}
+	if _, err := engine.CreateSandbox(context.Background(), request); err != nil {
+		t.Fatalf("CreateSandbox() error = %v", err)
+	}
+	var original []operation.Event
+	if err := store.View(context.Background(), func(reader state.Reader) error {
+		var readErr error
+		original, readErr = reader.EventsAfter(0, 0)
+		return readErr
+	}); err != nil {
+		t.Fatalf("EventsAfter() error = %v", err)
+	}
+	var completeDuration operation.Duration
+	for _, event := range original {
+		if event.OperationID != request.OperationID {
+			continue
+		}
+		switch event.Stage {
+		case operation.StagePersistIntent:
+			if event.Duration != nil {
+				t.Fatalf("persist-intent duration = %v, want unavailable", event.Duration.Value())
+			}
+		case operation.StageComplete:
+			if event.Duration == nil || *event.Duration <= 0 {
+				t.Fatalf("new complete duration = %#v, want positive same-process span", event.Duration)
+			}
+			completeDuration = *event.Duration
+		default:
+			if event.Duration == nil || event.Duration.Value() != step {
+				t.Fatalf("provider stage %s duration = %#v, want %v", event.Stage, event.Duration, step)
+			}
+		}
+	}
+	if completeDuration <= operation.Duration(step) {
+		t.Fatalf("complete duration = %v, want span larger than one provider stage", completeDuration.Value())
+	}
+	if _, err := engine.CreateSandbox(context.Background(), request); err != nil {
+		t.Fatalf("CreateSandbox(exact replay) error = %v", err)
+	}
+	var replayed []operation.Event
+	if err := store.View(context.Background(), func(reader state.Reader) error {
+		var readErr error
+		replayed, readErr = reader.EventsAfter(0, 0)
+		return readErr
+	}); err != nil {
+		t.Fatalf("EventsAfter(replay) error = %v", err)
+	}
+	if !reflect.DeepEqual(replayed, original) {
+		t.Fatal("exact replay remeasured or replaced persisted stage durations")
+	}
+}
+
+// TestResumedOperationLeavesCompleteDurationUnavailable verifies a response-loss resume measures newly executed provider stages without inventing an end-to-end span across invocations.
+func TestResumedOperationLeavesCompleteDurationUnavailable(t *testing.T) {
+	host := newFakeHost()
+	host.failAfterEnsureKind = ownership.KindKeeperProcess
+	store := state.NewMemoryStore()
+	firstClock := &scriptedClock{now: time.Date(2026, 8, 24, 10, 0, 0, 0, time.UTC), step: time.Millisecond}
+	first, err := NewWithClock(store, testProviders(t, host), firstClock)
+	if err != nil {
+		t.Fatalf("NewWithClock(first) error = %v", err)
+	}
+	request := lifecycle.SandboxCreateRequest{
+		OperationID: "op-resumed-duration", SandboxID: "sandbox-resumed-duration",
+		Spec: domain.SandboxSpec{Network: domain.NetworkIntent{Mode: "none"}},
+	}
+	if _, err := first.CreateSandbox(context.Background(), request); err == nil {
+		t.Fatal("CreateSandbox(first) error = nil, want injected response loss")
+	}
+	restartedClock := &scriptedClock{now: time.Date(2026, 8, 24, 11, 0, 0, 0, time.UTC), step: 2 * time.Millisecond}
+	restarted, err := NewWithClock(store, testProviders(t, host), restartedClock)
+	if err != nil {
+		t.Fatalf("NewWithClock(restarted) error = %v", err)
+	}
+	result, err := restarted.CreateSandbox(context.Background(), request)
+	if err != nil {
+		t.Fatalf("CreateSandbox(resume) error = %v", err)
+	}
+	if result.Resolution != operation.ResolutionResume {
+		t.Fatalf("resume resolution = %s, want %s", result.Resolution, operation.ResolutionResume)
+	}
+	var events []operation.Event
+	if err := store.View(context.Background(), func(reader state.Reader) error {
+		var readErr error
+		events, readErr = reader.EventsAfter(0, 0)
+		return readErr
+	}); err != nil {
+		t.Fatalf("EventsAfter() error = %v", err)
+	}
+	measuredAfterRestart := false
+	for _, event := range events {
+		if event.OperationID != request.OperationID {
+			continue
+		}
+		if event.Stage == operation.StageComplete {
+			if event.Duration != nil {
+				t.Fatalf("resumed complete duration = %v, want unavailable across invocations", event.Duration.Value())
+			}
+			continue
+		}
+		if event.OccurredAt.Hour() == 11 && event.Duration != nil {
+			measuredAfterRestart = true
+		}
+	}
+	if !measuredAfterRestart {
+		t.Fatal("resumed provider actions did not retain their same-process stage duration")
+	}
+}
+
+// TestInvalidMeasurementClockPreservesSideEffectJournal verifies zero and
+// regressing injected samples make timing unavailable without invalidating
+// diagnostic timestamps or discarding successfully checkpointed host effects.
+func TestInvalidMeasurementClockPreservesSideEffectJournal(t *testing.T) {
+	base := time.Date(2026, 8, 24, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		clock Clock
+	}{
+		{name: "zero samples", clock: &manualClock{}},
+		{name: "regressing samples", clock: &scriptedClock{now: base, step: -time.Millisecond}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			host := newFakeHost()
+			store := state.NewMemoryStore()
+			engine, err := NewWithClock(store, testProviders(t, host), test.clock)
+			if err != nil {
+				t.Fatalf("NewWithClock() error = %v", err)
+			}
+			request := lifecycle.SandboxCreateRequest{
+				OperationID: "op-invalid-measurement-clock", SandboxID: "sandbox-invalid-measurement-clock",
+				Spec: domain.SandboxSpec{Network: domain.NetworkIntent{Mode: "none"}},
+			}
+			result, err := engine.CreateSandbox(context.Background(), request)
+			if err != nil {
+				t.Fatalf("CreateSandbox() error = %v", err)
+			}
+			if result.Sandbox == nil || result.Sandbox.Status.Phase != domain.SandboxReady {
+				t.Fatalf("CreateSandbox() result = %#v, want Ready", result.Sandbox)
+			}
+			inventory, err := engine.sandboxInventory(context.Background(), request.SandboxID)
+			if err != nil || len(inventory) != 6 {
+				t.Fatalf("sandboxInventory() = (%d, %v), want six journaled receipts", len(inventory), err)
+			}
+			providerEvents := 0
+			if err := store.View(context.Background(), func(reader state.Reader) error {
+				events, readErr := reader.EventsAfter(0, 0)
+				if readErr != nil {
+					return readErr
+				}
+				for _, event := range events {
+					if event.OperationID != request.OperationID {
+						continue
+					}
+					if event.OccurredAt.IsZero() {
+						t.Fatalf("event %s retained a zero diagnostic timestamp", event.Stage)
+					}
+					if event.Duration != nil {
+						t.Fatalf("event %s duration = %v, want unavailable", event.Stage, event.Duration.Value())
+					}
+					if event.Stage != operation.StagePersistIntent && event.Stage != operation.StageComplete {
+						providerEvents++
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("EventsAfter() error = %v", err)
+			}
+			if providerEvents == 0 {
+				t.Fatal("CreateSandbox() retained no provider side-effect checkpoints")
+			}
+		})
 	}
 }
 
@@ -796,11 +1001,18 @@ func (host *fakeHost) AttachAttemptProcess(_ context.Context, request provider.A
 	return provider.NewAttachmentObservation(request)
 }
 
-// SnapshotAttemptOOM returns a scoped zero-delta fake memory event snapshot.
+// SnapshotAttemptOOM returns a scoped fake memory event snapshot and runs one
+// optional post-read hook so tests can advance a measurement clock at the boundary.
 func (host *fakeHost) SnapshotAttemptOOM(_ context.Context, request provider.OwnedReceiptRequest) (provider.OOMSnapshot, error) {
 	host.mu.Lock()
-	defer host.mu.Unlock()
-	return provider.NewOOMSnapshot(request, host.oom, host.oomKill, host.oomGroupKill)
+	snapshot, err := provider.NewOOMSnapshot(request, host.oom, host.oomKill, host.oomGroupKill)
+	hook := host.snapshotOOMHook
+	host.snapshotOOMHook = nil
+	host.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return snapshot, err
 }
 
 // ReleaseStartGate moves the fake wrapper from prepared to running after validating exact dependencies.

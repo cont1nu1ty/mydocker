@@ -25,8 +25,6 @@ const (
 )
 
 var (
-	// ErrLauncherIncomplete reports the fail-closed production gap between M2 helpers and a safe PID1 shim bootstrap.
-	ErrLauncherIncomplete = errors.New("Linux shim launcher is not safely implementable with current M2 primitives")
 	// ErrArtifactUnsafe reports a runtime-root, owner-directory, or artifact identity that cannot be trusted.
 	ErrArtifactUnsafe = errors.New("unsafe slim runtime artifact")
 	// ErrReceiptMismatch reports a receipt whose deterministic identity or evidence no longer matches its owner.

@@ -7,8 +7,9 @@ import (
 
 // validEvent constructs a fully populated event for sequence and validation tests.
 func validEvent(sequence Sequence) Event {
+	duration := Duration(25 * time.Millisecond)
 	return Event{
-		SchemaVersion:      SchemaVersion,
+		SchemaVersion:      EventSchemaVersion,
 		Sequence:           sequence,
 		OperationID:        "op-1",
 		Type:               TypeCreate,
@@ -18,7 +19,7 @@ func validEvent(sequence Sequence) Event {
 		Result:             ResultSucceeded,
 		Reason:             ReasonNone,
 		OccurredAt:         time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC),
-		Duration:           Duration(25 * time.Millisecond),
+		Duration:           &duration,
 		Generation:         1,
 		ObservedGeneration: 1,
 		Details:            []byte(`{"from":"creating","to":"ready"}`),
@@ -65,8 +66,11 @@ func TestHostLifecycleStagesRemainBounded(t *testing.T) {
 // result/reason consistency, stage vocabulary, timestamp, and JSON details.
 func TestEventValidateRejectsInvalidFields(t *testing.T) {
 	tests := map[string]func(*Event){
-		"zero sequence":       func(event *Event) { event.Sequence = 0 },
-		"negative duration":   func(event *Event) { event.Duration = -1 },
+		"zero sequence": func(event *Event) { event.Sequence = 0 },
+		"negative duration": func(event *Event) {
+			duration := Duration(-1)
+			event.Duration = &duration
+		},
 		"observed generation": func(event *Event) { event.ObservedGeneration = 2 },
 		"missing timestamp":   func(event *Event) { event.OccurredAt = time.Time{} },
 		"unbounded stage":     func(event *Event) { event.Stage = "future_stage" },
@@ -121,17 +125,35 @@ func TestEventValidateAfterRejectsGap(t *testing.T) {
 }
 
 // TestEventCloneDeepCopiesDetails verifies observers cannot mutate stored event
-// details through a returned clone.
+// details, resources, or optional duration evidence through a returned clone.
 func TestEventCloneDeepCopiesDetails(t *testing.T) {
 	original := validEvent(1)
 	clone := original.Clone()
 	clone.Details[2] = 'X'
 	clone.Resources[0].ID = "sandbox-mutated"
+	*clone.Duration = Duration(time.Second)
 	if string(clone.Details) == string(original.Details) {
 		t.Fatal("Clone() details share backing storage")
 	}
 	if original.Resources[0].ID != "sandbox-1" {
 		t.Fatal("Clone() resources share backing storage")
+	}
+	if original.Duration == nil || original.Duration.Value() != 25*time.Millisecond {
+		t.Fatal("Clone() duration shares mutable pointer storage")
+	}
+}
+
+// TestEventValidateAcceptsUnmeasuredDuration verifies missing timing evidence is valid and distinct from an explicit measured zero.
+func TestEventValidateAcceptsUnmeasuredDuration(t *testing.T) {
+	unmeasured := validEvent(1)
+	unmeasured.Duration = nil
+	if err := unmeasured.Validate(); err != nil {
+		t.Fatalf("Validate(unmeasured) error = %v", err)
+	}
+	zero := Duration(0)
+	unmeasured.Duration = &zero
+	if err := unmeasured.Validate(); err != nil {
+		t.Fatalf("Validate(measured zero) error = %v", err)
 	}
 }
 

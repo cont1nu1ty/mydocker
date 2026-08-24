@@ -42,7 +42,10 @@ func (engine *Engine) SynchronizeTerminals(ctx context.Context) ([]operation.Ope
 			releaseTarget()
 			continue
 		}
+		operationStartedAt := engine.beginMeasurement()
+		observationStartedAt := engine.beginMeasurement()
 		observation, observeErr := engine.observeRetainedAttemptLocked(ctx, pair.Container.ID)
+		observationMeasurement := engine.finishMeasurement(observationStartedAt)
 		if observeErr != nil {
 			releaseTarget()
 			if provider.IsObservationUnavailable(observeErr) {
@@ -68,7 +71,7 @@ func (engine *Engine) SynchronizeTerminals(ctx context.Context) ([]operation.Ope
 				return recorded, eligibilityErr
 			}
 		}
-		if _, err := engine.recordObservedTerminalLocked(ctx, operationID, pair.Container.ID, observation); err != nil {
+		if _, err := engine.recordObservedTerminalLocked(ctx, operationID, pair.Container.ID, observation, observationMeasurement, operationStartedAt); err != nil {
 			releaseTarget()
 			return recorded, err
 		}
@@ -216,7 +219,7 @@ func (engine *Engine) SynchronizeKillDeadlines(ctx context.Context) ([]operation
 		if record.KillEscalationDeadline == nil {
 			return reconciled, fmt.Errorf("active Kill %q is missing its durable escalation deadline", active.ID)
 		}
-		if engine.clock.Now().Before(*record.KillEscalationDeadline) {
+		if engine.diagnosticNow().Before(*record.KillEscalationDeadline) {
 			continue
 		}
 		if _, err := engine.KillContainer(ctx, lifecycle.KillRequest{

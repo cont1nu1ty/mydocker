@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"mydocker/internal/domain"
 	"mydocker/internal/operation"
@@ -184,6 +185,7 @@ func TestCheckpointOperationPersistsOrderedRecoveryProgress(t *testing.T) {
 	)
 	firstRollback := []rollback.Record{cgroupRollback}
 	firstReceipts := []ownership.Receipt{cgroupReceipt}
+	firstDuration := operation.Duration(5 * time.Millisecond)
 	first, err := coordinator.CheckpointOperation(context.Background(), CheckpointRequest{
 		OperationID: request.OperationID,
 		Target:      target,
@@ -191,12 +193,14 @@ func TestCheckpointOperationPersistsOrderedRecoveryProgress(t *testing.T) {
 		Stage:       operation.StagePrepareCgroup,
 		Rollback:    firstRollback,
 		Receipts:    firstReceipts,
+		Duration:    &firstDuration,
 		Details:     map[string]string{"provider": "cgroupv2"},
 	})
 	if err != nil || !first.Changed || first.Operation.Stage != operation.StagePrepareCgroup {
 		t.Fatalf("CheckpointOperation(first) = (%#v, %v)", first, err)
 	}
 
+	retryDuration := operation.Duration(9 * time.Millisecond)
 	retry, err := coordinator.CheckpointOperation(context.Background(), CheckpointRequest{
 		OperationID: request.OperationID,
 		Target:      target,
@@ -204,9 +208,22 @@ func TestCheckpointOperationPersistsOrderedRecoveryProgress(t *testing.T) {
 		Stage:       operation.StagePrepareCgroup,
 		Rollback:    firstRollback,
 		Receipts:    firstReceipts,
+		Duration:    &retryDuration,
 	})
 	if err != nil || retry.Changed {
 		t.Fatalf("CheckpointOperation(exact retry) = (%#v, %v), want unchanged", retry, err)
+	}
+	if err := store.View(context.Background(), func(reader state.Reader) error {
+		events, readErr := reader.EventsAfter(0, 0)
+		if readErr != nil {
+			return readErr
+		}
+		if len(events) != 2 || events[1].Duration == nil || *events[1].Duration != firstDuration {
+			t.Fatalf("events after exact retry = %#v, want one unchanged measured checkpoint", events)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("View(events after exact retry) error = %v", err)
 	}
 
 	keeperReceipt, keeperRollback := testCheckpointAcquisition(

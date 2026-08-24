@@ -271,7 +271,24 @@ func (delivery SignalDelivery) Validate() error {
 	if !delivery.Signal.Valid() || !delivery.Delivered || delivery.DeliveredAt.IsZero() || !validDigest(delivery.EvidenceSHA256) {
 		return errors.New("signal delivery requires a supported delivered signal, delivery time, and canonical evidence")
 	}
+	expected, err := signalDeliveryEvidence(delivery)
+	if err != nil {
+		return err
+	}
+	if delivery.EvidenceSHA256 != expected {
+		return errors.New("signal delivery evidence does not match its public fields")
+	}
 	return nil
+}
+
+// signalDeliveryEvidence binds the exact public action result without hashing its digest recursively.
+func signalDeliveryEvidence(delivery SignalDelivery) (string, error) {
+	return ownership.EvidenceDigest(struct {
+		Identity    ChildIdentity `json:"identity"`
+		Signal      Signal        `json:"signal"`
+		Delivered   bool          `json:"delivered"`
+		DeliveredAt time.Time     `json:"delivered_at"`
+	}{delivery.Identity, delivery.Signal, delivery.Delivered, delivery.DeliveredAt})
 }
 
 // Child is the one started workload process; signaling must reverify its strong handle at action time.
@@ -280,7 +297,8 @@ type Child interface {
 	Identity() ChildIdentity
 	// Wait reaps the child exactly once and returns independently attributable terminal facts.
 	Wait() (ChildExitEvidence, error)
-	// SignalVerified performs strong-handle verification and signal delivery as one child-owned action.
+	// SignalVerified performs strong-handle verification and signal delivery as one child-owned action;
+	// the wrapper supplies the final timestamp and canonical public evidence.
 	SignalVerified(Signal) (SignalDelivery, error)
 }
 

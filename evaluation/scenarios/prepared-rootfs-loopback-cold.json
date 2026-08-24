@@ -34,7 +34,7 @@
     "cache": {
       "content": "unknown",
       "unpacked_chain": "unknown",
-      "snapshot": "new-per-attempt",
+      "snapshot": "not-created-prepared-rootfs-shared",
       "page_cache": "unknown",
       "immutable_layers": "unknown"
     },

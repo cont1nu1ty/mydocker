@@ -89,7 +89,7 @@ func (c *Coordinator) BeginContainerCreate(ctx context.Context, request Containe
 		if _, putErr = tx.PutSandbox(sandboxRecord, sandboxRecord.Revision); putErr != nil {
 			return putErr
 		}
-		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0, pair.Container.Status.Generation, pair.Container.Status.ObservedGeneration, map[string]string{"phase": pair.Attempt.Phase.String(), "attempt_id": string(pair.Attempt.ID)}, containerEventResources(pair)...)
+		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil, pair.Container.Status.Generation, pair.Container.Status.ObservedGeneration, map[string]string{"phase": pair.Attempt.Phase.String(), "attempt_id": string(pair.Attempt.ID)}, containerEventResources(pair)...)
 		if eventErr != nil {
 			return eventErr
 		}
@@ -149,7 +149,7 @@ func (c *Coordinator) BeginContainerStart(ctx context.Context, request Container
 		if putErr != nil {
 			return putErr
 		}
-		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0, record.ContainerAttempt.Container.Status.Generation, record.ContainerAttempt.Container.Status.ObservedGeneration, map[string]string{"phase": record.ContainerAttempt.Attempt.Phase.String()}, containerEventResources(record.ContainerAttempt)...)
+		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil, record.ContainerAttempt.Container.Status.Generation, record.ContainerAttempt.Container.Status.ObservedGeneration, map[string]string{"phase": record.ContainerAttempt.Attempt.Phase.String()}, containerEventResources(record.ContainerAttempt)...)
 		if eventErr != nil {
 			return eventErr
 		}
@@ -204,7 +204,7 @@ func (c *Coordinator) BeginContainerDelete(ctx context.Context, request Containe
 			if putErr != nil {
 				return putErr
 			}
-			if _, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0, 0, 0, map[string]string{"phase": "metadata_absent_pending_host_verification"}); eventErr != nil {
+			if _, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil, 0, 0, map[string]string{"phase": "metadata_absent_pending_host_verification"}); eventErr != nil {
 				return eventErr
 			}
 			result = ContainerResult{Resolution: operation.ResolutionNew, Operation: operationRecord.Operation, Fingerprint: binding.Fingerprint}
@@ -234,7 +234,7 @@ func (c *Coordinator) BeginContainerDelete(ctx context.Context, request Containe
 		if putErr != nil {
 			return putErr
 		}
-		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0, updated.ContainerAttempt.Container.Status.Generation, updated.ContainerAttempt.Container.Status.ObservedGeneration, map[string]string{"phase": updated.ContainerAttempt.Attempt.Phase.String()}, containerEventResources(updated.ContainerAttempt)...)
+		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil, updated.ContainerAttempt.Container.Status.Generation, updated.ContainerAttempt.Container.Status.ObservedGeneration, map[string]string{"phase": updated.ContainerAttempt.Attempt.Phase.String()}, containerEventResources(updated.ContainerAttempt)...)
 		if eventErr != nil {
 			return eventErr
 		}
@@ -386,7 +386,7 @@ func (c *Coordinator) BeginRecordStopped(ctx context.Context, request RecordStop
 		if putErr != nil {
 			return putErr
 		}
-		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0,
+		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil,
 			record.ContainerAttempt.Container.Status.Generation, record.ContainerAttempt.Container.Status.ObservedGeneration,
 			map[string]string{"phase": "terminal_observation_pending"}, containerEventResources(record.ContainerAttempt)...)
 		if eventErr != nil {
@@ -565,7 +565,7 @@ func (c *Coordinator) PlanKill(ctx context.Context, request KillRequest) (KillRe
 			if putErr != nil {
 				return putErr
 			}
-			event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StageComplete, operation.ResultNoop, c.clock.Now(), 0, pair.Container.Status.Generation, pair.Container.Status.ObservedGeneration, map[string]string{"phase": pair.Attempt.Phase.String(), "plan": "not_required"}, containerEventResources(pair)...)
+			event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StageComplete, operation.ResultNoop, c.clock.Now(), nil, pair.Container.Status.Generation, pair.Container.Status.ObservedGeneration, map[string]string{"phase": pair.Attempt.Phase.String(), "plan": "not_required"}, containerEventResources(pair)...)
 			if eventErr != nil {
 				return eventErr
 			}
@@ -605,7 +605,7 @@ func (c *Coordinator) PlanKill(ctx context.Context, request KillRequest) (KillRe
 		if putErr != nil {
 			return putErr
 		}
-		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0, pair.Container.Status.Generation, pair.Container.Status.ObservedGeneration, map[string]string{"phase": pair.Attempt.Phase.String(), "plan": "recorded_not_executed"}, containerEventResources(pair)...)
+		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil, pair.Container.Status.Generation, pair.Container.Status.ObservedGeneration, map[string]string{"phase": pair.Attempt.Phase.String(), "plan": "recorded_not_executed"}, containerEventResources(pair)...)
 		if eventErr != nil {
 			return eventErr
 		}
@@ -851,7 +851,7 @@ func (c *Coordinator) recordStoppedInTx(tx state.Tx, binding operation.Binding, 
 		if err != nil {
 			return ContainerResult{}, err
 		}
-		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0, record.ContainerAttempt.Container.Status.Generation, record.ContainerAttempt.Container.Status.ObservedGeneration, map[string]string{"phase": "terminal_observation"}, containerEventResources(record.ContainerAttempt)...)
+		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil, record.ContainerAttempt.Container.Status.Generation, record.ContainerAttempt.Container.Status.ObservedGeneration, map[string]string{"phase": "terminal_observation"}, containerEventResources(record.ContainerAttempt)...)
 		if eventErr != nil {
 			return ContainerResult{}, eventErr
 		}
@@ -893,7 +893,7 @@ func (c *Coordinator) persistContainerNoop(tx state.Tx, binding operation.Bindin
 	if err != nil {
 		return err
 	}
-	event, err := appendOperationEvent(tx, operationRecord.Operation, operation.StageComplete, operation.ResultNoop, c.clock.Now(), 0, record.ContainerAttempt.Container.Status.Generation, record.ContainerAttempt.Container.Status.ObservedGeneration, map[string]string{"phase": record.ContainerAttempt.Attempt.Phase.String()}, containerEventResources(record.ContainerAttempt)...)
+	event, err := appendOperationEvent(tx, operationRecord.Operation, operation.StageComplete, operation.ResultNoop, c.clock.Now(), nil, record.ContainerAttempt.Container.Status.Generation, record.ContainerAttempt.Container.Status.ObservedGeneration, map[string]string{"phase": record.ContainerAttempt.Attempt.Phase.String()}, containerEventResources(record.ContainerAttempt)...)
 	if err != nil {
 		return err
 	}

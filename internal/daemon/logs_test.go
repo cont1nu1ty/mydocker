@@ -154,6 +154,37 @@ func TestRuntimeLogRegistryRediscoversStrictShimConfig(t *testing.T) {
 	}
 }
 
+// TestRuntimeLogRegistryRestartRejectsFutureCursorOnEmptyLog verifies daemon rediscovery preserves an empty committed tail and returns a typed gap instead of a successful empty page.
+func TestRuntimeLogRegistryRestartRejectsFutureCursorOnEmptyLog(t *testing.T) {
+	root, owner, identity, logPath := newRuntimeLogLocation(t, "op-log-empty-restart", "container-empty-restart", "attempt-empty-restart")
+	writeRuntimeLogConfig(t, root, owner, identity, logPath)
+	writer, err := logstore.Open(logPath, identity)
+	if err != nil {
+		t.Fatalf("open empty shim writer: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close empty shim writer: %v", err)
+	}
+
+	restarted, err := NewRuntimeLogRegistry(root)
+	if err != nil {
+		t.Fatalf("NewRuntimeLogRegistry() error = %v", err)
+	}
+	source, err := restarted.Locate(context.Background(), identity)
+	if err != nil {
+		t.Fatalf("Locate() empty log after registry restart = %v", err)
+	}
+	frames, err := source.Read(0, 10)
+	if err != nil || len(frames) != 0 {
+		t.Fatalf("Read(empty reset) after registry restart = (%+v, %v), want successful empty page", frames, err)
+	}
+	_, err = source.Read(1, 10)
+	var gap *logstore.CursorGapError
+	if !errors.Is(err, logstore.ErrCursorGap) || !errors.As(err, &gap) || gap.Requested != 1 || gap.LastAvailable != 0 {
+		t.Fatalf("Read(future) after registry restart gap = (%#v, %v), want requested 1 and last available 0", gap, err)
+	}
+}
+
 // TestRuntimeLogRegistryRejectsConfigPathAndLogLink verifies neither persisted config text nor a link can redirect the identity outside its derived owner location.
 func TestRuntimeLogRegistryRejectsConfigPathAndLogLink(t *testing.T) {
 	t.Run("config path", func(t *testing.T) {

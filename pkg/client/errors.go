@@ -92,8 +92,8 @@ func IsOperationExpired(err error) bool {
 	return CodeOf(err) == v1.CodeOperationExpired
 }
 
-// IsResumeGap reports that an event cursor predates the retained suffix so a
-// caller can deliberately restart observation from an empty resume token.
+// IsResumeGap reports that an event or workload-log cursor is outside committed
+// history so a caller can deliberately restart observation from an empty token.
 func IsResumeGap(err error) bool {
 	return CodeOf(err) == v1.CodeResumeGap
 }

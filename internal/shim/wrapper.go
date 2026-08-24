@@ -11,6 +11,8 @@ import (
 	"mydocker/internal/ownership"
 )
 
+var errDescendantCleanupUnconfirmed = errors.New("workload descendant cleanup is not confirmed")
+
 // Clock supplies wall-clock terminal metadata and deterministic test timestamps.
 type Clock interface {
 	// Now returns the current wall time; elapsed child duration comes from Child wait evidence instead.
@@ -69,6 +71,7 @@ type Wrapper struct {
 	childStartedAt time.Time
 	terminal       *TerminalRecord
 	persistenceErr error
+	quiescenceErr  error
 	rootfsPreparer RootfsPreparer
 	rootfsStarted  bool
 	rootfsRequest  RootfsRequest
@@ -158,6 +161,9 @@ func (wrapper *Wrapper) Inspect() (Observation, error) {
 // inspectLocked builds one coherent observation and performs at most one exact
 // terminal persistence retry when a prior commit ended with uncertain durability.
 func (wrapper *Wrapper) inspectLocked() (Observation, error) {
+	if wrapper.quiescenceErr != nil {
+		return Observation{}, newError(CodeUnavailable, "workload process tree is not verified quiescent", wrapper.quiescenceErr)
+	}
 	if wrapper.persistenceErr != nil && wrapper.terminal != nil {
 		record := wrapper.terminal.Clone()
 		wrapper.persistenceErr = wrapper.persistTerminal(record)
@@ -330,6 +336,13 @@ func (wrapper *Wrapper) recordStartFailure(startErr error) error {
 // reap waits exactly once, correlates exit and OOM evidence, commits terminal state, and keeps the wrapper alive.
 func (wrapper *Wrapper) reap(child Child) {
 	exit, waitErr := child.Wait()
+	if errors.Is(waitErr, errDescendantCleanupUnconfirmed) {
+		wrapper.mu.Lock()
+		wrapper.starting = false
+		wrapper.quiescenceErr = waitErr
+		wrapper.mu.Unlock()
+		return
+	}
 	validationErr := exit.Validate()
 	if waitErr != nil || validationErr != nil {
 		wrapper.mu.Lock()
@@ -413,6 +426,10 @@ func (wrapper *Wrapper) ForwardSignal(signal Signal) (SignalDelivery, error) {
 		wrapper.mu.Unlock()
 		return SignalDelivery{}, newError(CodeWrongMode, "keeper has no workload child", nil)
 	}
+	if wrapper.quiescenceErr != nil {
+		wrapper.mu.Unlock()
+		return SignalDelivery{}, newError(CodeNotRunning, "workload process tree state is unavailable", wrapper.quiescenceErr)
+	}
 	if wrapper.child == nil || wrapper.terminal != nil {
 		wrapper.mu.Unlock()
 		return SignalDelivery{}, newError(CodeNotRunning, "no verified running workload child", nil)
@@ -432,6 +449,11 @@ func (wrapper *Wrapper) ForwardSignal(signal Signal) (SignalDelivery, error) {
 	// The wrapper clock is stamped immediately after the child-owned verified
 	// action returns, so every exact control replay carries the same grace anchor.
 	delivery.DeliveredAt = wrapper.clock.Now().Round(0).UTC()
+	evidence, err := signalDeliveryEvidence(delivery)
+	if err != nil {
+		return SignalDelivery{}, newError(CodeNotRunning, "construct signal delivery evidence", err)
+	}
+	delivery.EvidenceSHA256 = evidence
 	if err := delivery.Validate(); err != nil {
 		return SignalDelivery{}, newError(CodeNotRunning, "child returned invalid signal evidence", err)
 	}

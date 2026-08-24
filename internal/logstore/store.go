@@ -181,7 +181,7 @@ func (store *Store) Append(stream Stream, payload []byte) (Frame, error) {
 	return frame.Clone(), nil
 }
 
-// Read returns frames whose global cursor is strictly greater than after, in cursor order; zero means all remaining.
+// Read returns frames whose global cursor is strictly greater than after, in cursor order; zero means all remaining and a future cursor returns ErrCursorGap.
 func (store *Store) Read(after Cursor, limit int) ([]Frame, error) {
 	if limit < 0 {
 		return nil, ErrInvalidLimit
@@ -390,6 +390,9 @@ func scanFramePage(file File, identity Identity, snapshotSize int64, after Curso
 		}
 	} else if finalInfo.Size() < snapshotSize {
 		return scanResult{}, fmt.Errorf("%w: file shrank during read-only scan", ErrCorrupt)
+	}
+	if after > lastCursor {
+		return scanResult{}, &CursorGapError{Requested: after, LastAvailable: lastCursor}
 	}
 	return scanResult{frames: frames, lastCursor: lastCursor, lastSequence: lastSequence, validSize: fileSize}, nil
 }

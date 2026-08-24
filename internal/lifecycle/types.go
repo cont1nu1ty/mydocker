@@ -57,12 +57,13 @@ func (kind VerificationKind) Valid() bool {
 }
 
 // Verification carries an explicit external observation; it never performs the observation itself.
+// Duration is present only when the caller measured the complete operation in one process invocation.
 type Verification struct {
 	Kind            VerificationKind        `json:"kind"`
 	Verified        bool                    `json:"verified"`
 	Evidence        string                  `json:"evidence"`
 	ObservedAt      time.Time               `json:"observed_at"`
-	Duration        operation.Duration      `json:"duration_ns"`
+	Duration        *operation.Duration     `json:"duration_ns,omitempty"`
 	ProcessIdentity *domain.ProcessIdentity `json:"process_identity,omitempty"`
 	Streams         domain.StreamReferences `json:"streams"`
 }
@@ -70,6 +71,10 @@ type Verification struct {
 // Clone returns verification data without retaining a mutable process-identity pointer.
 func (v Verification) Clone() Verification {
 	clone := v
+	if v.Duration != nil {
+		duration := *v.Duration
+		clone.Duration = &duration
+	}
 	if v.ProcessIdentity != nil {
 		identity := *v.ProcessIdentity
 		clone.ProcessIdentity = &identity
@@ -82,8 +87,10 @@ func (v Verification) Validate() error {
 	if !v.Kind.Valid() || !v.Verified || strings.TrimSpace(v.Evidence) == "" || strings.ContainsRune(v.Evidence, '\x00') || v.ObservedAt.IsZero() {
 		return ErrVerificationRequired
 	}
-	if err := v.Duration.Validate(); err != nil {
-		return fmt.Errorf("verification duration: %w", err)
+	if v.Duration != nil {
+		if err := v.Duration.Validate(); err != nil {
+			return fmt.Errorf("verification duration: %w", err)
+		}
 	}
 	if err := v.Streams.Validate(); err != nil {
 		return err

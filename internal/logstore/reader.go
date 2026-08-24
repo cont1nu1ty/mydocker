@@ -44,7 +44,7 @@ func (reader *Reader) Identity() Identity {
 	return reader.identity
 }
 
-// Read reopens and validates one fixed-size snapshot, returning frames strictly after the cursor without retaining a file descriptor.
+// Read reopens and validates one fixed-size snapshot, returning frames strictly after the cursor and ErrCursorGap for a future position without retaining a file descriptor.
 func (reader *Reader) Read(after Cursor, limit int) ([]Frame, error) {
 	if reader == nil {
 		return nil, ErrClosed

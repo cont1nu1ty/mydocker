@@ -49,7 +49,7 @@ func (c *Coordinator) BeginSandboxCreate(ctx context.Context, request SandboxCre
 			if putErr != nil {
 				return putErr
 			}
-			event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StageComplete, operation.ResultNoop, c.clock.Now(), 0, existing.Sandbox.Status.Generation, existing.Sandbox.Status.ObservedGeneration, map[string]string{"phase": existing.Sandbox.Status.Phase.String()})
+			event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StageComplete, operation.ResultNoop, c.clock.Now(), nil, existing.Sandbox.Status.Generation, existing.Sandbox.Status.ObservedGeneration, map[string]string{"phase": existing.Sandbox.Status.Phase.String()})
 			if eventErr != nil {
 				return eventErr
 			}
@@ -84,7 +84,7 @@ func (c *Coordinator) BeginSandboxCreate(ctx context.Context, request SandboxCre
 		if putErr != nil {
 			return putErr
 		}
-		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0, sandbox.Status.Generation, sandbox.Status.ObservedGeneration, map[string]string{"phase": sandbox.Status.Phase.String()})
+		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil, sandbox.Status.Generation, sandbox.Status.ObservedGeneration, map[string]string{"phase": sandbox.Status.Phase.String()})
 		if eventErr != nil {
 			return eventErr
 		}
@@ -160,7 +160,7 @@ func (c *Coordinator) BeginSandboxStop(ctx context.Context, request SandboxActio
 		if putErr != nil {
 			return putErr
 		}
-		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0, updated.Sandbox.Status.Generation, updated.Sandbox.Status.ObservedGeneration, map[string]string{"phase": updated.Sandbox.Status.Phase.String()})
+		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil, updated.Sandbox.Status.Generation, updated.Sandbox.Status.ObservedGeneration, map[string]string{"phase": updated.Sandbox.Status.Phase.String()})
 		if eventErr != nil {
 			return eventErr
 		}
@@ -212,7 +212,7 @@ func (c *Coordinator) BeginSandboxRemove(ctx context.Context, request SandboxAct
 			if putErr != nil {
 				return putErr
 			}
-			if _, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0, 0, 0, map[string]string{"phase": "metadata_absent_pending_host_verification"}); eventErr != nil {
+			if _, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil, 0, 0, map[string]string{"phase": "metadata_absent_pending_host_verification"}); eventErr != nil {
 				return eventErr
 			}
 			result = SandboxResult{Resolution: operation.ResolutionNew, Operation: operationRecord.Operation, Fingerprint: binding.Fingerprint}
@@ -239,7 +239,7 @@ func (c *Coordinator) BeginSandboxRemove(ctx context.Context, request SandboxAct
 		if putErr != nil {
 			return putErr
 		}
-		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), 0, record.Sandbox.Status.Generation, record.Sandbox.Status.ObservedGeneration, map[string]string{"phase": record.Sandbox.Status.Phase.String()})
+		event, eventErr := appendOperationEvent(tx, operationRecord.Operation, operation.StagePersistIntent, operation.ResultPending, c.clock.Now(), nil, record.Sandbox.Status.Generation, record.Sandbox.Status.ObservedGeneration, map[string]string{"phase": record.Sandbox.Status.Phase.String()})
 		if eventErr != nil {
 			return eventErr
 		}
@@ -416,7 +416,7 @@ func (c *Coordinator) persistSandboxNoop(tx state.Tx, binding operation.Binding,
 	if err != nil {
 		return err
 	}
-	event, err := appendOperationEvent(tx, operationRecord.Operation, operation.StageComplete, operation.ResultNoop, c.clock.Now(), 0, record.Sandbox.Status.Generation, record.Sandbox.Status.ObservedGeneration, map[string]string{"phase": record.Sandbox.Status.Phase.String()})
+	event, err := appendOperationEvent(tx, operationRecord.Operation, operation.StageComplete, operation.ResultNoop, c.clock.Now(), nil, record.Sandbox.Status.Generation, record.Sandbox.Status.ObservedGeneration, map[string]string{"phase": record.Sandbox.Status.Phase.String()})
 	if err != nil {
 		return err
 	}

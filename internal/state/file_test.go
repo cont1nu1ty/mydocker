@@ -3,8 +3,10 @@ package state
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync"
@@ -35,8 +37,11 @@ func TestFileStorePersistsAndReopens(t *testing.T) {
 	second := testOperation("op-file-z", "sandbox-file-z")
 	first := testOperation("op-file-a", "sandbox-file-a")
 	firstEvent := testEvent(first)
+	measuredZero := operation.Duration(0)
+	firstEvent.Duration = &measuredZero
 	firstEvent.Details = json.RawMessage("{\"source\":\"first\"}")
 	secondEvent := testEvent(second)
+	secondEvent.Duration = nil
 	var firstRecord OperationRecord
 	err = store.Update(context.Background(), func(tx Tx) error {
 		var err error
@@ -83,6 +88,9 @@ func TestFileStorePersistsAndReopens(t *testing.T) {
 		}
 		if len(events) != 2 || events[0].Sequence != 1 || events[1].Sequence != 2 {
 			t.Fatalf("EventsAfter() sequences = %v, want [1 2]", eventSequences(events))
+		}
+		if events[0].Duration == nil || events[0].Duration.Value() != 0 || events[1].Duration != nil {
+			t.Fatalf("reopened event durations = %#v/%#v, want measured zero then unavailable", events[0].Duration, events[1].Duration)
 		}
 		originalDetails := append(json.RawMessage(nil), events[0].Details...)
 		events[0].Details[0] = 'X'
@@ -210,8 +218,9 @@ func TestFileStoreRejectsInvalidDiskEnvelope(t *testing.T) {
 		envelope.PayloadSHA256 = digestFilePayloadForTest(t, *envelope.Payload)
 	})
 	unknownField := appendUnknownEnvelopeField(t, valid)
-	duplicateField := bytes.Replace(valid, []byte("\"schema_version\":2,"),
-		[]byte("\"schema_version\":2,\"schema_version\":2,"), 1)
+	schemaField := []byte(fmt.Sprintf("\"schema_version\":%d,", currentFileSchemaVersion))
+	duplicateSchemaField := []byte(fmt.Sprintf("\"schema_version\":%d,\"schema_version\":%d,", currentFileSchemaVersion, currentFileSchemaVersion))
+	duplicateField := bytes.Replace(valid, schemaField, duplicateSchemaField, 1)
 	duplicate := duplicateOperationEnvelope(t)
 
 	tests := []struct {
@@ -242,7 +251,7 @@ func TestFileStoreRejectsInvalidDiskEnvelope(t *testing.T) {
 }
 
 // TestFileStoreRetentionSurvivesReopen verifies exact replay, tombstones, and
-// event resume-gap boundaries are committed in the same durable v2 snapshot.
+// event resume-gap boundaries are committed in the same current snapshot.
 func TestFileStoreRetentionSurvivesReopen(t *testing.T) {
 	path := filepath.Join(secureStateTestDir(t), "state.json")
 	policy := RetentionPolicy{TerminalOperationLimit: 1, OperationIdentityLimit: 6, EventLimit: 2}
@@ -479,9 +488,9 @@ func TestFileStoreRejectsOversizedEnvelope(t *testing.T) {
 	}
 }
 
-// TestFileStoreRejectsChecksummedV2RetentionTamper proves a valid outer
+// TestFileStoreRejectsChecksummedV3RetentionTamper proves a valid outer
 // checksum cannot authorize retention metadata that changes an event binding.
-func TestFileStoreRejectsChecksummedV2RetentionTamper(t *testing.T) {
+func TestFileStoreRejectsChecksummedV3RetentionTamper(t *testing.T) {
 	path := filepath.Join(secureStateTestDir(t), "state.json")
 	policy := RetentionPolicy{TerminalOperationLimit: 1, OperationIdentityLimit: 4, EventLimit: 4}
 	store, err := NewFileStoreWithRetention(path, policy)
@@ -494,11 +503,11 @@ func TestFileStoreRejectsChecksummedV2RetentionTamper(t *testing.T) {
 
 	encoded, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("ReadFile(v2 fixture) error = %v", err)
+		t.Fatalf("ReadFile(v3 fixture) error = %v", err)
 	}
 	mutated := mutateFileEnvelope(t, encoded, func(envelope *fileEnvelope) {
-		if envelope.SchemaVersion != fileSchemaVersionV2 || len(envelope.Payload.RetiredOperations) != 1 {
-			t.Fatalf("v2 fixture schema/retired count = %d/%d, want 2/1", envelope.SchemaVersion, len(envelope.Payload.RetiredOperations))
+		if envelope.SchemaVersion != fileSchemaVersionV3 || len(envelope.Payload.RetiredOperations) != 1 {
+			t.Fatalf("v3 fixture schema/retired count = %d/%d, want 3/1", envelope.SchemaVersion, len(envelope.Payload.RetiredOperations))
 		}
 		envelope.Payload.RetiredOperations[0].Target.ID = "sandbox-valid-but-wrong"
 		envelope.PayloadSHA256 = digestFilePayloadForTest(t, *envelope.Payload)
@@ -511,10 +520,10 @@ func TestFileStoreRejectsChecksummedV2RetentionTamper(t *testing.T) {
 	}
 }
 
-// TestFileStoreRejectsChecksummedV2MissingTombstone verifies terminal order is
+// TestFileStoreRejectsChecksummedV3MissingTombstone verifies terminal order is
 // a contiguous 1..high-watermark set, so deleting one retired ID cannot erase
 // idempotency history even when an attacker refreshes the outer checksum.
-func TestFileStoreRejectsChecksummedV2MissingTombstone(t *testing.T) {
+func TestFileStoreRejectsChecksummedV3MissingTombstone(t *testing.T) {
 	path := filepath.Join(secureStateTestDir(t), "state.json")
 	policy := RetentionPolicy{TerminalOperationLimit: 1, OperationIdentityLimit: 4, EventLimit: 1}
 	store, err := NewFileStoreWithRetention(path, policy)
@@ -528,11 +537,11 @@ func TestFileStoreRejectsChecksummedV2MissingTombstone(t *testing.T) {
 
 	encoded, err := os.ReadFile(path)
 	if err != nil {
-		t.Fatalf("ReadFile(v2 tombstone fixture) error = %v", err)
+		t.Fatalf("ReadFile(v3 tombstone fixture) error = %v", err)
 	}
 	mutated := mutateFileEnvelope(t, encoded, func(envelope *fileEnvelope) {
-		if envelope.SchemaVersion != fileSchemaVersionV2 || len(envelope.Payload.RetiredOperations) != 2 {
-			t.Fatalf("v2 fixture schema/retired count = %d/%d, want 2/2", envelope.SchemaVersion, len(envelope.Payload.RetiredOperations))
+		if envelope.SchemaVersion != fileSchemaVersionV3 || len(envelope.Payload.RetiredOperations) != 2 {
+			t.Fatalf("v3 fixture schema/retired count = %d/%d, want 3/2", envelope.SchemaVersion, len(envelope.Payload.RetiredOperations))
 		}
 		envelope.Payload.RetiredOperations = envelope.Payload.RetiredOperations[1:]
 		envelope.PayloadSHA256 = digestFilePayloadForTest(t, *envelope.Payload)
@@ -546,7 +555,7 @@ func TestFileStoreRejectsChecksummedV2MissingTombstone(t *testing.T) {
 }
 
 // TestFileStoreMigratesV1Envelope verifies an old checksummed snapshot is
-// validated, loaded, and atomically rewritten with explicit v2 retention fields.
+// validated, loaded, and atomically rewritten with current retention and event semantics.
 func TestFileStoreMigratesV1Envelope(t *testing.T) {
 	path := filepath.Join(secureStateTestDir(t), "state.json")
 	data := newMemoryData()
@@ -587,8 +596,127 @@ func TestFileStoreMigratesV1Envelope(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decodeFileEnvelope(migrated) error = %v", err)
 	}
-	if decoded.SchemaVersion != fileSchemaVersionV2 || decoded.Payload.FirstEventSequence != 1 {
-		t.Fatalf("migrated schema/first event = %d/%d, want 2/1", decoded.SchemaVersion, decoded.Payload.FirstEventSequence)
+	if decoded.SchemaVersion != fileSchemaVersionV3 || decoded.Payload.FirstEventSequence != 1 {
+		t.Fatalf("migrated schema/first event = %d/%d, want 3/1", decoded.SchemaVersion, decoded.Payload.FirstEventSequence)
+	}
+}
+
+// TestFileStoreMigratesLegacyZeroDuration verifies independently checksummed
+// v1 and v2 envelopes convert their historical zero placeholders to unavailable
+// timing evidence before being rewritten with current event semantics.
+func TestFileStoreMigratesLegacyZeroDuration(t *testing.T) {
+	for _, fileSchema := range []uint32{fileSchemaVersionV1, fileSchemaVersionV2} {
+		t.Run(fmt.Sprintf("file_schema_%d", fileSchema), func(t *testing.T) {
+			path := filepath.Join(secureStateTestDir(t), "state.json")
+			writeLegacyZeroDurationEnvelope(t, path, fileSchema)
+			store, err := NewFileStore(path)
+			if err != nil {
+				t.Fatalf("NewFileStore(legacy duration migration) error = %v", err)
+			}
+			if err := store.View(context.Background(), func(reader Reader) error {
+				events, readErr := reader.EventsAfter(0, 0)
+				if readErr != nil {
+					return readErr
+				}
+				if len(events) != 1 || events[0].SchemaVersion != operation.EventSchemaVersion || events[0].Duration != nil {
+					t.Fatalf("migrated legacy event = %#v, want event schema %d with unavailable duration", events, operation.EventSchemaVersion)
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("View(migrated legacy event) error = %v", err)
+			}
+			closeFileStoreForTest(t, store)
+			migrated, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("ReadFile(migrated legacy envelope) error = %v", err)
+			}
+			decoded, err := decodeFileEnvelope(migrated)
+			if err != nil {
+				t.Fatalf("decodeFileEnvelope(migrated legacy envelope) error = %v", err)
+			}
+			if decoded.SchemaVersion != fileSchemaVersionV3 || decoded.Payload.Events[0].Duration != nil {
+				t.Fatalf("migrated envelope schema/duration = %d/%#v, want 3/nil", decoded.SchemaVersion, decoded.Payload.Events[0].Duration)
+			}
+		})
+	}
+}
+
+// TestFileStoreRejectsLegacyEventSchemaInV3 verifies the current envelope never
+// silently applies legacy placeholder semantics without the legacy file-schema marker.
+func TestFileStoreRejectsLegacyEventSchemaInV3(t *testing.T) {
+	path := filepath.Join(secureStateTestDir(t), "state.json")
+	data := newMemoryData()
+	view := &memoryView{data: &data, writable: true, retention: DefaultRetentionPolicy()}
+	op := testOperation("op-v3-legacy-event-schema", "sandbox-v3-legacy-event-schema")
+	if _, err := view.PutOperation(NewOperationRecord(op), 0); err != nil {
+		t.Fatalf("PutOperation(current fixture) error = %v", err)
+	}
+	if _, err := view.AppendEvent(testEvent(op)); err != nil {
+		t.Fatalf("AppendEvent(current fixture) error = %v", err)
+	}
+	view.close()
+	encoded, err := encodeFileData(data)
+	if err != nil {
+		t.Fatalf("encodeFileData(current fixture) error = %v", err)
+	}
+	mutated := mutateFileEnvelope(t, encoded, func(envelope *fileEnvelope) {
+		if envelope.SchemaVersion != fileSchemaVersionV3 || len(envelope.Payload.Events) != 1 {
+			t.Fatalf("current fixture schema/events = %d/%d, want 3/1", envelope.SchemaVersion, len(envelope.Payload.Events))
+		}
+		envelope.Payload.Events[0].SchemaVersion = legacyEventSchemaVersionV1
+		envelope.PayloadSHA256 = digestFilePayloadForTest(t, *envelope.Payload)
+	})
+	if err := os.WriteFile(path, mutated, filePermission); err != nil {
+		t.Fatalf("WriteFile(current legacy-event fixture) error = %v", err)
+	}
+	if _, err := NewFileStore(path); !errors.Is(err, ErrUnsupportedSchema) {
+		t.Fatalf("NewFileStore(current legacy-event fixture) error = %v, want ErrUnsupportedSchema", err)
+	}
+}
+
+// writeLegacyZeroDurationEnvelope creates a valid legacy checksum independently
+// from production digest helpers, preserving the old mandatory numeric duration field.
+func writeLegacyZeroDurationEnvelope(t *testing.T, path string, fileSchema uint32) {
+	t.Helper()
+	data := newMemoryData()
+	view := &memoryView{data: &data, writable: true, retention: DefaultRetentionPolicy()}
+	op := testOperation(fmt.Sprintf("op-v%d-duration-migrate", fileSchema), fmt.Sprintf("sandbox-v%d-duration-migrate", fileSchema))
+	if _, err := view.PutOperation(NewOperationRecord(op), 0); err != nil {
+		t.Fatalf("PutOperation(legacy duration fixture) error = %v", err)
+	}
+	if _, err := view.AppendEvent(testEvent(op)); err != nil {
+		t.Fatalf("AppendEvent(legacy duration fixture) error = %v", err)
+	}
+	view.close()
+	payload := filePayloadFromMemory(data)
+	if fileSchema == fileSchemaVersionV1 {
+		payload.FirstEventSequence = 0
+		payload.TerminalOperationSequences = nil
+		payload.LastTerminalOperationSequence = 0
+		payload.RetiredOperations = nil
+	}
+	legacyZero := operation.Duration(0)
+	payload.Events[0].SchemaVersion = legacyEventSchemaVersionV1
+	payload.Events[0].Duration = &legacyZero
+	legacyPayload, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal(legacy payload) error = %v", err)
+	}
+	if !bytes.Contains(legacyPayload, []byte(`"duration_ns":0`)) {
+		t.Fatalf("legacy payload = %s, want explicit zero duration", legacyPayload)
+	}
+	digest := sha256.Sum256(legacyPayload)
+	envelope := struct {
+		SchemaVersion uint32          `json:"schema_version"`
+		Payload       json.RawMessage `json:"payload"`
+		PayloadSHA256 string          `json:"payload_sha256"`
+	}{SchemaVersion: fileSchema, Payload: legacyPayload, PayloadSHA256: fmt.Sprintf("%x", digest[:])}
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		t.Fatalf("Marshal(legacy envelope) error = %v", err)
+	}
+	if err := os.WriteFile(path, encoded, filePermission); err != nil {
+		t.Fatalf("WriteFile(legacy envelope) error = %v", err)
 	}
 }
 

@@ -126,7 +126,7 @@ func (c *Coordinator) ReconcileCondition(ctx context.Context, request ReconcileC
 		}
 		event, eventErr := appendOperationEvent(
 			tx, operationRecord.Operation, operation.StageComplete, operation.ResultSucceeded,
-			occurredAt, 0, generation, observed, semantic, resources...,
+			occurredAt, nil, generation, observed, semantic, resources...,
 		)
 		if eventErr != nil {
 			return eventErr
@@ -314,7 +314,7 @@ func (c *Coordinator) FailActiveOperation(ctx context.Context, request FailOpera
 		}
 		event, eventErr := appendOperationEvent(
 			tx, failed.Operation, operation.StageComplete, operation.ResultFailed,
-			occurredAt, 0, generation, observed, request.Failure, resources...,
+			occurredAt, nil, generation, observed, request.Failure, resources...,
 		)
 		if eventErr != nil {
 			return eventErr

@@ -258,7 +258,7 @@ adapter 才能将外部请求转换为本地 API。当前设计不兼容 CRI。
 
 - M3 已选择分离的 Sandbox keeper 与长期 init wrapper；M5 是否扩展为可无缝重连的
   per-Sandbox supervisor，以及重连失败时的最终 orphan policy，仍待真实故障矩阵决定。
-- 当前 FileStore schema v2 提供原子 snapshot、event ordering、最近 `1024` 个终态
+- 当前 FileStore schema v3 提供原子 snapshot、event ordering、旧事件计时迁移、最近 `1024` 个终态
   operation 的精确响应、最多 `65536` 个 identity/tombstone 及最近 `8192` 个 event；
   达到 identity/envelope 上限后的在线 rollover、归档和运维迁移仍未实现。
 - Kill API/CLI 要求显式 signal、grace period 和 escalation signal，不选择隐式默认值；

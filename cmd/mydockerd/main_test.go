@@ -15,7 +15,6 @@ import (
 
 	"mydocker/internal/provider"
 	"mydocker/internal/server"
-	"mydocker/internal/slim"
 )
 
 // fakeDaemonRuntime records startup ordering and injects failures without
@@ -277,14 +276,15 @@ func TestBackgroundExitErrorTreatsCanceledWatcherAsNormal(t *testing.T) {
 	}
 }
 
-// TestRunDaemonFailsClosedBeforeServerOnLauncherGap verifies an incomplete
+// TestRunDaemonFailsClosedBeforeServerOnPreflightFailure verifies a failed
 // production-style isolation preflight never constructs or binds the UDS.
-func TestRunDaemonFailsClosedBeforeServerOnLauncherGap(t *testing.T) {
+func TestRunDaemonFailsClosedBeforeServerOnPreflightFailure(t *testing.T) {
 	root := t.TempDir()
 	arguments := validDaemonArguments(root)
 	socketPath := filepath.Join(root, "api", "mydockerd.sock")
 	var order []string
-	runtime := &fakeDaemonRuntime{socketPath: socketPath, order: &order, preflightErr: slim.ErrLauncherIncomplete}
+	preflightFailure := errors.New("injected isolation preflight failure")
+	runtime := &fakeDaemonRuntime{socketPath: socketPath, order: &order, preflightErr: preflightFailure}
 	serverCalled := false
 	var logs bytes.Buffer
 	err := runDaemon(context.Background(), arguments, &logs,
@@ -296,11 +296,11 @@ func TestRunDaemonFailsClosedBeforeServerOnLauncherGap(t *testing.T) {
 			serverCalled = true
 			return nil, errors.New("must not be called")
 		})
-	if !errors.Is(err, slim.ErrLauncherIncomplete) {
-		t.Fatalf("error = %v, want ErrLauncherIncomplete", err)
+	if !errors.Is(err, preflightFailure) {
+		t.Fatalf("error = %v, want injected preflight failure", err)
 	}
 	if serverCalled {
-		t.Fatal("server was constructed after incomplete launcher preflight")
+		t.Fatal("server was constructed after failed isolation preflight")
 	}
 	if !reflect.DeepEqual(order, []string{"open", "preflight", "close"}) {
 		t.Fatalf("startup order = %v", order)
@@ -337,14 +337,15 @@ func TestRunDaemonDoesNotBindWhenRecoveryFails(t *testing.T) {
 	}
 }
 
-// TestPreflightHostChecksIncompleteIsolationBeforeCgroup verifies the known
-// launcher gap is surfaced exactly and no cgroup probe can obscure it.
-func TestPreflightHostChecksIncompleteIsolationBeforeCgroup(t *testing.T) {
-	isolationInspector := &fakeIsolationInspector{err: slim.ErrLauncherIncomplete}
+// TestPreflightHostChecksIsolationBeforeCgroup verifies an isolation failure
+// is surfaced exactly and no later cgroup probe can obscure it.
+func TestPreflightHostChecksIsolationBeforeCgroup(t *testing.T) {
+	preflightFailure := errors.New("injected isolation preflight failure")
+	isolationInspector := &fakeIsolationInspector{err: preflightFailure}
 	cgroupInspector := &fakeCgroupInspector{err: errors.New("must not be reached")}
 	err := preflightHost(context.Background(), cgroupInspector, isolationInspector)
-	if !errors.Is(err, slim.ErrLauncherIncomplete) {
-		t.Fatalf("error = %v, want ErrLauncherIncomplete", err)
+	if !errors.Is(err, preflightFailure) {
+		t.Fatalf("error = %v, want injected preflight failure", err)
 	}
 	if !isolationInspector.called || cgroupInspector.called {
 		t.Fatalf("isolation/cgroup calls = %v/%v", isolationInspector.called, cgroupInspector.called)

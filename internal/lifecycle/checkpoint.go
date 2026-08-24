@@ -29,7 +29,7 @@ type CheckpointRequest struct {
 	Receipts               []ownership.Receipt
 	Releases               []ownership.Release
 	OccurredAt             time.Time
-	Duration               operation.Duration
+	Duration               *operation.Duration
 	Details                any
 	UpsertCondition        *domain.Condition
 	ClearCondition         string
@@ -193,8 +193,10 @@ func validateCheckpointRequest(request CheckpointRequest) error {
 	case operation.StageValidate, operation.StagePersistIntent, operation.StageComplete:
 		return fmt.Errorf("stage %q is not a provider checkpoint", request.Stage)
 	}
-	if err := request.Duration.Validate(); err != nil {
-		return err
+	if request.Duration != nil {
+		if err := request.Duration.Validate(); err != nil {
+			return err
+		}
 	}
 	if request.UpsertCondition != nil && request.ClearCondition != "" {
 		return errors.New("provider checkpoint cannot upsert and clear a condition in one request")

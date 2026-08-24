@@ -66,7 +66,7 @@ func (engine *Engine) rollbackCreateLocked(ctx context.Context, operationID oper
 	for index := range records {
 		records[index].Started = true
 	}
-	if err := engine.checkpointRollback(ctx, progress, cause, records, failure, rollbackCondition(cause, nil)); err != nil {
+	if err := engine.checkpointRollback(ctx, progress, cause, records, failure, rollbackCondition(cause, nil), engine.unmeasuredCheckpoint()); err != nil {
 		return operation.Operation{}, err
 	}
 	var resolver rollback.Resolver
@@ -97,12 +97,15 @@ func (engine *Engine) rollbackCreateLocked(ctx context.Context, operationID oper
 			if err != nil {
 				return operation.Operation{}, err
 			}
-			if err := engine.checkpointRollback(ctx, progress, cause, records, map[string]string{"failed_inverse": records[index].Descriptor.Name}, rollbackCondition(cause, &report.Failures[len(report.Failures)-1])); err != nil {
+			if err := engine.checkpointRollback(ctx, progress, cause, records, map[string]string{"failed_inverse": records[index].Descriptor.Name}, rollbackCondition(cause, &report.Failures[len(report.Failures)-1]), engine.unmeasuredCheckpoint()); err != nil {
 				return operation.Operation{}, err
 			}
 			continue
 		}
-		if inverseErr := inverse(ctx); inverseErr != nil {
+		inverseStartedAt := engine.beginMeasurement()
+		inverseErr := inverse(ctx)
+		inverseMeasurement := engine.finishMeasurement(inverseStartedAt)
+		if inverseErr != nil {
 			updated, recordErr := records[index].RecordFailure(inverseErr)
 			if recordErr != nil {
 				return operation.Operation{}, recordErr
@@ -113,7 +116,7 @@ func (engine *Engine) rollbackCreateLocked(ctx context.Context, operationID oper
 			if err != nil {
 				return operation.Operation{}, err
 			}
-			if err := engine.checkpointRollback(ctx, progress, cause, records, map[string]string{"failed_inverse": records[index].Descriptor.Name}, rollbackCondition(cause, &report.Failures[len(report.Failures)-1])); err != nil {
+			if err := engine.checkpointRollback(ctx, progress, cause, records, map[string]string{"failed_inverse": records[index].Descriptor.Name}, rollbackCondition(cause, &report.Failures[len(report.Failures)-1]), inverseMeasurement); err != nil {
 				return operation.Operation{}, err
 			}
 			continue
@@ -123,7 +126,7 @@ func (engine *Engine) rollbackCreateLocked(ctx context.Context, operationID oper
 		if err != nil {
 			return operation.Operation{}, err
 		}
-		if err := engine.checkpointRollback(ctx, progress, cause, records, map[string]string{"completed_inverse": records[index].Descriptor.Name}, rollbackCondition(cause, nil)); err != nil {
+		if err := engine.checkpointRollback(ctx, progress, cause, records, map[string]string{"completed_inverse": records[index].Descriptor.Name}, rollbackCondition(cause, nil), inverseMeasurement); err != nil {
 			return operation.Operation{}, err
 		}
 	}
@@ -151,7 +154,7 @@ func (engine *Engine) rollbackCreateLocked(ctx context.Context, operationID oper
 	if err != nil {
 		return operation.Operation{}, err
 	}
-	verification := lifecycle.Verification{Verified: true, Evidence: evidence, ObservedAt: engine.clock.Now()}
+	verification := lifecycle.Verification{Verified: true, Evidence: evidence, ObservedAt: engine.diagnosticNow()}
 	switch target.Kind {
 	case operation.TargetSandbox:
 		verification.Kind = lifecycle.VerificationSandboxAbsent
@@ -210,12 +213,12 @@ func (engine *Engine) resumeCreateRollbackLocked(ctx context.Context, operationI
 }
 
 // checkpointRollback atomically persists sealed or advanced inverse progress before another cleanup action begins.
-func (engine *Engine) checkpointRollback(ctx context.Context, progress lifecycle.OperationProgress, cause *rollback.Cause, records []rollback.Record, details any, condition *domain.Condition) error {
+func (engine *Engine) checkpointRollback(ctx context.Context, progress lifecycle.OperationProgress, cause *rollback.Cause, records []rollback.Record, details any, condition *domain.Condition, measurement stageMeasurement) error {
 	_, err := engine.lifecycle.CheckpointOperation(ctx, lifecycle.CheckpointRequest{
 		OperationID: progress.Operation.ID, Target: progress.Operation.Target, Fingerprint: progress.Operation.Fingerprint,
 		Stage: operation.StageRollback, RollbackCause: cause, OOMBaseline: progress.OOMBaseline,
 		Rollback: cloneRollback(records), Receipts: cloneReceipts(progress.Receipts),
-		Releases: cloneReleases(progress.Releases), OccurredAt: engine.clock.Now(), Details: details,
+		Releases: cloneReleases(progress.Releases), OccurredAt: measurement.occurredAt, Duration: measurement.duration, Details: details,
 		UpsertCondition: condition,
 	})
 	return err

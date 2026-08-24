@@ -46,6 +46,75 @@ func TestSynchronizeTerminalsRecordsNaturalExit(t *testing.T) {
 	}
 }
 
+// TestSynchronizeTerminalsCompleteDurationIncludesObservation verifies the
+// watcher starts a new natural-stop span before reading the supervisor, so the
+// complete duration is strictly wider than its nested observation stage.
+func TestSynchronizeTerminalsCompleteDurationIncludesObservation(t *testing.T) {
+	host := newFakeHost()
+	store := state.NewMemoryStore()
+	step := 3 * time.Millisecond
+	clock := &scriptedClock{now: time.Date(2026, 8, 24, 13, 0, 0, 0, time.UTC), step: step}
+	engine, err := NewWithClock(store, testProviders(t, host), clock)
+	if err != nil {
+		t.Fatalf("NewWithClock() error = %v", err)
+	}
+	prepareCreatedContainer(t, engine)
+	if _, err := engine.StartContainer(context.Background(), lifecycle.ContainerActionRequest{
+		OperationID: "op-start-before-measured-watch", ContainerID: "container-start-test",
+	}); err != nil {
+		t.Fatalf("StartContainer() error = %v", err)
+	}
+	started := time.Date(2026, 8, 24, 13, 30, 0, 0, time.UTC)
+	host.mu.Lock()
+	host.attempt = AttemptObservation{
+		Terminal: true, Evidence: "measured-watch-terminal-evidence",
+		Outcome: domain.ExitOutcome(0, domain.EvidenceFalse, started, started.Add(time.Second), time.Second),
+	}
+	host.mu.Unlock()
+	recorded, err := engine.SynchronizeTerminals(context.Background())
+	if err != nil || len(recorded) != 1 {
+		t.Fatalf("SynchronizeTerminals() = (%v, %v), want one natural-stop operation", recorded, err)
+	}
+	var observationDuration operation.Duration
+	var completeDuration operation.Duration
+	var foundObservation bool
+	var foundComplete bool
+	if err := store.View(context.Background(), func(reader state.Reader) error {
+		events, readErr := reader.EventsAfter(0, 0)
+		if readErr != nil {
+			return readErr
+		}
+		for _, event := range events {
+			if event.OperationID != recorded[0] {
+				continue
+			}
+			switch event.Stage {
+			case operation.StageObserveProcess:
+				if event.Duration == nil {
+					t.Fatal("watcher observation duration is unavailable")
+				}
+				observationDuration = *event.Duration
+				foundObservation = true
+			case operation.StageComplete:
+				if event.Duration == nil {
+					t.Fatal("watcher complete duration is unavailable")
+				}
+				completeDuration = *event.Duration
+				foundComplete = true
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("EventsAfter() error = %v", err)
+	}
+	if !foundObservation || observationDuration.Value() != step {
+		t.Fatalf("observation duration = %v/found=%t, want %v", observationDuration.Value(), foundObservation, step)
+	}
+	if !foundComplete || completeDuration <= observationDuration {
+		t.Fatalf("complete duration = %v/found=%t, want greater than observation %v", completeDuration.Value(), foundComplete, observationDuration.Value())
+	}
+}
+
 // TestWatchTerminalsStopsOnCancellation verifies daemon shutdown does not leak a polling goroutine.
 func TestWatchTerminalsStopsOnCancellation(t *testing.T) {
 	host := newFakeHost()

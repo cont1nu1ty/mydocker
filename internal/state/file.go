@@ -24,14 +24,20 @@ import (
 )
 
 const (
+	// legacyEventSchemaVersionV1 is the mandatory-duration event contract
+	// embedded in FileStore schemas v1 and v2.
+	legacyEventSchemaVersionV1 uint32 = 1
 	// fileSchemaVersionV1 identifies the complete on-disk transaction envelope,
 	// retained only for explicit migration of pre-retention snapshots.
 	fileSchemaVersionV1 uint32 = 1
 	// fileSchemaVersionV2 adds bounded operation/event retention metadata while
 	// leaving embedded resource and operation record schemas unchanged.
 	fileSchemaVersionV2 uint32 = 2
+	// fileSchemaVersionV3 migrates legacy event duration zero placeholders to
+	// unavailable evidence and adopts the independent event schema version.
+	fileSchemaVersionV3 uint32 = 3
 	// currentFileSchemaVersion is written by every new or migrated snapshot.
-	currentFileSchemaVersion = fileSchemaVersionV2
+	currentFileSchemaVersion = fileSchemaVersionV3
 	// MaxEnvelopeBytes bounds startup allocation and every encoded state commit;
 	// oversized state fails closed before JSON decoding or atomic replacement.
 	MaxEnvelopeBytes int64 = 64 << 20
@@ -686,7 +692,8 @@ func decodeFileEnvelope(encoded []byte) (fileEnvelope, error) {
 		}
 		return fileEnvelope{}, fmt.Errorf("persistence envelope has trailing data: %w: %w", ErrInvalidRecord, err)
 	}
-	if envelope.SchemaVersion != fileSchemaVersionV1 && envelope.SchemaVersion != fileSchemaVersionV2 {
+	if envelope.SchemaVersion != fileSchemaVersionV1 && envelope.SchemaVersion != fileSchemaVersionV2 &&
+		envelope.SchemaVersion != fileSchemaVersionV3 {
 		return fileEnvelope{}, fmt.Errorf("file schema %d: %w", envelope.SchemaVersion, ErrUnsupportedSchema)
 	}
 	if envelope.Payload == nil {
@@ -773,7 +780,7 @@ func memoryDataFromPayload(payload filePayload, fileSchema uint32) (memoryData, 
 	if payload.Sandboxes == nil || payload.ContainerAttempts == nil || payload.Operations == nil || payload.Events == nil {
 		return memoryData{}, fmt.Errorf("persistence payload collections must be present: %w", ErrInvalidRecord)
 	}
-	if fileSchema != fileSchemaVersionV1 && fileSchema != fileSchemaVersionV2 {
+	if fileSchema != fileSchemaVersionV1 && fileSchema != fileSchemaVersionV2 && fileSchema != fileSchemaVersionV3 {
 		return memoryData{}, fmt.Errorf("file schema %d: %w", fileSchema, ErrUnsupportedSchema)
 	}
 	data := newMemoryData()
@@ -828,11 +835,11 @@ func memoryDataFromPayload(payload filePayload, fileSchema uint32) (memoryData, 
 	if fileSchema == fileSchemaVersionV1 {
 		if payload.FirstEventSequence != 0 || len(payload.TerminalOperationSequences) != 0 ||
 			payload.LastTerminalOperationSequence != 0 || len(payload.RetiredOperations) != 0 {
-			return memoryData{}, fmt.Errorf("file schema v1 contains v2 retention metadata: %w", ErrInvalidRecord)
+			return memoryData{}, fmt.Errorf("file schema v1 contains retention metadata: %w", ErrInvalidRecord)
 		}
 	} else {
 		if payload.FirstEventSequence == 0 {
-			return memoryData{}, fmt.Errorf("file schema v2 is missing first event sequence: %w", ErrInvalidRecord)
+			return memoryData{}, fmt.Errorf("retention-aware file schema is missing first event sequence: %w", ErrInvalidRecord)
 		}
 		data.firstEventSequence = payload.FirstEventSequence
 		data.lastTerminalOperationSequence = payload.LastTerminalOperationSequence
@@ -864,20 +871,24 @@ func memoryDataFromPayload(payload filePayload, fileSchema uint32) (memoryData, 
 			}
 		}
 	}
+	events, err := migrateFileEvents(payload.Events, fileSchema)
+	if err != nil {
+		return memoryData{}, err
+	}
 	historicalGenerations := make(map[operation.Target]historicalGenerationState)
-	for index, event := range payload.Events {
+	for index, event := range events {
 		if err := validateEvent(event); err != nil {
 			return memoryData{}, err
 		}
 		firstExpected := EventSequence(1)
-		if fileSchema == fileSchemaVersionV2 {
+		if fileSchema != fileSchemaVersionV1 {
 			firstExpected = payload.FirstEventSequence
 		}
 		if index == 0 && event.Sequence != firstExpected {
 			return memoryData{}, fmt.Errorf("first event sequence is %d, want %d: %w", event.Sequence, firstExpected, ErrInvalidRecord)
 		}
 		if index > 0 {
-			if err := event.ValidateAfter(payload.Events[index-1]); err != nil {
+			if err := event.ValidateAfter(events[index-1]); err != nil {
 				return memoryData{}, fmt.Errorf("event ordering: %w: %v", ErrInvalidRecord, err)
 			}
 		}
@@ -901,7 +912,7 @@ func memoryDataFromPayload(payload filePayload, fileSchema uint32) (memoryData, 
 		if fileSchema == fileSchemaVersionV1 && payload.LastEventSequence != 0 {
 			return memoryData{}, fmt.Errorf("empty v1 event log has last sequence %d: %w", payload.LastEventSequence, ErrInvalidRecord)
 		}
-		if fileSchema == fileSchemaVersionV2 && data.firstEventSequence != data.nextAvailableEventSequence() {
+		if fileSchema != fileSchemaVersionV1 && data.firstEventSequence != data.nextAvailableEventSequence() {
 			return memoryData{}, fmt.Errorf("empty event suffix starts at %d after high watermark %d: %w",
 				data.firstEventSequence, data.lastEventSequence, ErrInvalidRecord)
 		}
@@ -919,6 +930,29 @@ func memoryDataFromPayload(payload filePayload, fileSchema uint32) (memoryData, 
 		return memoryData{}, err
 	}
 	return data, nil
+}
+
+// migrateFileEvents upgrades the legacy event-v1 duration contract only after
+// the enclosing legacy envelope checksum has been verified. Historical zero
+// values were placeholders, so v1/v2 files convert them to unavailable evidence.
+func migrateFileEvents(events []operation.Event, fileSchema uint32) ([]operation.Event, error) {
+	migrated := make([]operation.Event, len(events))
+	for index, event := range events {
+		clone := event.Clone()
+		if fileSchema == fileSchemaVersionV1 || fileSchema == fileSchemaVersionV2 {
+			if clone.SchemaVersion != legacyEventSchemaVersionV1 {
+				return nil, fmt.Errorf("legacy event %d schema %d: %w", index, clone.SchemaVersion, ErrUnsupportedSchema)
+			}
+			clone.SchemaVersion = operation.EventSchemaVersion
+			if clone.Duration != nil && *clone.Duration == 0 {
+				clone.Duration = nil
+			}
+		} else if clone.SchemaVersion != operation.EventSchemaVersion {
+			return nil, fmt.Errorf("current event %d schema %d: %w", index, clone.SchemaVersion, ErrUnsupportedSchema)
+		}
+		migrated[index] = clone
+	}
+	return migrated, nil
 }
 
 // validateHistoricalEventGeneration rejects generation regression inside one

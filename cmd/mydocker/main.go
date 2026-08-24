@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	v1 "mydocker/api/runtime/v1"
+	"mydocker/internal/strictjson"
 	"mydocker/pkg/client"
 )
 
@@ -448,17 +448,11 @@ func readJSONInput(path string, stdin io.Reader, destination any) error {
 	if int64(len(payload)) > maxInputBytes {
 		return invalidArgument("input", "exceeds the 1 MiB limit")
 	}
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(destination); err != nil {
-		return v1.WrapError(v1.CodeInvalidArgument, "input", "invalid JSON request: "+err.Error(), false, err)
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
+	if err := strictjson.Decode(payload, destination); err != nil {
+		if errors.Is(err, strictjson.ErrMultipleValues) {
 			return invalidArgument("input", "must contain exactly one JSON value")
 		}
-		return v1.WrapError(v1.CodeInvalidArgument, "input", "invalid trailing JSON data", false, err)
+		return v1.WrapError(v1.CodeInvalidArgument, "input", "invalid JSON request: "+err.Error(), false, err)
 	}
 	return nil
 }
