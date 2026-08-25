@@ -2,15 +2,16 @@
 
 ## 状态
 
-**In progress。** 当前已有 FileStore、engine、shim 协议、带版本的 HTTP/JSON UDS
+**M3 Verified（精简 provider 范围）。** 当前已有 FileStore、engine、shim 协议、带版本的 HTTP/JSON UDS
 API、`pkg/client`、JSON CLI、operation/event/log 查询、启动恢复、终态 watcher、
 kill-deadline watcher 和只调用公共 API 的评测工具，并具有纯 Go/注入依赖测试。
 FileStore 已实现有界 operation/event retention、原子 compaction 和显式 resume gap。
 
-这仍不是生产可用声明：`LinuxShimLauncher` 已编码完整 process factory 与恢复所需
-证据，但真实 rootful lifecycle/daemon restart 尚未在一次性 VM 上验收，M3 的共享
-prepared-rootfs 也不是每 Attempt snapshot，固定 identity/envelope 上限尚无在线
-rollover。metrics、stats、tracing 和 Image API 仍是后续 Proposed/Planned 能力。
+2026-08-25 的一次性 KVM 套件已通过生产 `LinuxShimLauncher`、公共 UDS API、真实
+rootful lifecycle、daemon reopen、信号和 OOM 验收。这仍不是生产可用声明：M3 的共享
+prepared-rootfs 不是每 Attempt snapshot，固定 identity/envelope 上限尚无在线 rollover，
+workload 也没有 hostile-code 安全 profile。metrics、stats、tracing 和 Image API 仍是
+后续 Proposed/Planned 能力。
 
 ## 目的
 
@@ -79,10 +80,24 @@ engine 协调：
 
 ### 当前本地 API 与后续扩展
 
-以下 Sandbox/Container 调用、`GetOperation`、分页 `EventsAfter` 和按
-Container/Attempt 绑定的 `LogsAfter` 已由 HTTP/JSON UDS v1、公共客户端和 CLI 实现；
-生产 launcher 已编码，但这里只声明传输/服务契约和非特权组合测试通过，不声明真实
-rootful workload 已经运行。
+以下 Sandbox/Container 调用、`GetOperation`、分页 `EventsAfter` 和按 Container/Attempt
+绑定的 `LogsAfter` 已由 HTTP/JSON UDS v1、公共客户端和 CLI 实现；只读 daemon Info
+当前由 UDS v1 和公共客户端实现。本节声明传输/服务契约；真实 rootful workload 的
+生产组合验收另见 [M3 rootful 记录](../../integration/rootful/README.md)。
+
+Daemon 信息：
+
+```text
+GET /v1/info
+```
+
+该端点只读且不创建 operation。响应中的 `daemon_build.source` 固定说明身份来自正在运行
+的 daemon binary Go build info；production `mydockerd` 仅调用自身
+`debug.ReadBuildInfo`，不读取当前工作目录 Git。无法获得完整 VCS revision 或
+`vcs.modified` 时会显式返回 `unavailable: true` 和有界 reason；正常为空的 module sum
+或 build tags 不会伪装成身份缺失。公共 Go client 提供 typed `Info` 方法，评测 harness
+必须在创建输出或发送生命周期请求前先读取并严格校验该响应；当前 CLI 暂无 `info`
+子命令。
 
 Sandbox 服务：
 
@@ -211,9 +226,10 @@ schema-v1/v2 snapshot 经 checksum、结构与不变量完整校验后，原子�
 保留共享 namespace，每个 Attempt 一个 init/PID 1 wrapper 监管 workload、捕获退出状态
 并提供 daemon 重启后的重新校验证据。shim 协议、owner-bound config/artifact、终态读取、
 deferred-rootfs ACK、namespace reattach，以及生产 process factory 的
-启动/readiness/crash-rediscovery/作用时控制闭环已经编码并有非特权测试；真实 rootful
-daemon restart 与 M5 更完整的无缝重连仍未验收。最终进程拓扑不能仅依赖 daemon 或用户
-进程持续存活。
+启动/readiness/crash-rediscovery/作用时控制闭环已经编码并有非特权测试；M3 rootful
+套件还验证了 Running Attempt 在 daemon 关闭后由同一持久状态重开并继续接受经校验的
+信号。M5 更完整的无缝重连和长期故障矩阵仍未验收。最终进程拓扑不能仅依赖 daemon 或
+用户进程持续存活。
 
 在可用时使用 pidfd；否则使用包含进程启动信息和所有权、且经过同等强度验证的身份。
 仅凭持久化的整数 PID，不能授权发送 signal、加入 namespace、接管或删除。
@@ -263,8 +279,9 @@ revision，因此并发 terminal replay 不会误删后来复用相同 ID 的新
 - 在产生无法安全重新发现的副作用之前，先持久化状态转换意图和操作身份。
 - setup 与 teardown 共用显式资源步骤和幂等逆操作。
 - 单一回滚栈记录资源获取顺序；回滚按逆序执行。
-- 错误按 operation/stage 和有界 reason class 类型化；详细 cause chain 保留在
-  log/event 中。
+- 错误按 operation/stage 和有界 reason class 类型化；持久 event 保留有界分类与证据。
+  当前 daemon JSON 诊断日志只覆盖启停/故障，还没有接入逐请求/逐 operation cause chain；
+  这是后续可观测性接线，不得写成已实现能力。
 - 生命周期 API 定义重试语义；传输重试绝不会静默重复外部副作用。
 - active operation 永不因保留策略淘汰；完整终态 record 按上述窗口保留 fingerprint、
   stage、result 和 response，窗口外转为拒绝 ID 复用的 tombstone。
@@ -280,6 +297,11 @@ active operation，先经 provider 观察/计划，再执行可恢复阶段。�
 投影自然退出，独立 kill-deadline watcher 只扫描 active Kill 并恢复已持久的 escalation
 deadline；这不是持续运行的全量 `Reconcile`。这些路径已用注入 provider 测试，尚未在
 真实 namespace、cgroup、mount 或 PID 1 上验收，也不声称已实现 M5 supervisor 无缝重连。
+
+守护进程停止时先排空 API，再取消并等待后台 watcher；`--shutdown-timeout` 分别限制
+这两个阶段。只有两者都确认静止后才显式关闭 `FileStore`。任一阶段超时都会返回失败，
+且不会在仍可能执行 provider 作用或 checkpoint 的 goroutine 旁边把状态存储误判为已
+安全关闭。
 
 目标恢复流程仍要求先只读检查进程身份、namespace、cgroup、mount、snapshot、link、
 IPAM 和 runtime 状态，再创建调谐计划。

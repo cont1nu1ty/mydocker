@@ -2,20 +2,35 @@
 
 ## 状态
 
-**Proposed。** M0 规定所有权边界和评测边界；2.0 尚无网络实现。
+**M3 精简网络：Verified；M4C 完整网络：Not started / Proposed。** M3 已实现
+`network=none/loopback`、Sandbox hostname/DNS 的版本化 API、校验、持久意图、provider
+编排与恢复路径；生产 launcher 也已实现 network namespace、loopback readback 和托管
+`/etc/resolv.conf` 的相应动作。安全 gate、普通测试/race、带 tag 的编译/vet，以及
+2026-08-25 的[真实 rootful 生命周期](../../integration/rootful/README.md)均通过；后者
+验证 none、loopback 内核 readback、workload 读取 hostname/DNS 和 daemon reopen。
 
 ## 目的
 
 为每个 Sandbox 提供稳定且可恢复的节点本地网络身份。网络创建和拆除必须支持原子
 状态、并发安全、幂等重试、逆序回滚、daemon 重启协调以及可度量的阶段边界。
 
-网络属于 Sandbox，而不属于单次 Container Attempt。连续 Attempts 加入同一个
-Sandbox network namespace，并保留其 IP、路由、DNS 输入和端口映射，除非策略明确
-要求删除并重新创建整个 Sandbox。
+网络属于 Sandbox，而不属于单次 Container Attempt。M3 中，连续 Attempts 加入同一个
+Sandbox network namespace，并复用 hostname/DNS 输入；M4C 才计划为该稳定边界增加
+IP、路由、veth/bridge 身份和端口映射。停止某个 Attempt 不能顺便删除 Sandbox 网络
+资源。
 
 ## 范围与非目标
 
-首版范围包括：
+当前 M3 已实现的精简范围包括：
+
+- 由 namespace keeper 持有的 Sandbox network namespace；
+- `network=none` 与 `network=loopback` 两种模式；
+- Sandbox hostname 和托管 DNS 输入，并在 Attempt 的 mount 视图中提供
+  `/etc/resolv.conf`；
+- 通过公共 API、持久状态和 daemon recovery 编排这些资源。
+
+M3 不分配地址，不创建 veth/bridge、route、IPAM reservation、port mapping 或 firewall
+rule。以下是尚未开始的 M4C 完整网络范围：
 
 - 由 namespace keeper/supervisor 持有的 Sandbox network namespace；
 - 一个网络接入点所需的 veth pair 和受管 Linux bridge；
@@ -46,7 +61,7 @@ Attempt 只加入该 namespace。停止或替换用户进程不能顺便删除�
 
 ## 设置与拆除流程
 
-计划的节点本地设置流程：
+M4C 计划的节点本地设置流程：
 
 ```text
 reserve IP atomically
@@ -94,8 +109,9 @@ IPAM 必须：
   重新拼装 shell 字符串表达网络意图。
 - veth 两端、bridge membership、namespace 内地址/loopback/route 都必须经过创建后
   验证；“系统调用未报错”不自动等于 Sandbox 网络 Ready。
-- DNS 输入属于 Sandbox 稳定环境。实际文件/绑定的生成、更新和 keeper 重启语义必须
-  在实现前确定，且不能依赖某次 Attempt 的 rootfs 永久存在。
+- DNS 输入属于 Sandbox 稳定环境。M3 已实现 owner-bound 托管文件及绑定动作；该输入
+  不依赖某次 Attempt 永久拥有 prepared-rootfs source。真实 mount 与 daemon restart
+  已由 M3 rootful 套件覆盖。M4C 还需定义 DNS 与地址、路由及网络接入更新之间的语义。
 - firewall 变更使用精确且归本系统所有的 rule identity；绝不通过含糊的字符串匹配、
   端口号或不完整 comment 删除规则。
 - 端口映射冲突在产生部分规则前检测或以可回滚事务处理；冲突必须返回类型化错误，
@@ -144,7 +160,7 @@ keeper/supervisor 重启或丢失时，恢复行为必须区分“namespace 仍�
 
 ## 可观测性与评测点
 
-网络场景测量：
+M4C 完整网络场景计划测量：
 
 - Sandbox network setup 各阶段及整体延迟；
 - 在声明并发度下的并发 setup；
@@ -156,6 +172,10 @@ keeper/supervisor 重启或丢失时，恢复行为必须区分“namespace 仍�
 评测必须固定 kernel、network namespace/bridge/firewall 后端、CIDR、端口集合、构建、
 并发度、工作负载、样本数和 profiling 状态。压力测试要区分延迟清理、有界缓存和持续
 泄漏；benchmark 不能代替网络行为正确性测试。
+
+M3 的 `prepared-rootfs+loopback` cold/warm 评测场景已经实现，但它只记录公共 API 调用、
+daemon events 和精简网络标签；它不是 veth/bridge/IPAM/port 的 M4C 基线，也不把
+M3 rootful 正确性套件的通过结果转换成性能 baseline。
 
 Sandbox ID、完整接口身份、IP、operation ID 和详细错误进入 structured logs/traces，
 不能成为无界 Prometheus labels。准确的基准测试契约和结果元数据见
@@ -173,7 +193,7 @@ IPAM/firewall 状态。多节点数据面、service networking、CNI 集成和�
 
 ## 验收条件
 
-仅在满足以下条件时，此功能才达到 **Verified** 状态：
+仅在满足以下条件时，M4C 完整网络功能才达到 **Verified** 状态：
 
 - namespace 由可信 keeper/supervisor 持有，不依赖某个用户进程 PID；
 - Sandbox 能承受连续 Attempt 替换，并保持规定的 IP、route、DNS 和 port identity；

@@ -22,28 +22,39 @@ operation/event、rollback、事务状态边界和两阶段生命周期协调契
 Running、`running -> stopped` 及 metadata 删除都要求明确外部验证。启动前删除可依据
 尚未运行这一已持久事实进入 `stopped/not_applicable`，但真正删除仍需确认资源不存在。
 
-**M2 状态：Implemented, privileged verification pending。** 当前已有 rootful Linux
+**M2 状态：Verified（M2 范围）。** 当前已有 rootful Linux
 namespace/mount/rootfs 原语、cgroup v2 Sandbox/Attempt 父子层级、pidfd 强身份、
 宿主机所有权 receipt/checkpoint/rollback 与窄 provider 契约。CPU period 固定为
 `100000` µs，缺省 pids limit 为 `1024`；CPU/memory requests 不会写入
-enforcement controllers。这些边界已通过纯单元测试、race detector 和静态检查。
+enforcement controllers。这些边界已通过纯单元测试、race detector、静态检查，以及
+一次性 KVM 来宾机中的真实 namespace/mount/PID 1/cgroup v2/limits/OOM 验收。
 
-**M3 状态：In progress。** 已实现带版本的 HTTP/JSON over UDS 契约、
+**M3 状态：Verified（M3 精简 provider 范围）。** 已实现带版本的 HTTP/JSON over UDS 契约、
 `pkg/client`、JSON CLI、持久 `FileStore`、engine、shim 协议与精简 provider、
 operations/events/logs 查询、daemon 重启协调、终态观测及 kill deadline 后台恢复，
-以及只调用公共 API 的 `mydocker-eval` 评测工具。这些组件有纯 Go、临时
-文件系统和注入 provider 测试，但不等于真实容器已经运行。
+以及只调用公共 API 的 `mydocker-eval` 评测工具。纯 Go、临时文件系统、注入 provider
+和公共 UDS 组合测试均已通过。
 
 生产 `LinuxShimLauncher` 已组合持久 launch intent、cgroup-at-fork、pidfd、
 namespace reattach、keeper/init bootstrap、作用时校验与控制协议；兼容宿主机上的
-只读 preflight 和恢复会在 UDS 绑定前完成。该生产组合尚未在一次性 rootful VM 中
-完成真实内核和 daemon restart 验收，不能把纯测试通过写成“生产可用”。
+只读 preflight 和恢复会在 UDS 绑定前完成。2026-08-25，该生产组合在专用、一次性
+Ubuntu 24.04 KVM 来宾机中通过了默认关闭的
+[M3 rootful 一次性主机套件](integration/rootful/README.md)：真实验证
+`network=none`、PID namespace 内 PID 1、prepared-rootfs pivot、日志与 exit 23；
+验证 loopback、hostname/DNS、CPU/memory/pids controller 读回、daemon 关闭后重开与
+经身份校验的 SIGTERM；并以 `memory.events.local` 和公共 outcome 双重确认 OOM。
+套件结束后专用 cgroup root 无子 cgroup、无 member，工作根无残留 mount 或 shim 进程。
+当前 workload 也尚无 UID/GID、capability、`no_new_privs`、seccomp 或 LSM 执行配置；
+root workload 与 init shim 同属宿主 user namespace，因而 shim 持有的跨-pivot descriptor
+不能被当作抵御恶意 workload 的安全边界。M3 只能运行受信测试 workload，且只能放在
+可销毁验收环境中；`Verified` 只表示路线图规定的 M3 正确性门已通过，不是生产安全、
+多租户隔离或长期运行可用性声明。
 `FileStore` 已实现按数量的 operation/event retention、原子 compaction 和版本化
 resume-gap 错误，但默认 `65536` 个 operation identity 是
 fail-closed 的硬生命周期上限，尚无在线 rollover/归档流程；这不是“无限历史”的
-生产方案。本次未在真实 kernel 上
-运行 namespace、mount、cgroup/OOM/quota、PID 1、hostname/DNS 或 loopback 特权
-集成场景；相关 typed/fake 契约不是内核执行证据。
+生产方案。M3 仍只映射管理员配置的共享 prepared-rootfs，不创建每 Attempt snapshot；
+镜像/content/snapshot、完整 veth/IPAM 网络、hostile-workload 安全 profile、长期 stress
+和在线状态轮换分别属于 M4+/M5 后续范围。
 
 仓库的实际 Git 布局与最初的分支名称提案不同：
 
@@ -86,7 +97,7 @@ go vet ./...
 | `--cgroup-root` | 已委托的专用 cgroup v2 目录 |
 | `--shim` | `mydocker-shim` 可执行文件绝对路径 |
 | `--prepared-rootfs ID=/absolute/path` | 可重复；将 API 中的 opaque rootfs ID 绑定到受信路径 |
-| `--shutdown-timeout` | UDS 优雅停止上限，默认 `15s` |
+| `--shutdown-timeout` | API 排空与后台 watcher 停止两个阶段各自的上限，默认每阶段 `15s` |
 
 CLI 请求使用严格 JSON 文件。固定 wire 字段名必须与 API 声明精确匹配大小写，不能把
 `mode` 写成 `Mode` 或 `MODE`；map key 则保持大小写敏感，大小写不同的键可以同时存在。
@@ -262,10 +273,10 @@ bundle 到进程的职责仍止于这一低层能力边界。未来的 agent 必
 ## 安全
 
 计划中的 runtime 仅支持 Linux 且以 rootful 模式运行。Namespace、mount、cgroup、
-bridge、veth 和 firewall 操作可能改变宿主机。未来的特权 integration、stress 和 fault
-场景只能在隔离的一次性机器或 VM 中完成 preflight 后运行。当前是普通、
-非一次性的裸机开发环境，进程无特权内核能力且 cgroup 子树未委托必需
-controllers，所以 M2 特权集成验收已按安全契约跳过。
+bridge、veth 和 firewall 操作可能改变宿主机。特权 integration、stress 和 fault
+场景只能在隔离的一次性机器或 VM 中完成 preflight 后运行。M2/M3 的 rootful 验收
+严格在任务专用 KVM 来宾机内执行；普通开发宿主机只运行非特权检查并负责传输源码与
+收集日志。后续 M4+/M5 特权场景仍必须重新使用相同的隔离和双重 opt-in 安全门。
 
 ## 文档
 
@@ -287,7 +298,7 @@ controllers，所以 M2 特权集成验收已按安全契约跳过。
 - [未来集群兼容性](docs/features/cluster-compatibility.md)
 
 实现顺序和 milestone gates 仅由[路线图](docs/roadmap.md)定义。M1 已验证纯领域与
-协调契约；M2 已实现宿主机原语与 provider 边界，但在特权集成 gate 完成前
-仍不是 `Verified`。M3 的生产组合已编码但状态仍为 `In progress`；rootful 验收、
-有界状态的在线轮换策略和 prepared-rootfs 隔离完成前不可称生产可用。M4+ 设计在相关
-milestone 达到 Verified 前仍是 **Proposed** 或 **Planned**，不代表相应行为已经可用。
+协调契约；M2/M3 已通过各自范围内的非特权与一次性 KVM rootful 门。在线状态轮换、
+per-Attempt snapshot、完整网络、安全执行 profile、压力/故障矩阵和生产 SLO 尚未完成，
+所以不得把 M3 `Verified` 扩写成“生产可用”。M4+ 设计在相关 milestone 达到 Verified
+前仍是 **Proposed** 或 **Planned**，不代表相应行为已经可用。

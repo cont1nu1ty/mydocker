@@ -1,15 +1,13 @@
 # mydocker 2.0 架构
 
-**状态：** In progress。M1 已验证纯领域模型、状态机、operation/event、rollback、
-事务状态边界和两阶段协调契约。M2 已实现 rootful Linux isolation/cgroup v2
-原语、宿主机所有权收据与 provider 契约，并通过纯单元测试、race detector 和
-静态检查；真实 namespace/mount/cgroup/OOM/quota/PID 1 特权集成验收尚未运行。
-M3 已实现 FileStore、engine/shim/provider 编排、带版本的 HTTP/JSON UDS
-API、`pkg/client`、CLI、logs/events、recovery 后台 watcher 和评测工具的
-纯测试基础，状态仍是 `In progress`。生产 `LinuxShimLauncher` 已编码持久 launch
-intent、cgroup-at-fork、pidfd、namespace reattach、keeper/init bootstrap 与作用时
-校验，但尚未在一次性 rootful VM 中完成真实内核和 daemon restart 验收；因此不声称
-已有经过验证的生产容器路径。
+**状态：** M3 Verified（限精简 provider 范围）。M1 已验证纯领域模型、状态机、
+operation/event、rollback、事务状态边界和两阶段协调契约。M2 的 rootful Linux
+isolation/cgroup v2 原语、宿主机所有权收据与 provider 契约，以及 M3 的 FileStore、
+engine/shim/provider 编排、HTTP/JSON UDS API、`pkg/client`、CLI、logs/events、recovery
+watcher 和评测基础均通过非特权测试。2026-08-25，生产 `LinuxShimLauncher` 组合又在
+一次性 Ubuntu 24.04 KVM 来宾机中通过真实 namespace/mount/PID 1/cgroup v2、
+none/loopback、daemon reopen、信号和 OOM 验收。该结论不覆盖 M4+ image/snapshot/
+完整网络，也不覆盖 hostile-workload 安全或 M5 长期可靠性。
 
 本文档是跨功能架构的主要依据。生命周期、隔离、镜像与文件系统、网络、
 守护进程/API 以及面向集群的详细行为，分别记录在 [`features/`](features/) 下的
@@ -148,8 +146,9 @@ flowchart TD
 
 当前 M3 已经把 CLI → UDS server → daemon service → engine → provider 的版本、
 身份、幂等性和恢复边界组合起来，并实现生产 Linux launcher 与 shim/keeper/PID 1
-路径；普通开发主机上的纯测试不能替代真实 hostname/DNS、none/loopback、namespace、
-mount 与 cgroup 的特权内核验收，因此 M3 仍不能标为 `Verified`。
+路径；普通开发主机上的纯测试之外，任务专用 KVM 验收还覆盖真实 hostname/DNS、
+none/loopback、namespace、mount、cgroup、daemon reopen、signal 与 OOM。完整证据边界见
+[rootful 验收记录](../integration/rootful/README.md)。
 
 ### M4+ 镜像到进程的目标数据路径
 
@@ -463,9 +462,10 @@ operation 的完整响应、最多 `65536` 个完整 identity 或 tombstone、�
 
 ### 可观测性
 
-当前已有按 operation/resource 关联的持久 stage events、daemon 结构化日志、
+当前已有按 operation/resource 关联的持久 stage events、daemon 启停/故障结构化日志，
 以及按 Container/Attempt 身份绑定、带 checksum 和 cursor 的 stdout/stderr
-frames。事件和 log cursor 支持有界分页；它们自身不是 benchmark 事实。
+frames。当前 daemon 诊断日志尚未接入逐请求/逐 operation 关联，不能拿 stage events
+替代这一缺口。事件和 workload log cursor 支持有界分页；它们自身不是 benchmark 事实。
 低基数 metrics 仍是后续目标，不得用现有日志/事件推断已实现 Prometheus 契约。
 
 ### 未来的 agent
@@ -602,8 +602,8 @@ evaluation/
 
 其中运行时交付面只有 `cmd/mydocker`、`cmd/mydockerd` 与 `cmd/mydocker-shim` 三个程序
 入口；`evaluation/cmd/mydocker-eval` 是独立评测程序。`internal/engine`、
-`internal/slim` 等均为进程内 package。生产 Linux launcher 已编码，
-但真实特权内核路径仍待一次性 VM 验收。以下仍是 M4A–M4C 的目标 package 布局，
+`internal/slim` 等均为进程内 package。生产 Linux launcher 的 M3 精简路径已通过
+一次性 VM 验收。以下仍是 M4A–M4C 的目标 package 布局，
 不代表对应能力已经实现、集成或需要拆成独立进程：
 
 ```text

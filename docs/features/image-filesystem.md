@@ -2,11 +2,17 @@
 
 ## 状态
 
-**Proposed。** M0 规定对象、组件与评测边界；2.0 尚无镜像或文件系统实现。
+**M4A/M4B：Not started / Proposed。** 当前 M3 只有已经实现的 prepared-rootfs bridge：
+daemon 把 opaque ID 解析到管理员配置的共享 source，低层 provider 为 Attempt 建立
+mount 视图并持久化 owner receipt。它没有 OCI image/content store、layer unpack、
+per-Attempt snapshot 或 versioned bundle；M3 的共享 source mount 视图、self-bind、
+`pivot_root`、`/proc` 与 teardown 已通过
+[rootful 验收](../../integration/rootful/README.md)。本文件其余设计描述未来 M4A/M4B，
+不能作为当前实现清单，也不能把已验收的共享 source 重新命名为 snapshot。
 
 ## 目的
 
-mydocker 是单节点容器执行引擎。它接收外部 builder 产出的 OCI Image，把已验证的
+mydocker 是单节点容器执行引擎。M4A/M4B 将接收外部 builder 产出的 OCI Image，把已验证的
 镜像内容转换为单个 Container Attempt 可使用的 rootfs 和 bundle，再交给
 低层 runtime 能力边界创建 Linux 进程。该名称描述职责；当前仓库没有独立的
 `mydocker-runtime` 二进制。
@@ -16,7 +22,7 @@ mydocker 是单节点容器执行引擎。它接收外部 builder 产出的 OCI 
 
 ## 范围与非目标
 
-首版范围包括：
+M4A/M4B 首版计划范围包括：
 
 - OCI Image Layout 导入，以及 reference 到不可变 manifest digest 的解析；
 - manifest、config 和压缩 filesystem layer 的摘要/大小校验；
@@ -43,6 +49,23 @@ Experiment**，先定义冻结/一致性、OCI whiteout 转换、volume 排除�
 
 ## 镜像到进程的数据路径
 
+当前 M3 的实际桥接路径是：
+
+```text
+--prepared-rootfs ID=/trusted/shared/source
+-> daemon prepared-rootfs catalog
+-> Attempt-owned mount namespace/view + owner receipt
+-> 低层 runtime 能力边界
+-> Linux process
+```
+
+共享 prepared-rootfs source 由 daemon 配置边界管理，不归任一 Attempt 所有；删除
+Attempt 只清理其 mount 视图和 receipt。M3 不提供独享 writable snapshot，也不生成下述
+M4B bundle。当前 cold/warm 评测把该条件明确记录为
+`not-created-prepared-rootfs-shared`，不能与 M4A/M4B 的 image/snapshot 性能比较。
+
+未来 M4A/M4B 的目标数据路径是：
+
 ```text
 外部 Builder
 -> OCI Image Layout
@@ -56,7 +79,7 @@ Experiment**，先定义冻结/一致性、OCI whiteout 转换、volume 排除�
 -> Linux process
 ```
 
-这里有两条相关但不同的操作路径：
+M4A/M4B 有两条相关但不同的计划操作路径：
 
 ```text
 ImportImage
@@ -78,6 +101,9 @@ CreateContainer
 创建 Sandbox/Container；创建 Attempt 也不会隐式修改镜像 reference。
 
 ## 核心对象
+
+下表中的 image/content/unpacked/snapshot/bundle 均为 M4A/M4B 目标对象，不是 M3
+prepared-rootfs catalog 已创建的对象。
 
 | 对象 | 身份与语义 |
 | --- | --- |

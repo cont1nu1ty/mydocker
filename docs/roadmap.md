@@ -14,8 +14,8 @@
 | --- | --- | --- |
 | M0 仓库初始化 | Verified | 已审计的基线与可度量架构契约 |
 | M1 生命周期基础 | Verified | 纯领域模型、状态及 operation 契约 |
-| M2 隔离与 cgroup v2 | Implemented | rootful 隔离与资源强制执行；特权验收待完成 |
-| M3 守护进程与本地 API | In progress | daemon/API/CLI/launcher/恢复/评测基础已编码；特权验收与 prepared-rootfs 隔离待完成 |
+| M2 隔离与 cgroup v2 | Verified | rootful 隔离、资源强制执行与 OOM 证据已通过一次性 KVM 验收 |
+| M3 守护进程与本地 API | Verified | 精简 provider 的 daemon/API/CLI/launcher/恢复与 rootful 生命周期已验收 |
 | M4A 镜像与内容 | Not started | OCI Image Layout 导入、内容寻址与 layer unpack |
 | M4B 文件系统与 Snapshot | Not started | OverlayFS snapshot、rootfs、mount 与 bundle |
 | M4C Sandbox 网络 | Not started | 稳定的 netns、veth/bridge、IPAM 与 port mapping |
@@ -110,10 +110,10 @@
 
 ## M2：隔离与 cgroup v2
 
-**状态：** Implemented, privileged verification pending。宿主机原语、所有权/回滚
-契约和 provider 边界已实现，并通过纯单元测试、race detector 和静态检查。
-真实 kernel 集成场景尚未在符合安全契约的一次性宿主机上运行，因此本里程碑
-尚未达到 `Verified`。
+**状态：** Verified（M2 范围）。宿主机原语、所有权/回滚契约和 provider 边界已实现，
+并通过纯单元测试、race detector、静态检查，以及一次性 KVM 来宾机中的真实
+namespace/mount/PID 1/cgroup v2/limits/OOM 集成验收。M4+ 文件系统/网络与 M5 的长期
+压力、故障矩阵不属于本里程碑的 `Verified` 声明。
 
 ### 功能目标
 
@@ -172,20 +172,20 @@
   workload descendants 位于 sibling Attempt leaf。M2 的纯原语测试不等同于
   已运行 M3 launcher 或真实 PID 1/cgroup 集成场景。
 
-### 当前验证与待验收项
+### 当前验证与边界
 
 - 已验证：fake `Ops`、fake/临时 cgroup filesystem（包括空 parent、keeper/Attempt
   siblings、只读双重身份 membership 与精确 leaf-to-parent cleanup）、状态/生命周期
   事务和 provider 契约的普通单元测试、race detector 与 `go vet`。
-- 未运行：真实 `unshare`/`setns`、mount/`pivot_root`、PID 1/`/proc`、
-  cgroup controller 写入/membership/cleanup、CPU quota、memory/OOM、pids limit、
-  特权故障注入与压力场景。
-- 跳过原因：当前是普通、非一次性的裸机开发环境，当前进程无特权
-  内核能力，cgroup v2 子树未委托所需 controllers，且未收到针对该宿主机的
-  高风险实验授权。
-- 放行条件：专用、一次性 rootful Linux VM 或等价隔离宿主机，具备所需
-  namespace/mount/pidfd 能力和已委托 `cpu`/`memory`/`pids` 的专用 cgroup v2
-  root，并对 privileged test 显式 opt-in；必须先通过 read-only preflight。
+- 已验证：2026-08-25 在专用 Ubuntu 24.04 KVM 来宾机（Linux
+  `6.8.0-137-generic`、unified cgroup v2、`cpu memory pids` controllers）中，双重
+  opt-in 和全部 read-only preflight 通过后，真实运行 `unshare`/namespace、
+  self-bind/`pivot_root`、PID 1/`/proc`、keeper/Attempt sibling membership、
+  `cpu.max`/`memory.max`/`pids.max` 读回、`memory.events.local` OOM 归因及
+  leaf-to-parent cleanup。完整命令与边界见
+  [rootful 验收记录](../integration/rootful/README.md)。
+- 未运行且不属于 M2 完成门：特权故障注入全矩阵、长期压力与 hostile-workload
+  安全测试；它们分别进入 M5 和后续执行安全 profile 工作。
 
 ### 正确性验收
 
@@ -214,9 +214,10 @@
 
 ## M3：守护进程与本地 API
 
-**状态：** In progress。纯 Go、注入 provider 与生产 Linux launcher 已组成，但真实
-rootful lifecycle、daemon restart 和 prepared-rootfs 隔离尚未通过，因此不得标记为
-`Verified`。
+**状态：** Verified（M3 精简 provider 范围）。纯 Go、注入 provider、版本化公共 API
+与生产 Linux launcher 已组成；非特权完整生命周期套件和一次性 KVM 中的真实 rootful
+lifecycle/daemon restart/OOM 套件均通过。共享 prepared-rootfs 是被明确验收的 M3
+边界，不是尚未实现的 per-Attempt snapshot。
 
 ### 功能目标
 
@@ -257,25 +258,34 @@ rootful lifecycle、daemon restart 和 prepared-rootfs 隔离尚未通过，因�
   已实现 cold/warm prepared-rootfs 场景、调用方单调 span、daemon stage-event
   关联、失败后清理尝试、环境快照及持久 JSONL 原始证据。
 - Sandbox hostname、DNS 和 `network=none/loopback` 已有 typed validation/provider/fake
-  契约；这些测试不表示 UTS、`resolv.conf` 或 loopback 已在真实 kernel 中执行。
+  契约；一次性 KVM 套件还验证了 workload 实际读取 hostname/托管
+  `/etc/resolv.conf`，以及 loopback 配置的内核 readback。
+- 默认关闭的 [M3 rootful 一次性主机套件](../integration/rootful/README.md) 已组合
+  production daemon/launcher/shim、公共 UDS client、none/PID1/exit、loopback/DNS/limits、
+  daemon reopen/SIGTERM、固定内存压力/OOM attribution 和资源清理场景。普通安全
+  gate/race、带 tag 的编译/vet，以及 2026-08-25 的一次性 Ubuntu 24.04 KVM 特权
+  lifecycle 均通过；最终复跑直接使用 `newProductionServer`，未保留诊断 service 包装。
 
-### 当前 blocker
+### 已验证边界与后续工作
 
-- 生产 `LinuxShimLauncher` 已把 cgroup-at-fork/pidfd、namespace reattach、
-  UTS/none/loopback 配置、deferred-rootfs ACK、DNS 绑定、跨 pivot artifact descriptor、
-  immutable launch intent、keeper/init readiness、crash rediscovery 和作用时
-  inspect/remove/signal/resolve 组合为 process factory，并有非特权/注入 seam 测试。
-  但这些测试不能证明真实 namespace、PID 1、mount、cgroup 与 daemon crash 组合正确；
-  仍需在一次性 rootful VM 中逐项验收。
+- 生产 `LinuxShimLauncher` 的 cgroup-at-fork/pidfd、namespace reattach、
+  UTS/none/loopback、deferred-rootfs ACK、DNS 绑定、跨 pivot artifact descriptor、
+  keeper/init readiness、作用时 inspect/remove/signal 和 daemon reopen 组合，已由真实
+  rootful 场景覆盖；非特权注入测试继续负责异常阶段和并发窗口。
 - M3 的 prepared-rootfs catalog 目前只把 opaque ID 映射到一个受信但共享的目录；它不
   创建每 Attempt snapshot，也没有证明并发/连续 Attempt 之间写入隔离。签入的 M3
   场景必须如实记录 `not-created-prepared-rootfs-shared`，不能将其作为 M4B snapshot
   性能或正确性证据。
+- M3 workload 尚无 UID/GID、capability、`no_new_privs`、seccomp 或 LSM profile；root
+  workload 与 init wrapper 同处宿主 user namespace，跨 pivot artifact descriptor 不是
+  hostile-workload 安全边界。在执行安全 profile 落地前仅允许受信测试 workload。
 - operation/event 的无界增长已由固定窗口、tombstone、原子 compaction 和显式 gap
   消除；但达到 `65536` identity 或 `64 MiB` envelope 后尚无在线 rollover/归档/迁移
   流程。当前会安全拒绝新 intent，而不是无限增长；仍不得据此声称长期生产可用。
-- 真实 rootful namespace/mount/cgroup/PID 1/OOM/quota/hostname/DNS/loopback 生命周期和
-  daemon restart 场景尚未在一次性 VM 上运行。
+- 验收环境使用受控、可销毁 KVM 来宾机，Linux `6.8.0-137-generic`、Go `1.22.2`、
+  unified cgroup v2；三场景结束后专用 cgroup root 无 child/member，工作根无残留
+  mount 或 shim 进程。该单一 kernel matrix 足以关闭 M3 门，但不代表跨发行版、跨 kernel
+  或长期运行已由 M5 验证。
 
 ### 正确性验收
 
@@ -684,7 +694,6 @@ samples 及 trace/profiling 状态。
 
 ## 下一里程碑
 
-M2 实现已落地，但下一个 M2 gate 是在专用一次性环境通过 preflight 后，
-运行并记录 namespace、mount、cgroup v2 与资源强制的特权集成验收。
-在这些证据齐备前，M2 保持 `Implemented`，不能标记为 `Verified`；后续里程碑的
-实现不能代替该 gate。
+M2/M3 的范围与一次性 KVM 验收门已闭合。下一里程碑是 M4A：先实现并验证 OCI Image
+Layout 导入、digest/content store 与安全 layer unpack；不要自动把 M3 的共享
+prepared-rootfs 重新命名为 snapshot，也不要提前开始 M4B/M4C 或集群分支。

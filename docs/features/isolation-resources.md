@@ -2,15 +2,22 @@
 
 ## 状态
 
-**Implemented, privileged verification pending。** M2 已实现 `internal/isolation`、
+**M2 Verified（M2 范围）。** M2 已实现 `internal/isolation`、
 `internal/cgroupv2`、`internal/ownership` 和 `internal/provider` 中的隔离原语、
 cgroup v2 管理、宿主机资源所有权收据以及 provider 契约，并把分阶段
 checkpoint、receipt adoption 和失败后 rollback 接入 M1 的状态/生命周期边界。
 
-上述行为已通过测试替身和临时文件系统验证的纯单元测试、race detector 和
-`go vet`。真实 namespace、mount、PID 1/`/proc`、cgroup membership、CPU quota、
-memory/OOM 与 pids enforcement 的特权集成验收尚未运行，因此 M2 不得标记为
-`Verified` 或 `Complete`。
+上述行为已通过测试替身和临时文件系统的纯单元测试、race detector、`go vet`，以及
+2026-08-25 一次性 KVM 来宾机中的真实 namespace、mount、PID 1/`/proc`、cgroup
+membership、CPU/memory/pids controller 读回、OOM 归因和精确清理验收。跨 kernel
+矩阵、长期 stress 与特权故障注入全矩阵仍是 M5 后续门，不包含在 M2 声明中。
+
+当前 M3 process spec 尚未实现 workload UID/GID、capability bounding/drop、
+`no_new_privs`、seccomp 或 LSM profile。root workload 与 PID 1 wrapper 仍在宿主 user
+namespace 中，可能经 `/proc/1/fd` 触达 wrapper 为跨 `pivot_root` 保留的 descriptor；
+因此这些 owner-bound artifact 只防止路径替换和 daemon 误操作，不是抵御恶意 root
+workload 的安全边界。完成明确的执行安全 profile 前只能运行受信 workload，并且不得
+把当前 M3 描述成多租户或 hostile-code 隔离。
 
 ## 目的
 
@@ -73,7 +80,7 @@ Attempt 已报告 `stopped` 后继续运行，且 direct workload 的退出结�
 随后后代清理和日志排空耗时；Attempt terminal record 则只在整棵树静止后生成。若
 `wait4` 未能明确到达 `ECHILD`，wrapper 不提交 terminal，Inspect 返回 unavailable，
 由 daemon 的显式 teardown 收敛。该顺序已有非特权 seam/race 测试，真实 PID namespace
-行为仍待一次性 VM 验收。
+中的 PID 1/`/proc`、direct exit、信号与 OOM 路径也已由一次性 VM 验收。
 
 PID 1 child 的 readiness 分成两个持久边界。child 首先只验证自己确实是 PID 1，且
 active PID/mount namespace inode 与 bootstrap 一致；此时不得 mount 或 pivot。daemon
@@ -222,10 +229,17 @@ Removal 是幂等的。`EBUSY`、仍有进程的 cgroups、遗留 mounts 或存�
 host 文件来处理。Reconciliation 只枚举配置 root 下自有的 paths/handles，根据 durable
 state 进行验证，并且绝不删除未知的 cgroup 或 namespace。
 
+同一 owner 的 launcher `Ensure` 与 `Remove` 使用同一把进程内操作锁；`Remove` 持锁完成
+精确进程恢复、终止、absence 证明和 control socket 清理。在 unlink socket 前还必须读取
+launch journal，并确认它仍绑定 receipt 中完全相同的 `ProcessEvidence`。如果 recovery 已将
+journal 绑定到新进程，旧 receipt 的迟到 `Remove` 只能返回 `already_absent`，不得触碰新
+进程或删除新进程发布的 endpoint。
+
 M2 本身只交付 checkpoint/receipt/reverification 与 Linux 原语，不交付 daemon。
 M3 已有 daemon/engine/shim 协调、生产 Linux launcher 与启动恢复的非特权/注入测试，
-但真实 rootful restart 验收仍未完成，因此不声称已经验证接管真实 workload。恢复只
-使用已持久 receipt 重新发现并作用时验证资源；无法证明身份时报告显式的
+且一次性 KVM 套件已验证 Running Attempt 在 daemon 关闭后由同一 FileStore 重开、
+重新发现并接受经身份校验的 SIGTERM。恢复只使用已持久 receipt 重新发现并作用时
+验证资源；无法证明身份时报告显式的
 `unknown`/`orphan` condition，而不是信任裸 PID 或可变路径。
 
 ## 可观测性与评测点
@@ -265,10 +279,21 @@ benchmarks 可以记录 namespace/cgroup stage duration。
   完成前不得提交失败终态，以及 provider 契约的所有者绑定；
 - 上述包通过常规单元测试、race detector 和 `go vet`。
 
-当前主机是普通、非一次性的裸机开发环境，当前进程无特权内核能力，
-cgroup v2 子树也未委托所需 controllers；而且未收到对该宿主机运行高风险实验的
-显式授权。按仓库安全规则，本次未运行任何真实 `unshare`/`setns`、
-mount/`pivot_root`、cgroup controller 写入、信号、OOM/quota/PID 1、故障或压力场景。
+2026-08-25 还在任务专用、可销毁的 Ubuntu 24.04 KVM 来宾机（Linux
+`6.8.0-137-generic`、unified cgroup v2、`cpu memory pids`）中验证：
+
+- 双重 opt-in、root/路径/marker、namespace/mount/pidfd、cgroup controller 与
+  `clone3(CLONE_INTO_CGROUP|CLONE_PIDFD)` 的全部 fail-closed 前置门；
+- 真实 namespace 创建/重新加入、prepared-rootfs self-bind/`pivot_root`、新 `/proc`
+  中的 PID 1、最小 `/dev`、hostname、DNS 和 loopback；
+- process-free Sandbox parent、keeper/Attempt sibling membership，500m CPU、64 MiB
+  memory、64 pids 的 controller 读回，以及 128 MiB 场景的 OOM-kill counter 归因；
+- daemon reopen 后的身份重验证、SIGTERM、自然退出，以及每个场景的 leaf-to-parent
+  cleanup；套件退出后专用 cgroup root 无 child/member，工作根无 mount/shim 残留。
+
+普通开发宿主机没有运行上述特权行为，只负责源码传输和日志收集。特权故障注入全矩阵、
+长期压力、hostile-workload 与跨发行版/kernel 场景仍未运行，不得由本次 M2/M3 正确性
+验收推断。
 
 特权验收只能在专用、一次性 Linux VM 或等价隔离宿主机放行。该环境需要：
 
@@ -291,7 +316,7 @@ Resource-aware scheduling policy、overcommit、Spread 和 Bin-Packing 属于集
 
 ## 验收条件
 
-只有满足以下条件后，本功能才达到 Verified：
+M2 里程碑的以下条件已经由非特权测试与一次性 KVM 场景共同闭合：
 
 - supported-host preflight 能区分 cgroup v2 和必需的 namespace features；
 - new/join namespace paths 都有正向和负向 integration tests；
@@ -303,7 +328,12 @@ Resource-aware scheduling policy、overcommit、Spread 和 Bin-Packing 属于集
 - process-free parent 与 keeper/Attempt sibling membership 在 daemon restart
   reconciliation 后保持正确；
 - 注入 setup failures 后可以 rollback，且不泄漏自有的 mount/cgroup/process；
-- stress observations 表明资源行为有界且可以解释。
+
+以下是 M5/生产化门，尚未由 M2 `Verified` 覆盖：
+
+- 长期 stress observations 能说明 cgroup、mount、zombie、FD、goroutine 与 RSS 行为有界；
+- 特权 setup/teardown 故障矩阵、跨 kernel/delegation 组合与 hostile-workload 安全
+  profile 通过独立验收。
 
 ## 未决问题
 

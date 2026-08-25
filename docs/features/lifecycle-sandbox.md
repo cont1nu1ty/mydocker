@@ -2,10 +2,14 @@
 
 ## 状态
 
-**In progress。** M1 已验证纯领域对象/FSM、一对一与单活跃 Attempt 不变量、结构化
+**M3 Verified（精简 provider 范围）。** M1 已验证纯领域对象/FSM、一对一与单活跃 Attempt 不变量、结构化
 进程参数、强身份验证端口、operation 幂等性、event、rollback、事务状态边界和两阶段
-生命周期协调器。真实 namespace/cgroup/process、daemon restart、UDS API 与 cold/warm
-harness 分别仍属于 M2-M5，因此本功能整体尚未达到 Verified。
+生命周期协调器。M3 已实现版本化 UDS API、持久 engine/provider 编排、daemon recovery、
+`network=none/loopback`、hostname/DNS、共享 prepared-rootfs catalog 及 cold/warm 评测工具；
+非特权完整控制面测试已覆盖 API 到重启恢复，2026-08-25 的
+[rootful 套件](../../integration/rootful/README.md)又通过真实 namespace/cgroup/process、
+daemon reopen、signal、exit 与 OOM 生命周期。该状态不覆盖 M4+ per-Attempt snapshot/
+完整网络，也不覆盖 M5 长期可靠性或 hostile-workload 安全。
 
 ## 目的
 
@@ -33,17 +37,20 @@ Container Attempts。该契约在 retry、部分失败、进程退出、daemon r
 
 ### 资源所有权
 
-Sandbox 拥有稳定身份、UTS/IPC/network namespaces、hostname/DNS 设置、network
-attachment 和地址、port mappings、父 cgroup、labels，以及 keeper 或 supervisor
-身份。Container Attempt 拥有其进程、bundle、rootfs/snapshot、mount/PID namespaces、
-子 cgroup、输出、退出码、退出信号和 OOM 结果。
+当前 M3 中，Sandbox 拥有稳定身份、UTS/IPC/network namespaces、hostname/DNS 设置、
+父 cgroup、labels，以及 keeper 身份；M4C 才增加 network attachment、地址和 port
+mappings。Container Attempt 拥有其进程、mount/PID namespaces、子 cgroup、输出、
+退出码、退出信号和 OOM 结果。在文件系统维度，M3 Attempt 只拥有由配置过的共享
+prepared-rootfs source 建立的 mount 视图及其 owner receipt；它不拥有或删除该共享
+source，也没有每 Attempt 独享的 snapshot。Snapshot、独享 writable layer 和版本化
+bundle 是 M4B 的未来能力。
 
 因此，Sandbox 是一个保留的 workload environment，而不是空包装器。当一个 Attempt
 停止、后续 Attempt 被创建时，其网络身份和共享 namespaces 仍然存在。
 
 初期，一个面向 API 的 `Container` aggregate 恰好对应一个面向 kernel 的
 `Container Attempt`。Container 保留 immutable spec、query/log identity 和 atomic
-status projection；Attempt 拥有 process/rootfs/namespaces/cgroup，并且是输出及
+status projection；Attempt 拥有 process、mount 视图、namespaces/cgroup，并且是输出及
 exit/OOM outcome 的规范权威。`CreateContainer` 会返回两个 ID。后续 workload retry
 会在同一 Sandbox 中创建新的 Container/Attempt pair，而不会修改 terminal record。
 
@@ -92,9 +99,10 @@ UTS/IPC/network namespaces、配置 hostname/DNS/network、持久化 observed st
 host 上已经不存在相关资源后才执行移除。资源已不存在时重复执行 removal 会成功。
 
 `CreateContainer` 要求 Sandbox 为 Ready 且不存在 active Attempt。它会创建一一对应的
-Container/Attempt records，将 Sandbox 的 resource limits 解析进 Container spec，准备
-bundle/rootfs、子 cgroup、mounts、PID namespace、init process 和 start gate；只有
-`created` 状态完成持久化后才返回两个 ID。它不会执行 workload。
+Container/Attempt records，将 Sandbox 的 resource limits 解析进 Container spec，解析
+daemon 配置的 prepared-rootfs ID，并准备 Attempt-owned mount 视图/receipt、子 cgroup、
+PID namespace、init process 和 start gate；只有 `created` 状态完成持久化后才返回两个
+ID。它不会执行 workload，也不会创建 M4B 的 image-derived snapshot 或 bundle。
 
 `StartContainer` 释放 start gate，并确认状态已转为 `running`。收到请求响应不足以作为
 证据；daemon 需要来自 process/supervisor 的确认。
@@ -173,23 +181,26 @@ Attempt teardown 按以下依赖执行：
 stop/confirm process
 -> capture outcome and close streams
 -> detach child cgroup
--> unmount nested mounts and rootfs
--> release snapshot/writable layer
+-> unmount Attempt-owned mounts and prepared-rootfs view
 -> remove child cgroup
 -> persist absence and remove Container/Attempt metadata
 ```
+
+M4B 实现后，删除 versioned bundle 和释放 per-Attempt snapshot/writable layer 才会插入
+上述依赖顺序；当前 M3 绝不把共享 prepared-rootfs source 当作 Attempt 数据删除。
 
 Sandbox removal 按以下顺序执行：
 
 ```text
 verify Sandbox stopped and zero Container records
--> remove port rules/routes/veth
--> release IP allocation
 -> stop namespace keeper
 -> release UTS/IPC/network namespaces
 -> remove parent cgroup
 -> persist absence and remove Sandbox metadata
 ```
+
+M4C 实现后，移除 owned port rules/routes/veth 并释放 IP allocation 的步骤必须发生在
+停止 namespace keeper 之前；这些资源在当前 M3 精简网络中并不存在。
 
 具体实现可以细化这些步骤，但在保留下来的 intent 尚不足以完成 recovery 前，绝不能
 删除 metadata。
@@ -203,10 +214,11 @@ daemon 恢复已封存的 stack 后不得再登记新的 inverse。随后 rollba
 验证；如果仍有 host resource 遗留，则当前 phase 应保留 failure/cleanup condition，
 而不是错误地报告 terminal 或 absent phase。
 
-daemon restart 后，reconciliation 会将 durable intent 与 supervisor、process identity、
-namespaces、cgroups、mounts、network attachments 和 snapshots 进行比较。系统根据最后一个
-durable stage 继续 operation、执行 rollback、接管已验证的资源，或标记需要 operator
-处理的 condition。删除 orphan 前必须证明其所有权。
+daemon restart 后，当前 reconciliation 会将 durable intent 与 shim/process identity、
+namespaces、cgroups、Attempt mount view/receipt 和 M3 精简网络状态进行比较。系统根据
+最后一个 durable stage 继续 operation、执行 rollback、接管已验证的资源，或标记需要
+operator 处理的 condition。删除 orphan 前必须证明其所有权。M4B/M4C 实现后才把
+snapshots、network attachments、IPAM 和 port rules 纳入相同恢复原则。
 
 supervisor 会持久化 exit outcome，并保持 namespace/process handles 可供重新连接。
 持久化的裸 PID 绝不足以用于向进程发送信号或接管进程。
