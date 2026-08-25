@@ -42,7 +42,7 @@
     "warmup": "none",
     "labels": {
       "privilege_profile": "replace-before-run",
-      "result_kind": "raw-baseline"
+      "result_kind": "raw-debug-evidence"
     }
   }
 }

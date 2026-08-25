@@ -22,20 +22,24 @@ import (
 	"time"
 
 	v1 "mydocker/api/runtime/v1"
+	"mydocker/internal/strictjson"
 	"mydocker/pkg/client"
 )
 
 const (
-	evaluationSchemaVersion = uint32(1)
+	scenarioSchemaVersion   = uint32(1)
+	rawRecordSchemaVersion  = uint32(2)
 	maxScenarioBytes        = int64(1 << 20)
 	maxEventPages           = 1024
 	defaultEvaluationSocket = "/run/mydocker/mydockerd.sock"
 	unknownEvidence         = "unknown"
 	preparedRootfsSnapshot  = "not-created-prepared-rootfs-shared"
 	maxCommandEvidenceBytes = 1 << 20
+	maxEvaluationSamples    = 100
 )
 
 type evaluationClient interface {
+	Info(context.Context) (v1.InfoResponse, error)
 	CreateSandbox(context.Context, string, v1.CreateSandboxRequest) (v1.SandboxResponse, error)
 	StopSandbox(context.Context, string, string) (v1.SandboxResponse, error)
 	DeleteSandbox(context.Context, string, string) (v1.OperationResponse, error)
@@ -62,6 +66,7 @@ type scenario struct {
 	Version        string               `json:"version"`
 	Classification string               `json:"classification"`
 	Samples        int                  `json:"samples"`
+	WarmupAttempts int                  `json:"warmup_attempts,omitempty"`
 	Concurrency    int                  `json:"concurrency"`
 	RootFS         string               `json:"rootfs"`
 	Sandbox        v1.SandboxSpec       `json:"sandbox"`
@@ -87,33 +92,35 @@ type scenarioCacheState struct {
 }
 
 type scenarioIdentity struct {
-	Name    string `json:"name"`
-	Version string `json:"version"`
+	Name         string `json:"name"`
+	Version      string `json:"version"`
+	DigestSHA256 string `json:"digest_sha256"`
 }
 
 type recordedEnvironment struct {
-	ID                    string              `json:"id"`
-	Labels                map[string]string   `json:"labels,omitempty"`
-	GOOS                  string              `json:"goos"`
-	GOARCH                string              `json:"goarch"`
-	FilesystemProfile     string              `json:"filesystem_profile"`
-	NetworkMode           string              `json:"network_mode"`
-	ScenarioTag           string              `json:"scenario_tag"`
-	Commit                string              `json:"commit"`
-	Build                 buildEnvironment    `json:"build"`
-	Worktree              worktreeEnvironment `json:"worktree"`
-	Kernel                kernelEnvironment   `json:"kernel"`
-	Cgroup                cgroupEnvironment   `json:"cgroup"`
-	CPU                   cpuEnvironment      `json:"cpu"`
-	Memory                memoryEnvironment   `json:"memory"`
-	Storage               storageEnvironment  `json:"storage"`
-	Cache                 scenarioCacheState  `json:"cache"`
-	Concurrency           int                 `json:"concurrency"`
-	BackgroundNoise       string              `json:"background_noise"`
-	Warmup                string              `json:"warmup"`
-	ExperimentStartedAt   time.Time           `json:"experiment_started_at"`
-	TimeZone              string              `json:"timezone"`
-	TimeZoneOffsetSeconds int                 `json:"timezone_offset_seconds"`
+	ID                    string                 `json:"id"`
+	Labels                map[string]string      `json:"labels,omitempty"`
+	GOOS                  string                 `json:"goos"`
+	GOARCH                string                 `json:"goarch"`
+	FilesystemProfile     string                 `json:"filesystem_profile"`
+	NetworkMode           string                 `json:"network_mode"`
+	ScenarioTag           string                 `json:"scenario_tag"`
+	DaemonBuild           v1.DaemonBuildIdentity `json:"daemon_build"`
+	EvaluatorBuildCommit  string                 `json:"evaluator_build_commit"`
+	EvaluatorBuild        buildEnvironment       `json:"evaluator_build"`
+	OperatorWorktree      worktreeEnvironment    `json:"operator_worktree"`
+	Kernel                kernelEnvironment      `json:"kernel"`
+	Cgroup                cgroupEnvironment      `json:"cgroup"`
+	CPU                   cpuEnvironment         `json:"cpu"`
+	Memory                memoryEnvironment      `json:"memory"`
+	Storage               storageEnvironment     `json:"storage"`
+	Cache                 scenarioCacheState     `json:"cache"`
+	Concurrency           int                    `json:"concurrency"`
+	BackgroundNoise       string                 `json:"background_noise"`
+	Warmup                string                 `json:"warmup"`
+	ExperimentStartedAt   time.Time              `json:"experiment_started_at"`
+	TimeZone              string                 `json:"timezone"`
+	TimeZoneOffsetSeconds int                    `json:"timezone_offset_seconds"`
 }
 
 type buildEnvironment struct {
@@ -135,6 +142,7 @@ type buildEnvironment struct {
 
 type worktreeEnvironment struct {
 	Root                 string `json:"root"`
+	Head                 string `json:"head"`
 	Branch               string `json:"branch"`
 	Status               string `json:"status"`
 	StatusSHA256         string `json:"status_sha256"`
@@ -197,10 +205,26 @@ type rawRecord struct {
 	OperationID         string              `json:"operation_id,omitempty"`
 	OperationIDs        []string            `json:"operation_ids,omitempty"`
 	StartedAt           *time.Time          `json:"started_at,omitempty"`
-	DurationNanoseconds int64               `json:"duration_ns,omitempty"`
-	Success             bool                `json:"success"`
+	DurationNanoseconds *int64              `json:"duration_ns,omitempty"`
+	Success             *bool               `json:"success,omitempty"`
 	Error               *v1.ErrorDetail     `json:"error,omitempty"`
 	Event               *v1.Event           `json:"event,omitempty"`
+	Summary             *runSummary         `json:"summary,omitempty"`
+}
+
+// runSummary seals one semantically complete JSONL stream with machine-readable
+// lifecycle, evidence, and baseline-eligibility facts. Finalize separately
+// determines whether the enclosing output was durably published.
+type runSummary struct {
+	Completed             bool     `json:"completed"`
+	LifecycleSuccess      bool     `json:"lifecycle_success"`
+	EventEvidenceComplete bool     `json:"event_evidence_complete"`
+	ExpectedOperations    int      `json:"expected_operations"`
+	CompletedOperations   int      `json:"completed_operations"`
+	FormalSamples         int      `json:"formal_samples"`
+	BaselineEligible      bool     `json:"baseline_eligible"`
+	EvidenceQuality       string   `json:"evidence_quality"`
+	IneligibilityReasons  []string `json:"ineligibility_reasons,omitempty"`
 }
 
 type commandOptions struct {
@@ -220,7 +244,15 @@ type evaluator struct {
 	experimentID      string
 	scenario          scenario
 	environment       recordedEnvironment
+	scenarioDigest    string
 	operationContexts map[string]sampleContext
+	operationRequired map[string]bool
+	operationComplete map[string]bool
+	resourceIDs       map[string]struct{}
+	eventAfter        v1.ResumeToken
+	formalSamples     int
+	lifecycleOK       bool
+	eventEvidenceOK   bool
 }
 
 type callerSpan struct {
@@ -267,6 +299,10 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	if err := loaded.Validate(); err != nil {
 		return writeRunError(stderr, err)
 	}
+	scenarioDigest, err := canonicalScenarioDigest(loaded)
+	if err != nil {
+		return writeRunError(stderr, err)
+	}
 	if options.experimentID == "" {
 		options.experimentID, err = ids("experiment")
 		if err != nil {
@@ -277,18 +313,25 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		return writeRunError(stderr, v1.WrapError(v1.CodeInvalidArgument, "experiment-id", "must be a valid bounded identity", false, err))
 	}
 	environment := collectEnvironment(loaded, options.outputPath, clock)
-	output, err := openOutput(options.outputPath, stdout)
-	if err != nil {
-		return writeRunError(stderr, err)
-	}
 	apiClient, err := factory(client.Config{
 		SocketPath:       options.socketPath,
 		Timeout:          options.timeout,
 		TransportRetries: options.transportRetries,
 	})
 	if err != nil {
-		clientErr := v1.WrapError(v1.CodeInvalidArgument, "client", err.Error(), false, err)
-		return writeRunError(stderr, errors.Join(output.Finalize(), clientErr))
+		return writeRunError(stderr, v1.WrapError(v1.CodeInvalidArgument, "client", err.Error(), false, err))
+	}
+	daemonInfo, err := apiClient.Info(ctx)
+	if err != nil {
+		return writeRunError(stderr, err)
+	}
+	if err := daemonInfo.Validate(); err != nil {
+		return writeRunError(stderr, v1.WrapError(v1.CodeInternal, "daemon_info", "mydockerd returned invalid build identity", false, err))
+	}
+	environment.DaemonBuild = daemonInfo.DaemonBuild
+	output, err := openOutput(options.outputPath, stdout)
+	if err != nil {
+		return writeRunError(stderr, err)
 	}
 	runner := &evaluator{
 		client:            apiClient,
@@ -298,14 +341,30 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 		experimentID:      options.experimentID,
 		scenario:          loaded,
 		environment:       environment,
+		scenarioDigest:    scenarioDigest,
 		operationContexts: make(map[string]sampleContext),
+		operationRequired: make(map[string]bool),
+		operationComplete: make(map[string]bool),
+		resourceIDs:       make(map[string]struct{}),
 	}
 	runErr := runner.Run(ctx)
+	runErr = errors.Join(runErr, runner.emitRunSummary(runErr))
 	finalizeErr := output.Finalize()
 	if err := errors.Join(finalizeErr, runErr); err != nil {
 		return writeRunError(stderr, err)
 	}
 	return 0
+}
+
+// canonicalScenarioDigest binds every strict-decoded scenario field while
+// remaining stable across insignificant JSON whitespace and object key order.
+func canonicalScenarioDigest(input scenario) (string, error) {
+	payload, err := json.Marshal(input)
+	if err != nil {
+		return "", v1.WrapError(v1.CodeInternal, "scenario", "cannot canonicalize scenario", false, err)
+	}
+	digest := sha256.Sum256(payload)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 // parseOptions accepts only reproducibility and transport settings, never process argv fragments.
@@ -342,7 +401,7 @@ func parseOptions(args []string) (commandOptions, error) {
 
 // Validate enforces the first M3 prepared-rootfs none/loopback lifecycle boundary before any API call.
 func (input scenario) Validate() error {
-	if input.SchemaVersion != evaluationSchemaVersion {
+	if input.SchemaVersion != scenarioSchemaVersion {
 		return invalidArgument("schema_version", "must be 1")
 	}
 	if strings.TrimSpace(input.Name) == "" || strings.TrimSpace(input.Version) == "" {
@@ -351,8 +410,14 @@ func (input scenario) Validate() error {
 	if input.Classification != "cold" && input.Classification != "warm" {
 		return invalidArgument("classification", "must be cold or warm")
 	}
-	if input.Samples <= 0 || input.Samples > 10000 {
-		return invalidArgument("samples", "must be from 1 through 10000")
+	if input.Samples <= 0 || input.Samples > maxEvaluationSamples {
+		return invalidArgument("samples", fmt.Sprintf("must be from 1 through %d", maxEvaluationSamples))
+	}
+	if input.Classification == "cold" && input.WarmupAttempts != 0 {
+		return invalidArgument("warmup_attempts", "must be zero for cold scenarios")
+	}
+	if input.Classification == "warm" && (input.WarmupAttempts <= 0 || input.WarmupAttempts > maxEvaluationSamples) {
+		return invalidArgument("warmup_attempts", fmt.Sprintf("must be from 1 through %d for warm scenarios", maxEvaluationSamples))
 	}
 	if input.Concurrency != 1 {
 		return invalidArgument("concurrency", "M3 evaluator currently supports exactly one sequential caller")
@@ -430,17 +495,8 @@ func loadScenario(path string, stdin io.Reader) (scenario, error) {
 		return scenario{}, invalidArgument("scenario", "exceeds the 1 MiB limit")
 	}
 	var loaded scenario
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&loaded); err != nil {
+	if err := strictjson.Decode(payload, &loaded); err != nil {
 		return scenario{}, v1.WrapError(v1.CodeInvalidArgument, "scenario", "invalid scenario JSON: "+err.Error(), false, err)
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return scenario{}, invalidArgument("scenario", "must contain exactly one JSON value")
-		}
-		return scenario{}, v1.WrapError(v1.CodeInvalidArgument, "scenario", "invalid trailing JSON data", false, err)
 	}
 	return loaded, nil
 }
@@ -495,11 +551,7 @@ func (output *boundedCommandBuffer) Write(payload []byte) (int, error) {
 func collectRecordedEnvironment(input scenario, outputPath string, clock wallClock) recordedEnvironment {
 	startedAt := clock.Now()
 	build := collectBuildEnvironment()
-	worktree, repositoryCommit := collectWorktreeEnvironment(build)
-	commit := knownOrUnknown(build.VCSRevision)
-	if commit == unknownEvidence {
-		commit = repositoryCommit
-	}
+	worktree := collectWorktreeEnvironment()
 	_, timezoneOffset := startedAt.Zone()
 	return recordedEnvironment{
 		ID:                    input.Environment.ID,
@@ -509,9 +561,9 @@ func collectRecordedEnvironment(input scenario, outputPath string, clock wallClo
 		FilesystemProfile:     "prepared-rootfs",
 		NetworkMode:           input.Sandbox.Network.Mode,
 		ScenarioTag:           formatScenarioLabel(input),
-		Commit:                knownOrUnknown(commit),
-		Build:                 build,
-		Worktree:              worktree,
+		EvaluatorBuildCommit:  knownOrUnknown(build.VCSRevision),
+		EvaluatorBuild:        build,
+		OperatorWorktree:      worktree,
 		Kernel:                collectKernelEnvironment(),
 		Cgroup:                collectCgroupEnvironment(),
 		CPU:                   collectCPUEnvironment(),
@@ -569,29 +621,25 @@ func collectBuildEnvironment() buildEnvironment {
 	return result
 }
 
-// collectWorktreeEnvironment uses bounded read-only Git queries when available and falls back to embedded VCS metadata.
-func collectWorktreeEnvironment(build buildEnvironment) (worktreeEnvironment, string) {
+// collectWorktreeEnvironment records the operator's current Git context without
+// attributing that checkout to either the evaluator binary or the daemon under test.
+func collectWorktreeEnvironment() worktreeEnvironment {
 	result := worktreeEnvironment{
 		Root:                 unknownEvidence,
+		Head:                 unknownEvidence,
 		Branch:               unknownEvidence,
 		Status:               unknownEvidence,
 		StatusSHA256:         unknownEvidence,
 		TrackedDiffSHA256:    unknownEvidence,
 		UntrackedContentNote: "not-hashed; status_sha256 covers untracked paths only",
 	}
-	commit := knownOrUnknown(build.VCSRevision)
 	root, err := runReadOnlyCommand("git", "rev-parse", "--show-toplevel")
 	if err != nil {
-		if build.VCSModified == "true" {
-			result.Status = "dirty"
-		} else if build.VCSModified == "false" {
-			result.Status = "clean"
-		}
-		return result, commit
+		return result
 	}
 	result.Root = strings.TrimSpace(root)
 	if head, commandErr := runReadOnlyCommand("git", "-C", result.Root, "rev-parse", "HEAD"); commandErr == nil {
-		commit = knownOrUnknown(strings.TrimSpace(head))
+		result.Head = knownOrUnknown(strings.TrimSpace(head))
 	}
 	if branch, commandErr := runReadOnlyCommand("git", "-C", result.Root, "branch", "--show-current"); commandErr == nil {
 		result.Branch = knownOrUnknown(strings.TrimSpace(branch))
@@ -609,7 +657,7 @@ func collectWorktreeEnvironment(build buildEnvironment) (worktreeEnvironment, st
 	if diffErr == nil {
 		result.TrackedDiffSHA256 = sha256Text(diff)
 	}
-	return result, commit
+	return result
 }
 
 // runReadOnlyCommand executes one bounded inspection command with a short deadline and returns unknown-worthy errors on truncation.
@@ -902,19 +950,29 @@ func (runner *evaluator) Run(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	runner.eventAfter = eventTail
 	var lifecycleErr error
+	var eventErr error
 	if runner.scenario.Classification == "cold" {
 		for index := 0; index < runner.scenario.Samples; index++ {
-			if err := runner.runColdSample(ctx, index); err != nil {
-				lifecycleErr = err
+			sampleErr := runner.runColdSample(ctx, index)
+			if sampleErr == nil {
+				runner.formalSamples++
+			}
+			lifecycleErr = errors.Join(lifecycleErr, sampleErr)
+			drainErr := runner.collectEvents(ctx)
+			eventErr = errors.Join(eventErr, drainErr)
+			if sampleErr != nil || drainErr != nil {
 				break
 			}
 		}
 	} else {
-		lifecycleErr = runner.runWarmSamples(ctx)
+		lifecycleErr, eventErr = runner.runWarmSamples(ctx)
 	}
-	eventErr := runner.collectEvents(ctx, eventTail)
-	return errors.Join(lifecycleErr, eventErr)
+	eventErr = errors.Join(eventErr, runner.collectEvents(ctx))
+	runner.lifecycleOK = lifecycleErr == nil && runner.formalSamples == runner.scenario.Samples
+	evidenceErr := runner.validateEventEvidence(eventErr)
+	return errors.Join(lifecycleErr, eventErr, evidenceErr)
 }
 
 // runColdSample emits one caller-owned CreateSandbox-to-Running span while retaining per-operation spans and best-effort cleanup evidence.
@@ -968,6 +1026,9 @@ func (runner *evaluator) runColdSample(ctx context.Context, index int) error {
 			containerMayBeRunning = true
 			lifecycleErr = runner.measure(ctx, sample, "container.start", operationID, func() error {
 				response, callErr := runner.client.StartContainer(ctx, operationID, containerID)
+				if callErr == nil {
+					runner.operationRequired[operationID] = true
+				}
 				return errors.Join(callErr, requireRunning(response, callErr))
 			})
 		}
@@ -977,39 +1038,57 @@ func (runner *evaluator) runColdSample(ctx context.Context, index int) error {
 	return errors.Join(lifecycleErr, cleanupErr)
 }
 
-// runWarmSamples creates one stable Sandbox, attempts cleanup even after an ambiguous setup response, and measures repeated warm Attempts.
-func (runner *evaluator) runWarmSamples(ctx context.Context) error {
+// runWarmSamples creates one stable Sandbox and returns lifecycle failures
+// separately from incremental event-evidence failures.
+func (runner *evaluator) runWarmSamples(ctx context.Context) (error, error) {
 	setup := sampleContext{Classification: "warm", Index: -1}
 	sandboxID, err := runner.newResourceID("sandbox")
 	if err != nil {
-		return err
+		return err, nil
 	}
 	operationID, err := runner.newOperation(setup)
 	if err != nil {
-		return err
+		return err, nil
 	}
-	setupErr := runner.measure(ctx, setup, "setup.sandbox.create", operationID, func() error {
+	setupLifecycleErr := runner.measure(ctx, setup, "setup.sandbox.create", operationID, func() error {
 		_, callErr := runner.client.CreateSandbox(ctx, operationID, v1.CreateSandboxRequest{SandboxID: sandboxID, Spec: runner.scenario.Sandbox})
 		return callErr
 	})
-	if setupErr != nil {
+	setupEventErr := runner.collectEvents(ctx)
+	if setupLifecycleErr != nil || setupEventErr != nil {
 		cleanupErr := runner.cleanupSandbox(ctx, setup, "cleanup.", sandboxID)
-		return errors.Join(setupErr, cleanupErr)
+		return errors.Join(setupLifecycleErr, cleanupErr), errors.Join(setupEventErr, runner.collectEvents(ctx))
+	}
+	for index := 0; index < runner.scenario.WarmupAttempts; index++ {
+		warmupLifecycleErr := runner.runWarmAttempt(ctx, sandboxID, index, "warmup")
+		warmupEventErr := runner.collectEvents(ctx)
+		if warmupLifecycleErr != nil || warmupEventErr != nil {
+			cleanupErr := runner.cleanupSandbox(ctx, setup, "cleanup.", sandboxID)
+			return errors.Join(warmupLifecycleErr, cleanupErr), errors.Join(warmupEventErr, runner.collectEvents(ctx))
+		}
 	}
 	var lifecycleErr error
+	var eventErr error
 	for index := 0; index < runner.scenario.Samples; index++ {
-		if err := runner.runWarmAttempt(ctx, sandboxID, index); err != nil {
-			lifecycleErr = err
+		attemptErr := runner.runWarmAttempt(ctx, sandboxID, index, "warm")
+		if attemptErr == nil {
+			runner.formalSamples++
+		}
+		lifecycleErr = errors.Join(lifecycleErr, attemptErr)
+		drainErr := runner.collectEvents(ctx)
+		eventErr = errors.Join(eventErr, drainErr)
+		if attemptErr != nil || drainErr != nil {
 			break
 		}
 	}
 	cleanupErr := runner.cleanupSandbox(ctx, setup, "cleanup.", sandboxID)
-	return errors.Join(lifecycleErr, cleanupErr)
+	eventErr = errors.Join(eventErr, runner.collectEvents(ctx))
+	return errors.Join(lifecycleErr, cleanupErr), eventErr
 }
 
 // runWarmAttempt emits one caller-owned CreateContainer-to-Running span and cleans every possibly persisted Attempt by its known ID.
-func (runner *evaluator) runWarmAttempt(ctx context.Context, sandboxID string, index int) error {
-	sample := sampleContext{Classification: "warm", Index: index}
+func (runner *evaluator) runWarmAttempt(ctx context.Context, sandboxID string, index int, classification string) error {
+	sample := sampleContext{Classification: classification, Index: index}
 	containerID, err := runner.newResourceID("container")
 	if err != nil {
 		return err
@@ -1042,11 +1121,14 @@ func (runner *evaluator) runWarmAttempt(ctx context.Context, sandboxID string, i
 			containerMayBeRunning = true
 			lifecycleErr = runner.measure(ctx, sample, "container.start", operationID, func() error {
 				response, callErr := runner.client.StartContainer(ctx, operationID, containerID)
+				if callErr == nil {
+					runner.operationRequired[operationID] = true
+				}
 				return errors.Join(callErr, requireRunning(response, callErr))
 			})
 		}
 	}
-	lifecycleErr = runner.finishCallerSpan(sample, "warm.create_container_to_running", operationIDs, span, lifecycleErr)
+	lifecycleErr = runner.finishCallerSpan(sample, classification+".create_container_to_running", operationIDs, span, lifecycleErr)
 	cleanupErr := runner.cleanupAttempt(ctx, sample, "", sandboxID, containerID, true, containerMayExist, containerMayBeRunning, false)
 	return errors.Join(lifecycleErr, cleanupErr)
 }
@@ -1109,25 +1191,28 @@ func (runner *evaluator) beginCallerSpan() callerSpan {
 // finishCallerSpan emits one aggregate E2E observation correlated with every durable operation used to reach Running.
 func (runner *evaluator) finishCallerSpan(sample sampleContext, phase string, operationIDs []string, span callerSpan, callErr error) error {
 	finished := runner.clock.Now()
+	duration, durationErr := measuredDuration(span.started, finished)
+	recordErr := errors.Join(callErr, durationErr)
+	success := recordErr == nil
 	record := rawRecord{
-		SchemaVersion:       evaluationSchemaVersion,
+		SchemaVersion:       rawRecordSchemaVersion,
 		RecordType:          "caller_span",
 		ExperimentID:        runner.experimentID,
-		Scenario:            scenarioIdentity{Name: runner.scenario.Name, Version: runner.scenario.Version},
+		Scenario:            runner.scenarioIdentity(),
 		Environment:         runner.environment,
 		Classification:      sample.Classification,
 		SampleIndex:         sample.Index,
 		Phase:               phase,
 		OperationIDs:        append([]string(nil), operationIDs...),
 		StartedAt:           &span.started,
-		DurationNanoseconds: finished.Sub(span.started).Nanoseconds(),
-		Success:             callErr == nil,
+		DurationNanoseconds: duration,
+		Success:             &success,
 	}
-	if callErr != nil {
-		detail := stableErrorDetail(callErr)
+	if recordErr != nil {
+		detail := stableErrorDetail(recordErr)
 		record.Error = &detail
 	}
-	return errors.Join(callErr, runner.emit(record))
+	return errors.Join(recordErr, runner.emit(record))
 }
 
 // requireRunning prevents a successful transport response with a non-Running projection from closing an E2E startup sample.
@@ -1144,28 +1229,50 @@ func requireRunning(response v1.ContainerResponse, callErr error) error {
 // measure emits one caller-visible API span using only same-process duration subtraction.
 func (runner *evaluator) measure(_ context.Context, sample sampleContext, phase, operationID string, call func() error) error {
 	started := runner.clock.Now()
+	if operationID != "" {
+		runner.operationRequired[operationID] = false
+	}
 	callErr := call()
 	finished := runner.clock.Now()
+	duration, durationErr := measuredDuration(started, finished)
+	recordErr := errors.Join(callErr, durationErr)
+	success := recordErr == nil
+	if operationID != "" && callErr == nil {
+		runner.operationRequired[operationID] = true
+	}
 	record := rawRecord{
-		SchemaVersion:       evaluationSchemaVersion,
+		SchemaVersion:       rawRecordSchemaVersion,
 		RecordType:          "caller_span",
 		ExperimentID:        runner.experimentID,
-		Scenario:            scenarioIdentity{Name: runner.scenario.Name, Version: runner.scenario.Version},
+		Scenario:            runner.scenarioIdentity(),
 		Environment:         runner.environment,
 		Classification:      sample.Classification,
 		SampleIndex:         sample.Index,
 		Phase:               phase,
 		OperationID:         operationID,
 		StartedAt:           &started,
-		DurationNanoseconds: finished.Sub(started).Nanoseconds(),
-		Success:             callErr == nil,
+		DurationNanoseconds: duration,
+		Success:             &success,
 	}
-	if callErr != nil {
-		detail := stableErrorDetail(callErr)
+	if recordErr != nil {
+		detail := stableErrorDetail(recordErr)
 		record.Error = &detail
 	}
 	emitErr := runner.emit(record)
-	return errors.Join(callErr, emitErr)
+	return errors.Join(recordErr, emitErr)
+}
+
+// measuredDuration preserves an explicitly measured zero while rejecting zero
+// or regressing clock boundaries as unusable benchmark evidence.
+func measuredDuration(started, finished time.Time) (*int64, error) {
+	if started.IsZero() || finished.IsZero() {
+		return nil, v1.NewError(v1.CodeInternal, "clock", "evaluation clock returned a zero boundary")
+	}
+	if finished.Before(started) {
+		return nil, v1.NewError(v1.CodeInternal, "clock", "evaluation clock regressed during a measured span")
+	}
+	value := finished.Sub(started).Nanoseconds()
+	return &value, nil
 }
 
 // captureEventTail reaches a stable pre-run resume token before creating resources, avoiding a scan from sequence zero after the experiment.
@@ -1190,8 +1297,9 @@ func (runner *evaluator) captureEventTail(ctx context.Context) (v1.ResumeToken, 
 }
 
 // collectEvents pages from the captured pre-run tail, retaining only stage events for operation IDs generated by this run.
-func (runner *evaluator) collectEvents(ctx context.Context, after v1.ResumeToken) error {
+func (runner *evaluator) collectEvents(ctx context.Context) error {
 	sample := sampleContext{Classification: runner.scenario.Classification, Index: -1}
+	after := runner.eventAfter
 	for page := 0; page < maxEventPages; page++ {
 		var response v1.EventListResponse
 		if err := runner.measure(ctx, sample, "events.collect", "", func() error {
@@ -1208,28 +1316,55 @@ func (runner *evaluator) collectEvents(ctx context.Context, after v1.ResumeToken
 				continue
 			}
 			record := rawRecord{
-				SchemaVersion:  evaluationSchemaVersion,
+				SchemaVersion:  rawRecordSchemaVersion,
 				RecordType:     "stage_event",
 				ExperimentID:   runner.experimentID,
-				Scenario:       scenarioIdentity{Name: runner.scenario.Name, Version: runner.scenario.Version},
+				Scenario:       runner.scenarioIdentity(),
 				Environment:    runner.environment,
 				Classification: contextForOperation.Classification,
 				SampleIndex:    contextForOperation.Index,
 				Phase:          event.Stage,
 				OperationID:    event.OperationID,
-				Success:        event.Result == "succeeded" || event.Result == "noop",
 				Event:          &event,
+			}
+			if event.Stage == "complete" {
+				if runner.operationComplete[event.OperationID] {
+					return v1.NewError(v1.CodeInternal, "events", "operation emitted more than one terminal complete event")
+				}
+				if runner.operationRequired[event.OperationID] && event.Result != "succeeded" && event.Result != "noop" {
+					return v1.NewError(v1.CodeInternal, "events", "successful API operation has a non-success terminal event")
+				}
+				runner.operationComplete[event.OperationID] = true
 			}
 			if err := runner.emit(record); err != nil {
 				return err
 			}
 		}
 		if !response.HasMore {
+			runner.eventAfter = response.NextResumeToken
 			return nil
 		}
 		after = response.NextResumeToken
+		runner.eventAfter = after
 	}
 	return v1.NewError(v1.CodeUnavailable, "events", "event page limit exceeded before reaching the run boundary")
+}
+
+// validateEventEvidence requires every dispatched public lifecycle operation
+// to have one owned terminal complete event. The map value separately records
+// whether the API returned success for terminal-result consistency checks.
+func (runner *evaluator) validateEventEvidence(collectionErr error) error {
+	missing := 0
+	for operationID := range runner.operationRequired {
+		if !runner.operationComplete[operationID] {
+			missing++
+		}
+	}
+	runner.eventEvidenceOK = collectionErr == nil && missing == 0
+	if missing != 0 {
+		return v1.NewError(v1.CodeUnavailable, "events", fmt.Sprintf("%d dispatched operations are missing terminal complete events", missing))
+	}
+	return nil
 }
 
 // newOperation creates and registers the durable operation identity before its first request attempt.
@@ -1240,6 +1375,9 @@ func (runner *evaluator) newOperation(sample sampleContext) (string, error) {
 	}
 	if err := v1.ValidateOperationID(operationID); err != nil {
 		return "", v1.WrapError(v1.CodeInternal, "operation_id", "generated identity is invalid", false, err)
+	}
+	if _, exists := runner.operationContexts[operationID]; exists {
+		return "", v1.NewError(v1.CodeInternal, "operation_id", "identity generator returned a duplicate operation ID")
 	}
 	runner.operationContexts[operationID] = sample
 	return operationID, nil
@@ -1254,7 +1392,133 @@ func (runner *evaluator) newResourceID(prefix string) (string, error) {
 	if err := v1.ValidateResourceID(prefix+"_id", value); err != nil {
 		return "", v1.WrapError(v1.CodeInternal, prefix+"_id", "generated identity is invalid", false, err)
 	}
+	if _, exists := runner.resourceIDs[value]; exists {
+		return "", v1.NewError(v1.CodeInternal, prefix+"_id", "identity generator returned a duplicate resource ID")
+	}
+	runner.resourceIDs[value] = struct{}{}
 	return value, nil
+}
+
+// scenarioIdentity returns the canonical input identity attached to every raw
+// line so a same-name scenario edit cannot be confused with prior evidence.
+func (runner *evaluator) scenarioIdentity() scenarioIdentity {
+	return scenarioIdentity{Name: runner.scenario.Name, Version: runner.scenario.Version, DigestSHA256: runner.scenarioDigest}
+}
+
+// emitRunSummary writes the semantic completeness seal even when lifecycle or
+// evidence collection failed. Consumers must still require successful outer
+// output publication because a stream cannot attest to a later fsync failure.
+func (runner *evaluator) emitRunSummary(runErr error) error {
+	expected := len(runner.operationRequired)
+	completed := 0
+	for operationID := range runner.operationRequired {
+		if runner.operationComplete[operationID] {
+			completed++
+		}
+	}
+	reasons := runner.baselineIneligibilityReasons()
+	if runErr != nil {
+		reasons = append(reasons, "run_failed")
+	}
+	if !runner.eventEvidenceOK {
+		reasons = append(reasons, "event_evidence_incomplete")
+	}
+	success := runErr == nil
+	summary := runSummary{
+		Completed: true, LifecycleSuccess: runner.lifecycleOK, EventEvidenceComplete: runner.eventEvidenceOK,
+		ExpectedOperations: expected, CompletedOperations: completed, FormalSamples: runner.formalSamples,
+		BaselineEligible: len(reasons) == 0, EvidenceQuality: "debug", IneligibilityReasons: reasons,
+	}
+	if summary.BaselineEligible {
+		summary.EvidenceQuality = "baseline"
+	}
+	record := rawRecord{
+		SchemaVersion: rawRecordSchemaVersion, RecordType: "run_summary", ExperimentID: runner.experimentID,
+		Scenario: runner.scenarioIdentity(), Environment: runner.environment,
+		Classification: runner.scenario.Classification, SampleIndex: -1, Phase: "run.complete",
+		Success: &success, Summary: &summary,
+	}
+	if runErr != nil {
+		detail := stableErrorDetail(runErr)
+		record.Error = &detail
+	}
+	return runner.emit(record)
+}
+
+// baselineIneligibilityReasons returns bounded build and scenario reasons that prevent formal baseline use.
+func (runner *evaluator) baselineIneligibilityReasons() []string {
+	reasons := make([]string, 0, 6)
+	daemonBuild := runner.environment.DaemonBuild
+	daemonRevisionUsable := v1.UsableVCSRevision(daemonBuild.VCSRevision)
+	daemonIdentityUsable := !daemonBuild.Unavailable && daemonRevisionUsable && daemonBuild.VCSModified != nil
+	if !daemonIdentityUsable {
+		reasons = append(reasons, "daemon_build_identity_unavailable")
+	}
+	evaluatorBuild := runner.environment.EvaluatorBuild
+	evaluatorRevisionUsable := v1.UsableVCSRevision(evaluatorBuild.VCSRevision)
+	evaluatorModified, evaluatorModifiedKnown := parseEvaluatorModified(evaluatorBuild.VCSModified)
+	if !evaluatorRevisionUsable || !evaluatorModifiedKnown {
+		reasons = append(reasons, "evaluator_build_identity_unavailable")
+	}
+	if daemonRevisionUsable && evaluatorRevisionUsable && daemonBuild.VCSRevision != evaluatorBuild.VCSRevision {
+		reasons = append(reasons, "daemon_evaluator_revision_mismatch")
+	}
+	if daemonBuild.VCSModified != nil && *daemonBuild.VCSModified {
+		reasons = append(reasons, "daemon_build_modified")
+	}
+	if evaluatorModifiedKnown && evaluatorModified {
+		reasons = append(reasons, "evaluator_build_modified")
+	}
+	if scenarioEnvironmentHasPlaceholder(runner.scenario) {
+		reasons = append(reasons, "scenario_environment_placeholder")
+	}
+	if resultKind, declared := runner.scenario.Environment.Labels["result_kind"]; declared && resultKind != "raw-baseline-evidence" {
+		reasons = append(reasons, "scenario_declares_debug_evidence")
+	}
+	return reasons
+}
+
+// scenarioEnvironmentHasPlaceholder rejects unresolved environment identity, noise, warmup, label, or cache evidence.
+func scenarioEnvironmentHasPlaceholder(input scenario) bool {
+	environment := input.Environment
+	if placeholderEvidence(environment.ID) || environment.Noise != "none" {
+		return true
+	}
+	validWarmup := input.Classification == "cold" && environment.Warmup == "none" ||
+		input.Classification == "warm" && input.WarmupAttempts == 1 && environment.Warmup == "one-complete-unmeasured-attempt-before-formal-samples"
+	if !validWarmup {
+		return true
+	}
+	for key, value := range environment.Labels {
+		if placeholderEvidence(key) || placeholderEvidence(value) {
+			return true
+		}
+	}
+	cache := environment.Cache
+	for _, value := range []string{cache.Content, cache.UnpackedChain, cache.Snapshot, cache.PageCache, cache.ImmutableLayers} {
+		if placeholderEvidence(value) {
+			return true
+		}
+	}
+	return false
+}
+
+// placeholderEvidence reports empty, unknown, or replace-prefixed scenario evidence.
+func placeholderEvidence(value string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	return normalized == "" || normalized == unknownEvidence || strings.HasPrefix(normalized, "replace-")
+}
+
+// parseEvaluatorModified accepts only the exact boolean spelling emitted by Go build metadata.
+func parseEvaluatorModified(value string) (bool, bool) {
+	switch value {
+	case "false":
+		return false, true
+	case "true":
+		return true, true
+	default:
+		return false, false
+	}
 }
 
 // emit writes one complete JSONL record immediately so later failures do not erase prior raw evidence.

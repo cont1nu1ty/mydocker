@@ -1,13 +1,13 @@
 # 评测契约
 
-**状态：** In progress。M3 已实现只通过版本化公共 API 工作的 `mydocker-eval`
+**状态：** M3 评测契约已实现并通过非特权验证。M3 已实现只通过版本化公共 API 工作的 `mydocker-eval`
 harness、cold/warm prepared-rootfs 场景、调用方单调时钟跨度、daemon stage-event
-关联、失败后清理尝试和逐行 JSONL 原始证据。当前仍没有真实 rootful benchmark
-运行、结果、profile 或性能结论；纯 Go 单元测试不能替代这些证据。
-生产 `LinuxShimLauncher` 已编码，但尚未通过一次性 VM 中的 rootful 正确性验收；
-M3 catalog 也只复用共享 prepared-rootfs，而不创建每 Attempt snapshot。因此 harness
-命令和已签入场景当前是已测试的接口/证据生成契约，不是可立即执行或可与 M4B
-snapshot 场景比较的生产 benchmark 流程。
+关联、失败后清理尝试和逐行 JSONL 原始证据。生产 `LinuxShimLauncher` 已通过一次性
+KVM 的 M3 rootful 正确性验收，但该 tagged correctness suite 不是 `mydocker-eval`
+benchmark，也没有产生可提交的性能样本、profile 或性能结论。M3 catalog 只复用共享
+prepared-rootfs，而不创建每 Attempt snapshot。因此 harness 命令和已签入场景是已测试的
+接口/证据生成契约；正式 baseline 仍必须填写真实环境、通过 provenance/完整性门并单独
+执行，且不能与 M4B snapshot 场景直接比较。
 
 本文档是项目关于正确性、可靠性、测量和性能证据的主要契约。架构定义见
 [`docs/architecture.md`](../docs/architecture.md)，功能验收条件见
@@ -48,7 +48,10 @@ workload 或 profile 产物；M1/M2/M3 的组件正确性测试仍位于对应 G
 
 在隔离的一次性 Linux/VM 中完成 runtime preflight、启动可用的 `mydockerd`，并将场景中
 所有 `replace-*` 与 `unknown` 环境字段替换为本次实验的真实事实后，调用示例如下：
-这些是 rootful 正确性验收通过后的前置条件；当前仓库尚未提供该验收证据。
+这些是正式 baseline 的前置条件。仓库默认关闭的
+[M3 rootful 套件](../integration/rootful/README.md)已在一次性 KVM 中通过
+none/PID1/exit、loopback/restart/signal 和 OOM correctness 场景；该结果只解锁 M3
+正确性门，不会自动生成 `mydocker-eval` raw JSONL，也不会把测试耗时升级为 benchmark。
 
 ```text
 go run ./evaluation/cmd/mydocker-eval \
@@ -58,13 +61,47 @@ go run ./evaluation/cmd/mydocker-eval \
   --output <new-result.jsonl>
 ```
 
-`--output` 文件以 `0600`、不可覆盖方式新建；每条记录立即编码，运行结束必须成功
-同步文件和父目录并关闭两者，任一失败都会使命令失败。`--output -` 是非持久流，flush、关闭和
-持久性由下游接收方负责。Harness 在执行任何生命周期副作用之前捕获 event stream
-起点，完成后只分页读取该起点之后且属于本次 operation ID 的事件。
-FileStore 默认只保留最近 `8192` 个 event；若样本读取返回 `resume_gap`，该样本缺少完整
-阶段证据，必须作为失败原样保留，不能在同一样本中用空 token 重置后仍宣称测量完整。
-空 token 仅适合显式开始新的观察窗口。
+`--output` 文件以 `0600`、不可覆盖方式新建；每条记录立即编码。末行
+`run_summary` 封印本次流的语义完整性，随后仍必须成功同步文件和父目录并关闭两者，
+命令才会以零状态退出。Summary 无法在自身内部证明发生在它之后的 `fsync`、目录同步、
+关闭或进程退出成功；持久发布必须结合外层采集状态和命令退出状态判断。`--output -`
+是非持久流，flush、关闭和持久性由下游接收方负责。
+
+#### 输入 schema 与原始证据 schema
+
+场景输入和输出记录使用两个互不混用的版本空间：
+
+| 对象 | 当前版本 | 契约 |
+| --- | --- | --- |
+| Scenario 输入 | `schema_version: 1` | 严格 JSON；未知字段、解码后重复 key、字段名大小写别名、非法 UTF-8 或第二个 JSON 值均拒绝 |
+| Raw JSONL 记录 | `schema_version: 2` | 每一行独立解码；当前 record type 为 `caller_span`、`stage_event` 或末行 `run_summary` |
+
+FileStore envelope、API Event 等持久化/传输 schema 另有各自版本；它们与上述两个数字
+相同或不同都不表示可以互换。每条 raw-v2 记录的 `scenario` 都包含 `name`、`version`
+和 `digest_sha256`。该 SHA-256 基于严格解码后的完整 typed Scenario，再进行确定性
+JSON 编码；它不是原始文件字节的 hash。纯空白和 object key 顺序不改变 digest，argv、
+资源、环境声明或其他任一语义字段变化都会改变 digest。只比较场景名称和版本不足以
+证明输入相同。
+
+#### 样本、warmup 与增量事件证据
+
+当前 harness 只允许 `concurrency: 1`，`samples` 范围为 `1..100`。Cold 场景必须省略
+`warmup_attempts` 或将其置零；warm 场景必须显式设置 `warmup_attempts: 1..100`。
+Warm 场景先创建一个 Ready Sandbox，再对每个 warmup 执行完整但不计入正式样本的
+`CreateContainer -> StartContainer -> KillContainer -> DeleteContainer` Attempt；只有这些
+warmup 全部成功并清理后，才开始同一 Sandbox 内的正式 Attempt。Warmup 的 caller/event
+原始证据仍会保留，并以 `classification: "warmup"` 区分，但不会增加 summary 的
+`formal_samples`。
+
+Harness 在任何生命周期副作用之前捕获 event stream 起点，随后在 cold 的每个正式样本、
+warm 的 Sandbox setup、每个 warmup Attempt、每个正式 Attempt 和最终 cleanup 后增量分页
+读取事件，结束前再执行一次最终 drain。它只写出该起点之后且属于本次 operation ID 的
+事件；`events.capture_start`/`events.collect` 有自己的 caller span，但 drain 发生在正式
+E2E 样本边界之外，不能计入启动延迟。`samples`/`warmup_attempts` 的上限和逐阶段 drain
+缩短了 retention 窗口，但不能把丢失证据解释为成功。FileStore 默认只保留最近
+`8192` 个 event；若读取返回
+`resume_gap`，该运行必须失败并保留已有证据，不能用空 token 重置后仍宣称完整。空 token
+只适合显式开始新的观察窗口。
 
 每个成功样本同时保留逐 API `caller_span` 和一个不可拆分的 E2E `caller_span`：
 
@@ -75,9 +112,19 @@ FileStore 默认只保留最近 `8192` 个 event；若样本读取返回 `resume
 - E2E 记录的 `operation_ids` 按请求顺序关联组成该跨度的多个 durable operation；
   daemon stage-event duration 仍单独记录，不能与调用方时间相减或混为一项。
 
-Event 的 `duration_ns` 是可选证据。Harness 原样保留缺失字段，不得将其变成零样本；
-新 intent 的同进程 provider stage/complete duration 可作为 daemon 侧分解，resume、
-recovery 与纯 persistence bookkeeping 可以没有 duration。exact replay 不产生新测量。
+Raw-v2 caller span 的 `duration_ns` 在实现中是 `*int64`：字段缺失表示没有可用测量，
+显式 `0` 表示两个有效、相等的同进程时钟边界确实测得 `0 ns`。任一边界为 Go 零值或
+结束边界早于开始边界时，harness 会写出没有 duration、`success: false` 的 caller span，
+并以非零状态失败；不得把无效时钟转换为零样本。Caller span 和 `run_summary` 的
+`success` 同样使用指针，以便失败时显式写出 `false`。`stage_event` 不写顶层
+`success`，尤其不能把 pending stage 误解为成功；其语义来自嵌套 Event 的 `stage` 和
+`result`。
+
+嵌套 Event 的 `duration_ns` 也是可选证据。Harness 原样保留缺失字段，不得将其变成
+零样本；新 intent 的同进程 provider stage/complete duration 可作为 daemon 侧分解，
+resume、recovery 与纯 persistence bookkeeping 可以没有 duration。Exact replay 不产生
+新测量。
+
 FileStore schema-v3 会在完整校验后，把旧 schema-v1/v2 文件中由早期 writer 固定写出的
 `duration_ns: 0` 迁移为缺失，再以 event schema-v2 原子重写，因此 daemon API 不会把
 该占位值投影成零样本。脱离 FileStore 迁移链保存的旧 API/JSONL 原始证据仍无法事后
@@ -88,12 +135,63 @@ Sandbox/Container ID 和 create operation ID 都在第一次发送前产生。Cr
 Kill/Delete/Stop；这些清理各自使用新的幂等 operation ID。若原 operation 尚 active，
 清理可能返回冲突；该失败会保留在 JSONL 且命令非零退出，不能把它解释为清理完成。
 
-每条记录携带同一份运行前环境快照：commit/build 设置、工作树状态和有界摘要、kernel、
+每条记录携带同一份运行前环境快照。Harness 构造客户端后，必须先成功调用只读
+`GET /v1/info`，再创建输出文件、捕获 event 起点或发送任何生命周期请求；Info 传输或
+schema 校验失败时不会留下缺少 daemon 身份的 raw 流，也不会触发 workload 副作用。
+`daemon_build.source` 固定为 `daemon_binary_go_build_info`，内容只来自正在运行的
+`mydockerd` 二进制 `debug.ReadBuildInfo`，不会读取 daemon 启动目录的 Git。
+`unavailable: true` 及有界 `unavailable_reason` 是可记录的真实结果，此时实验仍可作为
+debug evidence 运行。
+
+`evaluator_build_commit` 和 `evaluator_build` 同样只来自正在运行的 evaluator 二进制的
+Go build info；`operator_worktree`（包括 `head`、branch、status 和有界摘要）只描述启动
+命令所在的操作者 Git 上下文，绝不回填任一 binary revision。其余快照包括 kernel、
 cgroup v2 路径与 controllers、CPU、memory、结果文件所在 storage、显式 cache 声明、
 concurrency、实验开始时间和 timezone。Harness 只读采集 Git/procfs/sysfs；无法读取或
-无法可靠推断的字段写为 `unknown`，不会以空值冒充事实。Cache/content/snapshot 字段是
-场景声明而非 harness 独立验证；签入场景中的 `unknown` 必须在正式 benchmark 前按真实
-preflight 证据更新，否则该运行只能归类为调试记录。
+可靠推断的字段写为 `unknown`，不会以空值冒充事实。
+
+Cache/content/snapshot 字段是场景声明而非 harness 独立验证。签入场景的
+`environment.labels.result_kind` 为 `raw-debug-evidence`；其中的 `unknown`/`replace-*`
+必须在正式实验前按真实 preflight 证据更新。Baseline gate 会统一检查 environment ID、
+cache 五项、labels 的 key/value、`background_noise` 的明确 `none` vocabulary，以及 cold
+的 `warmup: none` 或单次 warm 场景的完整 warmup vocabulary；任一未解析值只产生同一个
+有界原因 `scenario_environment_placeholder`。若场景保留 `result_kind`，正式基线还必须
+将它显式声明为 `raw-baseline-evidence`；签入的 `raw-debug-evidence` 会单独产生有界原因
+`scenario_declares_debug_evidence`。修改该 label 也不能绕过其他事实检查。
+
+#### 已发送 operation 与末行 summary
+
+每个已经发送的公共生命周期 operation 都必须在本次拥有的事件流中恰好出现一个
+`stage: "complete"`；请求返回错误或响应丢失也不能把它从完整性统计中删除。对于 API
+返回成功的 operation，terminal `result` 只能是 `succeeded` 或 `noop`。缺少 complete 以
+`unavailable` 失败；成功 API 对应非成功 terminal result，或同一 operation 出现重复
+complete，则作为内部证据冲突失败。任何事件分页、resume 或完整性错误都会使
+`event_evidence_complete` 为 `false`。
+
+成功写出的最后一行固定为 `record_type: "run_summary"`、`phase: "run.complete"`，其中：
+
+- `completed` 表示 JSONL 已到达语义封印点，不表示随后持久发布已经成功；
+- `lifecycle_success` 表示场景 setup、warmup、正式样本和 cleanup 均无 lifecycle 错误，
+  且完成的正式样本数等于 `samples`；
+- `event_evidence_complete` 独立表示事件收集/完整性无错误，且每个已发送 operation 都有
+  上述唯一 terminal complete；
+- `expected_operations`/`completed_operations` 分别统计所有已发送、要求 terminal
+  证据的 operation 及已确认数量；
+- `formal_samples` 只统计完成的正式样本，不含 warmup；若早期 event 错误阻止后续正式
+  样本执行，即使已执行部分的 API 成功，`lifecycle_success` 仍为 `false`；
+- 顶层 `success` 表示 lifecycle、事件和 summary 写入前错误的组合结果；
+- `baseline_eligible`、`evidence_quality` 和有界 `ineligibility_reasons` 给出机器可读的
+  证据等级。
+
+因此，所有 API 生命周期成功但缺少一个 complete event 时，`lifecycle_success` 可以为
+`true`，而 `event_evidence_complete` 必须为 `false`；两者不能合并成一个模糊状态。
+Baseline 资格要求 daemon/evaluator 两个二进制的 VCS revision 都是真实、非 `unknown`
+且完全相同，并且两侧 `vcs.modified` 都可判定且为 `false`。revision 不可用、revision
+不一致、daemon 或 evaluator 任一 modified 为 `true` 都会产生各自有界原因；正常为空的
+Go `Main.Sum` 或 build tags 不构成永久拒绝条件。场景环境仍有占位声明、运行失败或 event
+证据不完整时也会增加对应原因。只有 reasons 为空时才写
+`baseline_eligible: true`、`evidence_quality: "baseline"`，否则保持 `debug`。Summary 只能
+证明上述语义事实；文件 `fsync`/close、目录同步和命令退出状态仍由外层持久发布流程负责。
 
 ## 2. 评测分类
 
@@ -379,8 +477,9 @@ pull 隐藏在这一个不透明数字中。
 
 当前签入并通过纯 fake correctness 测试的输入是
 `prepared-rootfs-loopback-cold.json` 与 `prepared-rootfs-loopback-warm.json`；
-这表示场景/harness 代码存在，不表示真实 kernel 场景已运行或测量。下列名称及其
-数字后缀仍是未来配置，不是已完成结果。
+两者的 `environment.labels.result_kind` 都是 `raw-debug-evidence`。这表示
+场景/harness 代码存在，不表示真实 kernel 场景已运行或测量，更不表示已经建立
+baseline。下列名称及其数字后缀仍是未来配置，不是已完成结果。
 
 ### mydocker
 
@@ -435,10 +534,11 @@ distribution、scheduler policy、Lease 配置、故障时机和收敛条件。
 ```text
 experiment_id
 scenario name and version
-git branch
-git commit SHA
+scenario digest_sha256
+evaluator binary build commit and build settings
+operator worktree head, branch, status and diff references
+daemon binary Go/VCS build identity from GET /v1/info, including unavailable reason
 runtime base commit (cluster experiments)
-dirty worktree status and diff reference when dirty
 Go version
 build flags, tags, CGO/race/profiling settings
 Linux distribution
@@ -472,7 +572,8 @@ raw result location and checksum/reference
 
 ## 7. 结果格式与状态
 
-当前 M3 harness 先生成不可覆盖的逐行 JSONL 原始观察；每次正式实验还必须保存：
+当前 M3 harness 接受 scenario schema-v1，并生成不可覆盖的 raw JSONL schema-v2
+原始观察；每次正式实验还必须保存：
 
 ```text
 人类可读摘要（README.md 或 summary.md）
@@ -483,12 +584,14 @@ raw result location and checksum/reference
 ```
 
 原始观察必须保留成功、失败、重试、timeout 和样本顺序；摘要引用原始数据，不能
-替代原始数据。
+替代原始数据。JSONL 末行 `run_summary` 是机器可读的语义完整性封印，但不能替代
+外层 `fsync`/close、命令退出状态或结果文件 checksum。
 
 结果至少包含：
 
 - 实验、场景和环境标识；
-- commit SHA 和工作树脏状态；
+- scenario SHA-256、evaluator binary build commit、operator worktree head/脏状态，
+  以及 `GET /v1/info` 返回的 daemon binary identity 或明确 unavailable reason；
 - 指标名、采集渠道（harness、daemon stage event 或 Prometheus）、计时族、
   精确边界/时钟、单位和样本数；
 - warm-up 样本排除规则；
