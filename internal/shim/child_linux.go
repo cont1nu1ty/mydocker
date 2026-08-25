@@ -23,7 +23,14 @@ import (
 // OSChildRunner uses os/exec to fork one workload child and immediately captures a pidfd strong handle.
 type OSChildRunner struct{}
 
-const descendantWaitOptions = unix.WALL
+const (
+	descendantWaitOptions         = unix.WALL | unix.WNOHANG
+	descendantCleanupTimeout      = 5 * time.Second
+	descendantCleanupPollInterval = 10 * time.Millisecond
+)
+
+var errDirectChildWaitDeadlineExceeded = errors.New("direct workload wait cleanup deadline exceeded")
+var errChildOutputDeadlineExceeded = errors.New("workload output drain deadline exceeded")
 
 // descendantWaiter is the PID1-only wait boundary used after the direct
 // workload status has been collected without competing with exec.Cmd.Wait.
@@ -41,27 +48,89 @@ func (systemDescendantWaiter) WaitForExit() (int, error) {
 	return pid, err
 }
 
+// directChildAbortTarget starts the direct-child wait asynchronously so an
+// uninterruptible child cannot hold the post-exec Start failure path forever.
+// Only that background wait may reap the direct child; PID1 wait4 cleanup does
+// not begin until its completion has been observed.
+type directChildAbortTarget interface {
+	Kill() error
+	BeginWait() <-chan error
+}
+
+// execDirectChildAbortTarget adapts one started exec.Cmd to the bounded abort boundary.
+type execDirectChildAbortTarget struct {
+	command *exec.Cmd
+}
+
+// Kill requests termination of the exact direct child started by exec.Cmd.
+func (target execDirectChildAbortTarget) Kill() error {
+	if target.command == nil || target.command.Process == nil {
+		return errors.New("started workload command is not configured")
+	}
+	return target.command.Process.Kill()
+}
+
+// BeginWait leaves exec.Cmd.Wait running after an abort timeout so the direct
+// child is eventually reaped without a competing wait4 call.
+func (target execDirectChildAbortTarget) BeginWait() <-chan error {
+	done := make(chan error, 1)
+	go func() {
+		if target.command == nil {
+			done <- errors.New("started workload command is not configured")
+			return
+		}
+		done <- unexpectedCommandWaitError(target.command.Wait())
+	}()
+	return done
+}
+
+// descendantReapPolicy bounds nonblocking PID1 cleanup and provides a
+// deterministic clock, sleeper, and repeated-kill seam for failure tests.
+type descendantReapPolicy struct {
+	timeout      time.Duration
+	pollInterval time.Duration
+	now          func() time.Time
+	sleep        func(time.Duration)
+	kill         func() error
+}
+
+// defaultDescendantReapPolicy returns the production bounded cleanup policy.
+func defaultDescendantReapPolicy() descendantReapPolicy {
+	return descendantReapPolicy{
+		timeout: descendantCleanupTimeout, pollInterval: descendantCleanupPollInterval,
+		now: time.Now, sleep: time.Sleep, kill: killNamespaceDescendants,
+	}
+}
+
+// validate rejects a policy that could spin forever or omit repeated process-tree termination.
+func (policy descendantReapPolicy) validate() error {
+	if policy.timeout <= 0 || policy.pollInterval <= 0 || policy.now == nil || policy.sleep == nil || policy.kill == nil {
+		return errors.New("PID1 descendant reap policy is incomplete")
+	}
+	return nil
+}
+
 // Start forks and execs a structured absolute argv without a shell and returns a pidfd-backed Child.
 func (OSChildRunner) Start(process domain.ProcessSpec, stdout, stderr io.Writer) (Child, error) {
 	if err := process.Validate(); err != nil {
-		return nil, err
+		return nil, NewPreExecChildStartError(err)
 	}
 	if stdout == nil || stderr == nil {
-		return nil, errors.New("OS child runner requires stdout and stderr writers")
+		return nil, NewPreExecChildStartError(errors.New("OS child runner requires stdout and stderr writers"))
 	}
 	if !filepath.IsAbs(process.Argv[0]) || filepath.Clean(process.Argv[0]) != process.Argv[0] {
-		return nil, errors.New("OS child executable must be a clean absolute path")
+		return nil, NewPreExecChildStartError(errors.New("OS child executable must be a clean absolute path"))
 	}
 	if os.Getpid() != 1 {
-		return nil, errors.New("OS child runner requires the init wrapper to be PID 1")
+		return nil, NewPreExecChildStartError(errors.New("OS child runner requires the init wrapper to be PID 1"))
 	}
 	stdoutReader, stdoutWriter, err := os.Pipe()
 	if err != nil {
-		return nil, fmt.Errorf("create workload stdout pipe: %w", err)
+		return nil, NewPreExecChildStartError(fmt.Errorf("create workload stdout pipe: %w", err))
 	}
 	stderrReader, stderrWriter, err := os.Pipe()
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("create workload stderr pipe: %w", err), stdoutReader.Close(), stdoutWriter.Close())
+		return nil, NewPreExecChildStartError(errors.Join(fmt.Errorf("create workload stderr pipe: %w", err), stdoutReader.Close(), stdoutWriter.Close()))
 	}
 	command := exec.Command(process.Argv[0], process.Argv[1:]...)
 	command.Env = make([]string, len(process.Environment))
@@ -75,19 +144,21 @@ func (OSChildRunner) Start(process domain.ProcessSpec, stdout, stderr io.Writer)
 	command.Stderr = stderrWriter
 	startedAt := time.Now()
 	if err := command.Start(); err != nil {
-		return nil, errors.Join(fmt.Errorf("fork/exec workload child: %w", err),
-			stdoutReader.Close(), stdoutWriter.Close(), stderrReader.Close(), stderrWriter.Close())
+		return nil, NewPreExecChildStartError(errors.Join(fmt.Errorf("fork/exec workload child: %w", err),
+			stdoutReader.Close(), stdoutWriter.Close(), stderrReader.Close(), stderrWriter.Close()))
 	}
-	stdoutDone := copyChildOutput(stdoutReader, durableStdout)
-	stderrDone := copyChildOutput(stderrReader, durableStderr)
+	stdoutCopy := copyChildOutput(stdoutReader, durableStdout)
+	stderrCopy := copyChildOutput(stderrReader, durableStderr)
 	if err := errors.Join(stdoutWriter.Close(), stderrWriter.Close()); err != nil {
-		abortErr := abortStartedChild(command, systemDescendantWaiter{}, stdoutDone, stderrDone)
-		return nil, errors.Join(errors.New("close parent workload output descriptors"), err, abortErr)
+		quiescent, abortErr := abortStartedChild(command, systemDescendantWaiter{}, stdoutCopy, stderrCopy)
+		return nil, NewExecutedChildStartError(
+			errors.Join(errors.New("close parent workload output descriptors"), err, abortErr), quiescent,
+		)
 	}
 	pidfd, err := unix.PidfdOpen(command.Process.Pid, 0)
 	if err != nil {
-		abortErr := abortStartedChild(command, systemDescendantWaiter{}, stdoutDone, stderrDone)
-		return nil, errors.Join(fmt.Errorf("capture workload pidfd: %w", err), abortErr)
+		quiescent, abortErr := abortStartedChild(command, systemDescendantWaiter{}, stdoutCopy, stderrCopy)
+		return nil, NewExecutedChildStartError(errors.Join(fmt.Errorf("capture workload pidfd: %w", err), abortErr), quiescent)
 	}
 	evidence, err := ownership.EvidenceDigest(struct {
 		PID        int       `json:"pid"`
@@ -96,49 +167,154 @@ func (OSChildRunner) Start(process domain.ProcessSpec, stdout, stderr io.Writer)
 	}{command.Process.Pid, process.Argv[0], startedAt})
 	if err != nil {
 		_ = unix.Close(pidfd)
-		abortErr := abortStartedChild(command, systemDescendantWaiter{}, stdoutDone, stderrDone)
-		return nil, errors.Join(err, abortErr)
+		quiescent, abortErr := abortStartedChild(command, systemDescendantWaiter{}, stdoutCopy, stderrCopy)
+		return nil, NewExecutedChildStartError(errors.Join(err, abortErr), quiescent)
 	}
 	return &osChild{
 		command: command, pidfd: pidfd, startedAt: startedAt,
 		stdout: durableStdout, stderr: durableStderr,
-		stdoutDone: stdoutDone, stderrDone: stderrDone, reaper: systemDescendantWaiter{},
+		stdoutCopy: stdoutCopy, stderrCopy: stderrCopy, reaper: systemDescendantWaiter{},
 		killDescendants: killNamespaceDescendants,
 		identity:        ChildIdentity{Handle: "pidfd-" + strconv.Itoa(pidfd), EvidenceSHA256: evidence},
 	}, nil
 }
 
+// childOutputCopy owns one explicit read descriptor and completion channel so
+// failed descendant cleanup can cancel inherited-writer drainage deterministically.
+type childOutputCopy struct {
+	reader     *os.File
+	done       <-chan error
+	cancelOnce sync.Once
+	cancelErr  error
+}
+
 // copyChildOutput drains one explicit child pipe independently from direct
 // process waiting so inherited descriptors cannot postpone descendant cleanup.
-func copyChildOutput(reader *os.File, writer *stickyErrorWriter) <-chan error {
+func copyChildOutput(reader *os.File, writer *stickyErrorWriter) *childOutputCopy {
 	done := make(chan error, 1)
 	go func() {
 		_, copyErr := io.Copy(writer, reader)
 		done <- errors.Join(copyErr, reader.Close())
 	}()
-	return done
+	return &childOutputCopy{reader: reader, done: done}
 }
 
-// awaitChildOutput joins both bounded copy results after PID1 has killed and reaped every descendant.
-func awaitChildOutput(stdoutDone, stderrDone <-chan error) error {
-	if stdoutDone == nil || stderrDone == nil {
+// cancel closes the read descriptor once so a writer retained by an
+// unquiescent process tree cannot make the wrapper wait without bound.
+func (copy *childOutputCopy) cancel() error {
+	if copy == nil || copy.reader == nil {
+		return errors.New("workload output copy is not configured")
+	}
+	copy.cancelOnce.Do(func() {
+		copy.cancelErr = copy.reader.Close()
+		if errors.Is(copy.cancelErr, os.ErrClosed) {
+			copy.cancelErr = nil
+		}
+	})
+	return copy.cancelErr
+}
+
+// awaitChildOutput joins both copy results within one explicit budget. Closing
+// readers interrupts a pipe read, while the deadline also prevents a durable
+// sink blocked in Write from holding terminal publication forever.
+func awaitChildOutput(stdoutCopy, stderrCopy *childOutputCopy, cancel bool, maximum time.Duration) error {
+	if stdoutCopy == nil || stderrCopy == nil || stdoutCopy.done == nil || stderrCopy.done == nil {
 		return errors.New("workload output copy completion is not configured")
 	}
-	return errors.Join(<-stdoutDone, <-stderrDone)
+	if maximum <= 0 {
+		return errors.Join(errChildOutputDeadlineExceeded, cancelChildOutput(stdoutCopy, stderrCopy))
+	}
+	var cancelErr error
+	if cancel {
+		cancelErr = cancelChildOutput(stdoutCopy, stderrCopy)
+	}
+	timer := time.NewTimer(maximum)
+	defer timer.Stop()
+	stdoutDone := stdoutCopy.done
+	stderrDone := stderrCopy.done
+	var stdoutErr error
+	var stderrErr error
+	for stdoutDone != nil || stderrDone != nil {
+		select {
+		case result, ok := <-stdoutDone:
+			stdoutDone = nil
+			if !ok {
+				stdoutErr = errors.New("workload stdout copy closed without a result")
+			} else {
+				stdoutErr = result
+			}
+		case result, ok := <-stderrDone:
+			stderrDone = nil
+			if !ok {
+				stderrErr = errors.New("workload stderr copy closed without a result")
+			} else {
+				stderrErr = result
+			}
+		case <-timer.C:
+			return errors.Join(cancelErr, stdoutErr, stderrErr, errChildOutputDeadlineExceeded, cancelChildOutput(stdoutCopy, stderrCopy))
+		}
+	}
+	return errors.Join(cancelErr, stdoutErr, stderrErr)
+}
+
+// cancelChildOutput closes both read descriptors without waiting for a
+// potentially blocked durable sink, allowing an unconfirmed abort to return.
+func cancelChildOutput(stdoutCopy, stderrCopy *childOutputCopy) error {
+	if stdoutCopy == nil || stderrCopy == nil {
+		return errors.New("workload output copy is not configured")
+	}
+	return errors.Join(stdoutCopy.cancel(), stderrCopy.cancel())
 }
 
 // abortStartedChild kills one unpublishable direct child, destroys every
-// remaining namespace descendant, and drains output before Start returns an error.
-func abortStartedChild(command *exec.Cmd, reaper descendantWaiter, stdoutDone, stderrDone <-chan error) error {
+// remaining namespace descendant, drains output, and returns an independent
+// ECHILD-based process-tree quiescence fact before Start reports failure.
+func abortStartedChild(command *exec.Cmd, reaper descendantWaiter, stdoutCopy, stderrCopy *childOutputCopy) (bool, error) {
 	if command == nil || command.Process == nil {
-		return errors.New("started workload command is not configured")
+		return false, errors.New("started workload command is not configured")
 	}
-	killErr := command.Process.Kill()
+	return abortStartedChildWithPolicy(
+		execDirectChildAbortTarget{command: command}, reaper, stdoutCopy, stderrCopy,
+		defaultDescendantReapPolicy(),
+	)
+}
+
+// abortStartedChildWithPolicy applies one cleanup deadline to the direct wait
+// and all later PID1 descendant cleanup. A direct-wait timeout deliberately
+// skips wait4 so two waiters can never race to reap the same child.
+func abortStartedChildWithPolicy(target directChildAbortTarget, reaper descendantWaiter, stdoutCopy, stderrCopy *childOutputCopy, policy descendantReapPolicy) (bool, error) {
+	if target == nil {
+		return false, errors.New("started workload abort target is not configured")
+	}
+	if err := policy.validate(); err != nil {
+		return false, err
+	}
+	deadline := policy.now().Add(policy.timeout)
+	killErr := target.Kill()
 	if errors.Is(killErr, os.ErrProcessDone) {
 		killErr = nil
 	}
-	waitErr := unexpectedCommandWaitError(command.Wait())
-	return errors.Join(killErr, waitErr, killNamespaceDescendants(), reapDescendants(reaper), awaitChildOutput(stdoutDone, stderrDone))
+	waitDone := target.BeginWait()
+	remaining := deadline.Sub(policy.now())
+	if remaining <= 0 {
+		return false, errors.Join(killErr, errDirectChildWaitDeadlineExceeded, cancelChildOutput(stdoutCopy, stderrCopy))
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	var waitErr error
+	select {
+	case completedErr, ok := <-waitDone:
+		if !ok {
+			return false, errors.Join(killErr, errors.New("direct workload wait closed without a result"), cancelChildOutput(stdoutCopy, stderrCopy))
+		}
+		waitErr = completedErr
+	case <-timer.C:
+		return false, errors.Join(killErr, errDirectChildWaitDeadlineExceeded, cancelChildOutput(stdoutCopy, stderrCopy))
+	}
+	descendantKillErr := policy.kill()
+	reapErr := reapDescendantsUntil(reaper, policy, deadline)
+	outputBudget := deadline.Sub(policy.now())
+	return reapErr == nil, errors.Join(killErr, waitErr, descendantKillErr, reapErr, awaitChildOutput(stdoutCopy, stderrCopy, reapErr != nil, outputBudget))
 }
 
 // unexpectedCommandWaitError filters the expected non-zero or signaled direct
@@ -167,20 +343,56 @@ func killNamespaceDescendants() error {
 // reapDescendants waits until the PID namespace contains no adopted child,
 // retrying interrupted waits and rejecting impossible non-positive results.
 func reapDescendants(reaper descendantWaiter) error {
+	return reapDescendantsWithPolicy(reaper, defaultDescendantReapPolicy())
+}
+
+// reapDescendantsWithPolicy repeats kill and nonblocking wait4 until __WALL
+// reports ECHILD, or fails closed at a bounded deadline without claiming the
+// process tree is quiescent.
+func reapDescendantsWithPolicy(reaper descendantWaiter, policy descendantReapPolicy) error {
 	if reaper == nil {
 		return errors.New("PID1 descendant reaper is not configured")
 	}
+	if err := policy.validate(); err != nil {
+		return err
+	}
+	deadline := policy.now().Add(policy.timeout)
+	return reapDescendantsUntil(reaper, policy, deadline)
+}
+
+// reapDescendantsUntil consumes only the portion of an existing cleanup budget
+// left after the direct child has been reaped.
+func reapDescendantsUntil(reaper descendantWaiter, policy descendantReapPolicy, deadline time.Time) error {
+	if reaper == nil {
+		return errors.New("PID1 descendant reaper is not configured")
+	}
+	if err := policy.validate(); err != nil {
+		return err
+	}
+	var repeatedKillErr error
 	for {
 		pid, err := reaper.WaitForExit()
+		if errors.Is(err, unix.ECHILD) {
+			return nil
+		}
+		if !policy.now().Before(deadline) {
+			return errors.Join(errors.New("PID1 descendant cleanup deadline exceeded"), repeatedKillErr, err)
+		}
 		switch {
 		case errors.Is(err, unix.EINTR):
 			continue
-		case errors.Is(err, unix.ECHILD):
-			return nil
 		case err != nil:
 			return fmt.Errorf("reap PID1 descendant: %w", err)
-		case pid <= 0:
-			return errors.New("PID1 descendant wait returned no process")
+		case pid > 0:
+			continue
+		case pid < 0:
+			return errors.New("PID1 descendant wait returned an invalid process")
+		default:
+			killErr := policy.kill()
+			if killErr != nil && !errors.Is(killErr, unix.ESRCH) {
+				repeatedKillErr = errors.Join(repeatedKillErr, killErr)
+			}
+			policy.sleep(policy.pollInterval)
 		}
 	}
 }
@@ -229,8 +441,8 @@ type osChild struct {
 	identity        ChildIdentity
 	stdout          *stickyErrorWriter
 	stderr          *stickyErrorWriter
-	stdoutDone      <-chan error
-	stderrDone      <-chan error
+	stdoutCopy      *childOutputCopy
+	stderrCopy      *childOutputCopy
 	reaper          descendantWaiter
 	killDescendants func() error
 	waitMu          sync.Mutex
@@ -263,7 +475,7 @@ func (child *osChild) Wait() (ChildExitEvidence, error) {
 		killDescendantsErr = child.killDescendants()
 	}
 	reapErr := reapDescendants(child.reaper)
-	outputErr := awaitChildOutput(child.stdoutDone, child.stderrDone)
+	outputErr := awaitChildOutput(child.stdoutCopy, child.stderrCopy, reapErr != nil, descendantCleanupTimeout)
 	var resultErr error
 	startedAt, finishedAt, runningDuration := durableExecutionWindow(child.startedAt, directFinishedAt)
 	child.stateMu.Lock()

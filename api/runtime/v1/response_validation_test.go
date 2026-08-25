@@ -12,6 +12,7 @@ import (
 // TestResponseValidationAcceptsBoundedDTOs verifies each lifecycle resource and
 // list response accepts complete v1 identity, phase, generation, and operation data.
 func TestResponseValidationAcceptsBoundedDTOs(t *testing.T) {
+	modified := false
 	sandbox := validSandboxResponse("sandbox-one", "operation-sandbox")
 	container := validContainerResponse("container-one", "sandbox-one", "attempt-one", "operation-container")
 	event := validResponseEvent(1)
@@ -24,6 +25,7 @@ func TestResponseValidationAcceptsBoundedDTOs(t *testing.T) {
 		name     string
 		validate func() error
 	}{
+		{name: "Info", validate: (InfoResponse{DaemonBuild: DaemonBuildIdentity{Source: DaemonBuildIdentitySource, VCSRevision: "revision-one", VCSModified: &modified}}).Validate},
 		{name: "Sandbox", validate: sandbox.Validate},
 		{name: "Sandbox list", validate: (SandboxListResponse{Sandboxes: []Sandbox{sandbox.Sandbox}}).Validate},
 		{name: "Container", validate: container.Validate},
@@ -40,6 +42,29 @@ func TestResponseValidationAcceptsBoundedDTOs(t *testing.T) {
 				t.Fatalf("Validate() error = %v", err)
 			}
 		})
+	}
+}
+
+// TestDaemonBuildIdentityValidationRejectsContradictions verifies availability and source fields fail closed.
+func TestDaemonBuildIdentityValidationRejectsContradictions(t *testing.T) {
+	modified := false
+	tests := []DaemonBuildIdentity{
+		{},
+		{Source: DaemonBuildIdentitySource, VCSRevision: "unknown", VCSModified: &modified},
+		{Source: DaemonBuildIdentitySource, VCSRevision: "revision-one"},
+		{Source: DaemonBuildIdentitySource, Unavailable: true},
+		{Source: DaemonBuildIdentitySource, Unavailable: true, UnavailableReason: "future_reason"},
+	}
+	for index, identity := range tests {
+		if err := identity.Validate(); err == nil {
+			t.Fatalf("identity[%d] unexpectedly validated: %#v", index, identity)
+		}
+	}
+	validUnavailable := DaemonBuildIdentity{
+		Source: DaemonBuildIdentitySource, Unavailable: true, UnavailableReason: DaemonBuildUnavailableBuildInfo,
+	}
+	if err := validUnavailable.Validate(); err != nil {
+		t.Fatalf("valid unavailable identity error = %v", err)
 	}
 }
 

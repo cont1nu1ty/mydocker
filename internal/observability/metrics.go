@@ -53,6 +53,12 @@ func (labels MetricLabels) Validate() error {
 	if !labels.Operation.Valid() || !labels.Stage.Valid() || !labels.Result.Valid() || !labels.Reason.Valid() {
 		return errors.New("metric labels must use bounded operation, stage, result, and reason values")
 	}
+	if labels.Result == operation.ResultFailed && labels.Reason == operation.ReasonNone {
+		return errors.New("failed metric result must use a bounded failure reason")
+	}
+	if labels.Result != operation.ResultFailed && labels.Reason != operation.ReasonNone {
+		return errors.New("non-failed metric result must use reason none")
+	}
 	return nil
 }
 

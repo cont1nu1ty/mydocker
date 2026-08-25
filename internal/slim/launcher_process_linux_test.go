@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -57,6 +59,25 @@ func TestOSProcessFactoryClosesTransferredFDOnPreStartFailure(t *testing.T) {
 	// Mark the os.File wrapper closed after the raw transferred descriptor was
 	// consumed so its finalizer cannot later close an unrelated reused number.
 	_ = reader.Close()
+}
+
+// TestTerminateUnpublishedCommandIsBounded verifies a post-exec construction
+// failure cannot make ProcessFactory.Start wait forever when termination has
+// not yet made the exact child waitable.
+func TestTerminateUnpublishedCommandIsBounded(t *testing.T) {
+	command := exec.Command("/bin/sh", "-c", "exec sleep 30")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = command.Process.Kill() }()
+	startedAt := time.Now()
+	err := terminateUnpublishedCommand(command, func() error { return nil }, 10*time.Millisecond)
+	if !errors.Is(err, errUnpublishedCleanupTimeout) {
+		t.Fatalf("cleanup error=%v, want timeout", err)
+	}
+	if elapsed := time.Since(startedAt); elapsed > time.Second {
+		t.Fatalf("bounded cleanup took %s", elapsed)
+	}
 }
 
 // TestStartedProcessAbortIsConcurrentAndIdempotent verifies one exact signal,

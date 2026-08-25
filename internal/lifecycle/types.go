@@ -162,12 +162,13 @@ type ContainerConfirmRequest struct {
 
 // ContainerStartTerminalRequest records a wrapper terminal fact observed after gate release but before Running confirmation.
 type ContainerStartTerminalRequest struct {
-	OperationID  operation.OperationID
-	ContainerID  domain.ContainerID
-	Fingerprint  operation.RequestFingerprint
-	Outcome      domain.Outcome
-	Conditions   []domain.Condition
-	Verification Verification
+	OperationID     operation.OperationID
+	ContainerID     domain.ContainerID
+	Fingerprint     operation.RequestFingerprint
+	Outcome         domain.Outcome
+	OperationFailed bool
+	Conditions      []domain.Condition
+	Verification    Verification
 }
 
 // Failure identifies a bounded terminal operation cause while detailed provider diagnostics remain in events.

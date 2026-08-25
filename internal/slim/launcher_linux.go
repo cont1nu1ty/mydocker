@@ -40,7 +40,6 @@ type LinuxShimLauncher struct {
 	readinessTimeout time.Duration
 	cleanupTimeout   time.Duration
 	pollInterval     time.Duration
-	operationLocks   sync.Map
 }
 
 // linuxShimLauncherConfig exposes production seams only to package tests; all
@@ -205,8 +204,7 @@ func (launcher *LinuxShimLauncher) validateKeeperLaunch(ctx context.Context, req
 // ownerOperationLock serializes complete launch/recovery/socket cleanup for one
 // owner so a successful reset cannot race a second process into the same socket path.
 func (launcher *LinuxShimLauncher) ownerOperationLock(token string) *sync.Mutex {
-	value, _ := launcher.operationLocks.LoadOrStore(token, &sync.Mutex{})
-	return value.(*sync.Mutex)
+	return sharedOwnerOperationLock(launcher.runtimeRoot, token)
 }
 
 // launchKeeper performs one gated fork and keeps abort authority until strong
@@ -371,7 +369,7 @@ func (launcher *LinuxShimLauncher) relaunchAbsentKeeper(ctx context.Context, req
 }
 
 // waitKeeperLeafEmpty bounds restart convergence while an unjournaled gated
-// child exits through pipe EOF or Pdeathsig; raw member PIDs never authorize an action.
+// child exits through release-pipe EOF; raw member PIDs never authorize an action.
 func (launcher *LinuxShimLauncher) waitKeeperLeafEmpty(ctx context.Context, sandboxID domain.SandboxID) error {
 	waitContext, cancel := boundedLauncherContext(ctx, launcher.readinessTimeout)
 	defer cancel()
@@ -590,13 +588,19 @@ func minimalShimEnvironment() []string {
 // EnsureInit durably launches or rediscovers the Attempt PID1 bootstrap after
 // validating its cgroup, closed gate, streams, and three exact keeper namespaces.
 func (launcher *LinuxShimLauncher) EnsureInit(ctx context.Context, request InitLaunch) (LaunchedProcess, error) {
-	bootstrapEvidence, err := launcher.validateInitLaunch(ctx, request)
-	if err != nil {
+	if launcher == nil {
+		return LaunchedProcess{}, errors.New("Linux shim launcher is not configured")
+	}
+	if err := request.Owner.Validate(); err != nil {
 		return LaunchedProcess{}, err
 	}
 	lock := launcher.ownerOperationLock(request.Owner.Token)
 	lock.Lock()
 	defer lock.Unlock()
+	bootstrapEvidence, err := launcher.validateInitLaunch(ctx, request)
+	if err != nil {
+		return LaunchedProcess{}, err
+	}
 	store, err := newLaunchStore(request.Paths, request.Owner)
 	if err != nil {
 		return LaunchedProcess{}, err
@@ -677,10 +681,10 @@ func (launcher *LinuxShimLauncher) validateInitLaunch(ctx context.Context, reque
 	if err != nil {
 		return "", err
 	}
-	if err := validateInitArtifact(artifacts, request.Owner, request.Gate, ownership.KindStartGate, request.AttemptID, "closed"); err != nil {
+	if err := validateInitArtifact(artifacts, request.Owner, request.Gate, ownership.KindStartGate, request.AttemptID, artifactStateClosed); err != nil {
 		return "", err
 	}
-	if err := validateInitArtifact(artifacts, request.Owner, request.Streams, ownership.KindStreams, request.AttemptID, "ready"); err != nil {
+	if err := validateInitArtifact(artifacts, request.Owner, request.Streams, ownership.KindStreams, request.AttemptID, artifactStateReady); err != nil {
 		return "", err
 	}
 	return initBootstrapEvidence(request)

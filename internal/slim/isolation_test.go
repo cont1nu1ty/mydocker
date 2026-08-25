@@ -246,7 +246,7 @@ func TestIsolationProviderRejectsEnvironmentBeforeLauncherEffects(t *testing.T) 
 	sandboxOwner := testOwner(t, "sandbox-invalid-environment", operation.TargetSandbox, "sandbox-invalid-environment")
 	keeper, err := fixture.provider.EnsureKeeperProcess(ctx, providerapi.KeeperProcessRequest{
 		Owner: sandboxOwner, SandboxID: "sandbox-invalid-environment",
-		Cgroup: fakeCgroupReceipt(sandboxOwner, ownership.KindKeeperCgroup),
+		Cgroup: fakeCgroupReceipt(t, sandboxOwner, ownership.KindKeeperCgroup, "sandbox-invalid-environment", ""),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -281,7 +281,7 @@ func TestInspectLauncherPreservesObservationClassification(t *testing.T) {
 	owner := testOwner(t, "sandbox-inspect-classification", operation.TargetSandbox, "sandbox-inspect-classification")
 	keeper, err := fixture.provider.EnsureKeeperProcess(context.Background(), providerapi.KeeperProcessRequest{
 		Owner: owner, SandboxID: "sandbox-inspect-classification",
-		Cgroup: fakeCgroupReceipt(owner, ownership.KindKeeperCgroup),
+		Cgroup: fakeCgroupReceipt(t, owner, ownership.KindKeeperCgroup, "sandbox-inspect-classification", ""),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -395,17 +395,20 @@ type fakeShimClient struct {
 }
 
 // Do forwards one request to the registered wrapper without using a Unix socket.
-func (client fakeShimClient) Do(ctx context.Context, path string, request shim.ControlRequest) (shim.ControlResponse, error) {
+func (client fakeShimClient) Do(ctx context.Context, path string, expectedPeerPID int, request shim.ControlRequest) (shim.ControlResponse, int, error) {
 	if err := validateContext(ctx); err != nil {
-		return shim.ControlResponse{}, err
+		return shim.ControlResponse{}, 0, err
+	}
+	if expectedPeerPID != 4242 {
+		return shim.ControlResponse{}, 0, errors.New("fake shim peer differs from expected process evidence")
 	}
 	client.runtime.mu.Lock()
 	wrapper := client.runtime.wrappers[path]
 	client.runtime.mu.Unlock()
 	if wrapper == nil {
-		return shim.ControlResponse{}, errors.New("fake shim endpoint is absent")
+		return shim.ControlResponse{}, 0, errors.New("fake shim endpoint is absent")
 	}
-	return wrapper.HandleControl(request), nil
+	return wrapper.HandleControl(request), 4242, nil
 }
 
 // lossyShimClient drops the first completed signal response so provider retry must use shim's cached result.
@@ -414,16 +417,148 @@ type lossyShimClient struct {
 	lost     atomic.Bool
 }
 
-// Do forwards the side effect exactly once, then injects one post-commit response loss before allowing replay.
-func (client *lossyShimClient) Do(ctx context.Context, path string, request shim.ControlRequest) (shim.ControlResponse, error) {
-	response, err := client.delegate.Do(ctx, path, request)
+// countingShimClient counts physical release requests while delegating every
+// control exchange to the same in-memory wrapper.
+type countingShimClient struct {
+	delegate ShimClient
+	releases atomic.Int32
+}
+
+// Do records only ActionRelease calls so concurrent provider retries can prove
+// the durable gate intent suppresses duplicate physical release requests.
+func (client *countingShimClient) Do(ctx context.Context, path string, expectedPeerPID int, request shim.ControlRequest) (shim.ControlResponse, int, error) {
+	if request.Action == shim.ActionRelease {
+		client.releases.Add(1)
+	}
+	return client.delegate.Do(ctx, path, expectedPeerPID, request)
+}
+
+// lossyReleaseShimClient drops the first completed release response after the
+// wrapper has already consumed its one-shot gate.
+type lossyReleaseShimClient struct {
+	delegate     ShimClient
+	afterRelease func(string)
+	lost         atomic.Bool
+	releases     atomic.Int32
+}
+
+// Do injects the exact response-loss window between workload start and the
+// provider's final released-state publication.
+func (client *lossyReleaseShimClient) Do(ctx context.Context, path string, expectedPeerPID int, request shim.ControlRequest) (shim.ControlResponse, int, error) {
+	response, peerPID, err := client.delegate.Do(ctx, path, expectedPeerPID, request)
+	if request.Action == shim.ActionRelease {
+		client.releases.Add(1)
+		if err == nil && client.lost.CompareAndSwap(false, true) {
+			if client.afterRelease != nil {
+				client.afterRelease(path)
+			}
+			return shim.ControlResponse{}, 0, errors.New("injected release response loss after gate consumption")
+		}
+	}
+	return response, peerPID, err
+}
+
+// preparedFakeAttempt contains the exact receipts needed to exercise one
+// owner-scoped gate release without host namespace or cgroup side effects.
+type preparedFakeAttempt struct {
+	fixture    slimFixture
+	owner      ownership.OwnerKey
+	gate       ownership.Receipt
+	process    ownership.Receipt
+	cgroup     ownership.Receipt
+	rootfs     ownership.Receipt
+	attachment providerapi.AttachmentObservation
+}
+
+// newPreparedFakeAttempt builds a ready Sandbox and one prepared Attempt using
+// the complete fake launcher/provider contract.
+func newPreparedFakeAttempt(t *testing.T, suffix string) preparedFakeAttempt {
+	t.Helper()
+	launcher := &fakeLauncher{runtime: newFakeRuntime()}
+	fixture := newSlimFixture(t, launcher)
+	ctx := context.Background()
+	sandboxID := domain.SandboxID("sandbox-" + suffix)
+	sandboxOwner := testOwner(t, "sandbox-operation-"+suffix, operation.TargetSandbox, string(sandboxID))
+	keeper, err := fixture.provider.EnsureKeeperProcess(ctx, providerapi.KeeperProcessRequest{
+		Owner: sandboxOwner, SandboxID: sandboxID, Cgroup: fakeCgroupReceipt(t, sandboxOwner, ownership.KindKeeperCgroup, sandboxID, ""),
+	})
 	if err != nil {
-		return shim.ControlResponse{}, err
+		t.Fatal(err)
+	}
+	namespaces := make(map[isolation.NamespaceType]ownership.Receipt, 3)
+	for _, namespace := range []isolation.NamespaceType{isolation.NamespaceUTS, isolation.NamespaceIPC, isolation.NamespaceNetwork} {
+		request := providerapi.NamespaceRequest{Owner: sandboxOwner, Process: keeper, Namespace: namespace}
+		if namespace == isolation.NamespaceUTS {
+			request.Hostname = string(sandboxID)
+		}
+		if namespace == isolation.NamespaceNetwork {
+			request.NetworkMode = providerapi.SandboxNetworkLoopback
+		}
+		receipt, err := fixture.provider.EnsureNamespace(ctx, request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt, err = receipt.Adopt()
+		if err != nil {
+			t.Fatal(err)
+		}
+		namespaces[namespace] = receipt
+	}
+	containerID := domain.ContainerID("container-" + suffix)
+	attemptID := domain.AttemptID("attempt-" + suffix)
+	owner := testOwner(t, "container-operation-"+suffix, operation.TargetContainer, string(containerID))
+	gate, err := fixture.provider.EnsureStartGate(ctx, providerapi.AttemptResourceRequest{Owner: owner, AttemptID: attemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	streams, err := fixture.provider.EnsureStreams(ctx, providerapi.AttemptResourceRequest{Owner: owner, AttemptID: attemptID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cgroup := fakeCgroupReceipt(t, owner, ownership.KindAttemptCgroup, sandboxID, attemptID)
+	process, err := fixture.provider.EnsureInitProcess(ctx, providerapi.InitProcessRequest{
+		Owner: owner, SandboxID: sandboxID, AttemptID: attemptID, Cgroup: cgroup, Gate: gate, Streams: streams,
+		SandboxNamespaces: providerapi.SandboxNamespaces{
+			UTS: namespaces[isolation.NamespaceUTS], IPC: namespaces[isolation.NamespaceIPC], Network: namespaces[isolation.NamespaceNetwork],
+		},
+		Process: domain.ProcessSpec{Argv: []string{"/fake/workload"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := fixture.provider.EnsureNamespace(ctx, providerapi.NamespaceRequest{Owner: owner, Process: process, Namespace: isolation.NamespacePID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mount, err := fixture.provider.EnsureNamespace(ctx, providerapi.NamespaceRequest{Owner: owner, Process: process, Namespace: isolation.NamespaceMount})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootfs, err := fixture.provider.EnsureRootfs(ctx, providerapi.RootfsRequest{
+		Owner: owner, AttemptID: attemptID, Process: process, PID: pid, Mount: mount, SourceID: "prepared-one",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	attachment, err := providerapi.NewAttachmentObservation(providerapi.AttachProcessRequest{Owner: owner, Cgroup: cgroup, Process: process})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return preparedFakeAttempt{
+		fixture: fixture, owner: owner, gate: gate, process: process, cgroup: cgroup, rootfs: rootfs, attachment: attachment,
+	}
+}
+
+// Do forwards the side effect exactly once, then injects one post-commit response loss before allowing replay.
+func (client *lossyShimClient) Do(ctx context.Context, path string, expectedPeerPID int, request shim.ControlRequest) (shim.ControlResponse, int, error) {
+	response, peerPID, err := client.delegate.Do(ctx, path, expectedPeerPID, request)
+	if err != nil {
+		return shim.ControlResponse{}, 0, err
 	}
 	if request.Action == shim.ActionSignal && client.lost.CompareAndSwap(false, true) {
-		return shim.ControlResponse{}, errors.New("injected signal response loss after shim commit")
+		return shim.ControlResponse{}, 0, errors.New("injected signal response loss after shim commit")
 	}
-	return response, nil
+	return response, peerPID, nil
 }
 
 // unavailableShimClient returns CodeUnavailable either as a transport failure
@@ -434,14 +569,14 @@ type unavailableShimClient struct {
 
 // Do injects the selected unavailable path while retaining the request ID when
 // the failure is represented by a validated control response.
-func (client unavailableShimClient) Do(_ context.Context, _ string, request shim.ControlRequest) (shim.ControlResponse, error) {
+func (client unavailableShimClient) Do(_ context.Context, _ string, _ int, request shim.ControlRequest) (shim.ControlResponse, int, error) {
 	unavailable := &shim.Error{Code: shim.CodeUnavailable, Message: "injected shim outage"}
 	if !client.response {
-		return shim.ControlResponse{}, unavailable
+		return shim.ControlResponse{}, 0, unavailable
 	}
 	return shim.ControlResponse{
 		SchemaVersion: shim.SchemaVersion, RequestID: request.RequestID, Error: unavailable,
-	}, nil
+	}, 4242, nil
 }
 
 // fakeRequestIDs returns predictable unique request IDs for non-signal test actions.
@@ -548,7 +683,7 @@ func TestIsolationProviderFullFakeContract(t *testing.T) {
 	sandboxOwner := testOwner(t, "sandbox-operation", operation.TargetSandbox, "sandbox-one")
 	keeper, err := fixture.provider.EnsureKeeperProcess(ctx, providerapi.KeeperProcessRequest{
 		Owner: sandboxOwner, SandboxID: "sandbox-one",
-		Cgroup: fakeCgroupReceipt(sandboxOwner, ownership.KindKeeperCgroup),
+		Cgroup: fakeCgroupReceipt(t, sandboxOwner, ownership.KindKeeperCgroup, "sandbox-one", ""),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -625,7 +760,7 @@ func TestIsolationProviderFullFakeContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	attemptCgroup := fakeCgroupReceipt(containerOwner, ownership.KindAttemptCgroup)
+	attemptCgroup := fakeCgroupReceipt(t, containerOwner, ownership.KindAttemptCgroup, "sandbox-one", "attempt-one")
 	initReceipt, err := fixture.provider.EnsureInitProcess(ctx, providerapi.InitProcessRequest{
 		Owner: containerOwner, SandboxID: "sandbox-one", AttemptID: "attempt-one",
 		Cgroup: attemptCgroup, Gate: gate, Streams: streams,
@@ -699,10 +834,40 @@ func TestIsolationProviderFullFakeContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := fixture.provider.ReleaseStartGate(ctx, providerapi.ReleaseGateRequest{
+	releaseRequest := providerapi.ReleaseGateRequest{
 		Owner: containerOwner, Gate: gate, Process: initReceipt, Cgroup: attemptCgroup, Rootfs: rootfs, Attachment: attachment,
-	}); err != nil {
-		t.Fatal(err)
+	}
+	lossyRelease := &lossyReleaseShimClient{delegate: fixture.provider.shim}
+	fixture.provider.shim = lossyRelease
+	if _, err := fixture.provider.ReleaseStartGate(ctx, releaseRequest); err == nil {
+		t.Fatal("post-consumption release response loss was not surfaced")
+	}
+	gateRecord, found, err := fixture.provider.artifacts.Read(containerOwner, ownership.KindStartGate)
+	if err != nil || !found || gateRecord.State != artifactStateConsuming {
+		t.Fatalf("gate after response loss = (%+v, %t, %v), want consuming", gateRecord, found, err)
+	}
+	countingRelease := &countingShimClient{delegate: fakeShimClient{runtime: fixture.runtime}}
+	fixture.provider.shim = countingRelease
+	const concurrentReleases = 16
+	releaseErrors := make(chan error, concurrentReleases)
+	var releaseWait sync.WaitGroup
+	releaseWait.Add(concurrentReleases)
+	for index := 0; index < concurrentReleases; index++ {
+		go func() {
+			defer releaseWait.Done()
+			_, releaseErr := fixture.provider.ReleaseStartGate(ctx, releaseRequest)
+			releaseErrors <- releaseErr
+		}()
+	}
+	releaseWait.Wait()
+	close(releaseErrors)
+	for releaseErr := range releaseErrors {
+		if releaseErr != nil {
+			t.Fatal(releaseErr)
+		}
+	}
+	if initial, retries := lossyRelease.releases.Load(), countingRelease.releases.Load(); initial != 1 || retries != 0 {
+		t.Fatalf("physical shim release calls = initial %d retries %d, want 1 and 0", initial, retries)
 	}
 	running, err := fixture.provider.ObserveAttempt(ctx, providerapi.OwnedReceiptRequest{Owner: containerOwner, Receipt: initReceipt})
 	if err != nil || !running.Running {
@@ -749,7 +914,7 @@ func TestIsolationProviderFullFakeContract(t *testing.T) {
 	}
 	child.exit <- fakeSuccessfulExit(child.identity)
 	terminal := waitForTerminalObservation(t, fixture.provider, containerOwner, initReceipt)
-	if terminal.Outcome.ExitCode == nil || *terminal.Outcome.ExitCode != 0 {
+	if terminal.StartFailed || terminal.Outcome.ExitCode == nil || *terminal.Outcome.ExitCode != 0 {
 		t.Fatalf("terminal outcome=%+v", terminal.Outcome)
 	}
 	processReference, err := fixture.provider.ResolveProcess(ctx, initReceipt)
@@ -783,6 +948,179 @@ func TestIsolationProviderFullFakeContract(t *testing.T) {
 		if err != nil || result.After.Presence != providerapi.PresenceAbsent {
 			t.Fatalf("cleanup=%+v error=%v", result, err)
 		}
+	}
+}
+
+// TestObserveAttemptProjectsLaunchAbortedAsStartFailure verifies an executed
+// but unpublishable workload retains its unknown outcome while explicitly
+// failing the active Start operation rather than masquerading as success.
+func TestObserveAttemptProjectsLaunchAbortedAsStartFailure(t *testing.T) {
+	attempt := newPreparedFakeAttempt(t, "launch-aborted")
+	spec := shim.InitSpec{
+		Owner: attempt.owner, SandboxID: domain.SandboxID(attempt.process.Attributes[sandboxIDAttribute]),
+		ContainerID: domain.ContainerID(attempt.owner.Target.ID), AttemptID: domain.AttemptID(attempt.process.Attributes[attemptIDAttribute]),
+		WrapperEvidence: attempt.process.Attributes[wrapperEvidenceAttribute], Process: domain.ProcessSpec{Argv: []string{"/fake/workload"}},
+	}
+	record, err := shim.NewTerminalRecord(
+		spec, shim.TerminalLaunchAborted, domain.UnknownOutcome(domain.EvidenceUnknown), nil,
+		"strong child handle publication failed after exec", fakeSlimClock{}.Now(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper, err := shim.NewInit(spec, shim.InitDependencies{
+		Runner: &fakeSlimRunner{child: newFakeSlimChild(attempt.owner)}, Stdout: io.Discard, Stderr: io.Discard,
+		Terminal: &fakeSlimTerminal{record: &record}, Clock: fakeSlimClock{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths, err := deriveArtifactPaths(attempt.fixture.root, attempt.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt.fixture.runtime.mu.Lock()
+	attempt.fixture.runtime.wrappers[paths.ControlSocket] = wrapper
+	attempt.fixture.runtime.mu.Unlock()
+	observation, err := attempt.fixture.provider.ObserveAttempt(context.Background(), providerapi.OwnedReceiptRequest{
+		Owner: attempt.owner, Receipt: attempt.process,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !observation.Terminal || !observation.StartFailed || observation.Outcome.Presence != domain.OutcomeUnknown {
+		t.Fatalf("launch-aborted projection = %+v", observation)
+	}
+}
+
+// TestTerminalReasonFailsStartClassifiesOnlyPublicationFailures verifies wait
+// evidence loss after a published child does not retroactively redefine a
+// successful workload start as a start failure.
+func TestTerminalReasonFailsStartClassifiesOnlyPublicationFailures(t *testing.T) {
+	tests := []struct {
+		reason shim.TerminalReason
+		want   bool
+	}{
+		{reason: shim.TerminalStartFailed, want: true},
+		{reason: shim.TerminalLaunchAborted, want: true},
+		{reason: shim.TerminalChildExit, want: false},
+		{reason: shim.TerminalWaitFailed, want: false},
+	}
+	for _, test := range tests {
+		if got := terminalReasonFailsStart(test.reason); got != test.want {
+			t.Fatalf("terminalReasonFailsStart(%q) = %t, want %t", test.reason, got, test.want)
+		}
+	}
+}
+
+// TestReleaseResponseLossWithAbsentWrapperStaysFailClosed verifies an exec'd
+// workload cannot be launched a second time when its init wrapper disappears
+// before the release response and final gate publication reach the daemon.
+func TestReleaseResponseLossWithAbsentWrapperStaysFailClosed(t *testing.T) {
+	attempt := newPreparedFakeAttempt(t, "release-crash")
+	client := &lossyReleaseShimClient{
+		delegate: fakeShimClient{runtime: attempt.fixture.runtime},
+		afterRelease: func(path string) {
+			attempt.fixture.runtime.mu.Lock()
+			delete(attempt.fixture.runtime.wrappers, path)
+			attempt.fixture.runtime.mu.Unlock()
+		},
+	}
+	attempt.fixture.provider.shim = client
+	request := providerapi.ReleaseGateRequest{
+		Owner: attempt.owner, Gate: attempt.gate, Process: attempt.process,
+		Cgroup: attempt.cgroup, Rootfs: attempt.rootfs, Attachment: attempt.attachment,
+	}
+	if _, err := attempt.fixture.provider.ReleaseStartGate(context.Background(), request); err == nil {
+		t.Fatal("release response loss after wrapper disappearance was not surfaced")
+	}
+	if _, err := attempt.fixture.provider.ReleaseStartGate(context.Background(), request); err == nil {
+		t.Fatal("retry unexpectedly released an absent wrapper")
+	}
+	if calls := client.releases.Load(); calls != 1 {
+		t.Fatalf("physical shim release calls = %d, want one", calls)
+	}
+	record, found, err := attempt.fixture.provider.artifacts.Read(attempt.owner, ownership.KindStartGate)
+	if err != nil || !found || record.State != artifactStateConsuming {
+		t.Fatalf("gate after absent-wrapper retry = (%+v, %t, %v), want consuming", record, found, err)
+	}
+	if err := validateInitArtifact(
+		attempt.fixture.provider.artifacts, attempt.owner, attempt.gate, ownership.KindStartGate,
+		domain.AttemptID(attempt.gate.Attributes[attemptIDAttribute]), artifactStateClosed,
+	); err == nil {
+		t.Fatal("launcher prerequisite accepted a consuming gate for init relaunch")
+	}
+	recovered, err := attempt.fixture.provider.EnsureStartGate(context.Background(), providerapi.AttemptResourceRequest{
+		Owner: attempt.owner, AttemptID: domain.AttemptID(attempt.gate.Attributes[attemptIDAttribute]),
+	})
+	if err != nil || recovered.EvidenceSHA256 != attempt.gate.EvidenceSHA256 {
+		t.Fatalf("EnsureStartGate(consuming) = (%+v, %v)", recovered, err)
+	}
+	record, found, err = attempt.fixture.provider.artifacts.Read(attempt.owner, ownership.KindStartGate)
+	if err != nil || !found || record.State != artifactStateConsuming {
+		t.Fatalf("gate after Ensure replay = (%+v, %t, %v), want consuming", record, found, err)
+	}
+	if _, err := attempt.fixture.provider.RemoveProcess(context.Background(), providerapi.OwnedReceiptRequest{
+		Owner: attempt.owner, Receipt: attempt.process,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	removed, err := attempt.fixture.provider.RemoveStartGate(context.Background(), providerapi.OwnedReceiptRequest{
+		Owner: attempt.owner, Receipt: attempt.gate,
+	})
+	if err != nil || removed.After.Presence != providerapi.PresenceAbsent {
+		t.Fatalf("RemoveStartGate(consuming) = (%+v, %v)", removed, err)
+	}
+}
+
+// TestReleaseWaitsForDurableConsumptionIntent verifies a directory-sync
+// uncertainty after publishing consuming prevents the shim side effect until
+// a later retry rediscovers the durable intent.
+func TestReleaseWaitsForDurableConsumptionIntent(t *testing.T) {
+	attempt := newPreparedFakeAttempt(t, "release-sync")
+	counting := &countingShimClient{delegate: fakeShimClient{runtime: attempt.fixture.runtime}}
+	attempt.fixture.provider.shim = counting
+	paths, err := deriveArtifactPaths(attempt.fixture.root, attempt.owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	injected := errors.New("injected consuming directory sync uncertainty")
+	failed := false
+	attempt.fixture.provider.artifacts.syncDirectory = func(path string) error {
+		if filepath.Clean(path) == filepath.Clean(paths.OwnerRoot) && !failed {
+			failed = true
+			return injected
+		}
+		return syncArtifactDirectory(path)
+	}
+	request := providerapi.ReleaseGateRequest{
+		Owner: attempt.owner, Gate: attempt.gate, Process: attempt.process,
+		Cgroup: attempt.cgroup, Rootfs: attempt.rootfs, Attachment: attempt.attachment,
+	}
+	if _, err := attempt.fixture.provider.ReleaseStartGate(context.Background(), request); !errors.Is(err, injected) {
+		t.Fatalf("ReleaseStartGate(sync uncertainty) error = %v, want injected error", err)
+	}
+	if calls := counting.releases.Load(); calls != 0 {
+		t.Fatalf("physical shim release calls after uncertain intent = %d, want zero", calls)
+	}
+	attempt.fixture.provider.artifacts.syncDirectory = func(path string) error {
+		if filepath.Clean(path) == filepath.Clean(paths.OwnerRoot) {
+			return injected
+		}
+		return syncArtifactDirectory(path)
+	}
+	if _, err := attempt.fixture.provider.ReleaseStartGate(context.Background(), request); !errors.Is(err, injected) {
+		t.Fatalf("ReleaseStartGate(confirmation uncertainty) error = %v, want injected error", err)
+	}
+	if calls := counting.releases.Load(); calls != 0 {
+		t.Fatalf("physical shim release calls before confirmed intent = %d, want zero", calls)
+	}
+	attempt.fixture.provider.artifacts.syncDirectory = syncArtifactDirectory
+	if _, err := attempt.fixture.provider.ReleaseStartGate(context.Background(), request); err != nil {
+		t.Fatalf("ReleaseStartGate(retry) error = %v", err)
+	}
+	if calls := counting.releases.Load(); calls != 1 {
+		t.Fatalf("physical shim release calls after durable retry = %d, want one", calls)
 	}
 }
 
@@ -872,12 +1210,17 @@ func testOwner(t *testing.T, operationID string, kind operation.TargetKind, id s
 }
 
 // fakeCgroupReceipt constructs the minimum valid external cgroup dependency used by isolation contracts.
-func fakeCgroupReceipt(owner ownership.OwnerKey, kind ownership.Kind) ownership.Receipt {
-	return ownership.Receipt{
-		SchemaVersion: ownership.SchemaVersion, Provider: ownership.ProviderCgroupV2, Kind: kind,
-		LocalID: "fake-" + strings.ReplaceAll(string(kind), "_", "-"), Owner: owner,
-		EvidenceSHA256: fakeEvidence(owner, kind, "cgroup"),
+func fakeCgroupReceipt(t *testing.T, owner ownership.OwnerKey, kind ownership.Kind, sandboxID domain.SandboxID, attemptID domain.AttemptID) ownership.Receipt {
+	t.Helper()
+	var effective *cgroupv2.EffectiveLimits
+	if kind == ownership.KindAttemptCgroup {
+		effective = &cgroupv2.EffectiveLimits{}
 	}
+	receipt, err := newCgroupReceipt(owner, kind, sandboxID, attemptID, effective)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return receipt
 }
 
 // fakeEvidence creates deterministic canonical evidence for one owner/kind/fact tuple.

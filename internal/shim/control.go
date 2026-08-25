@@ -1,7 +1,6 @@
 package shim
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"mydocker/internal/ownership"
+	"mydocker/internal/strictjson"
 )
 
 const (
@@ -392,7 +392,7 @@ func (server *ControlServer) handleConnection(connection *net.UnixConn) {
 	_ = json.NewEncoder(connection).Encode(response)
 }
 
-// decodeControlRequest rejects unknown fields, trailing values, and payloads beyond the protocol bound.
+// decodeControlRequest rejects ambiguous JSON and payloads beyond the protocol bound.
 func decodeControlRequest(reader io.Reader) (ControlRequest, error) {
 	limited := &io.LimitedReader{R: reader, N: MaxControlBytes + 1}
 	payload, err := io.ReadAll(limited)
@@ -402,14 +402,9 @@ func decodeControlRequest(reader io.Reader) (ControlRequest, error) {
 	if len(payload) > MaxControlBytes {
 		return ControlRequest{}, newError(CodeInvalidArgument, "control request exceeds size limit", nil)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
 	var request ControlRequest
-	if err := decoder.Decode(&request); err != nil {
+	if err := strictjson.Decode(payload, &request); err != nil {
 		return ControlRequest{}, newError(CodeInvalidArgument, "decode control request", err)
-	}
-	if err := requireJSONEOF(decoder); err != nil {
-		return ControlRequest{}, newError(CodeInvalidArgument, "control request has trailing data", err)
 	}
 	return request, nil
 }
@@ -417,20 +412,30 @@ func decodeControlRequest(reader io.Reader) (ControlRequest, error) {
 // DoControl sends one request over a fresh Unix connection and discards the
 // optional transport peer identity used only by the production launcher.
 func DoControl(ctx context.Context, socketPath string, request ControlRequest) (ControlResponse, error) {
-	response, _, err := doControl(ctx, socketPath, request, false)
+	response, _, err := doControl(ctx, socketPath, request, false, 0)
 	return response, err
 }
 
 // DoControlWithPeer sends one bounded request and returns the authenticated
 // Unix peer PID so launch/recovery can open strong process evidence without a persisted raw PID.
 func DoControlWithPeer(ctx context.Context, socketPath string, request ControlRequest) (ControlResponse, int, error) {
-	return doControl(ctx, socketPath, request, true)
+	return doControl(ctx, socketPath, request, true, 0)
+}
+
+// DoControlWithExpectedPeer authenticates the serving Unix peer before writing
+// any request bytes, preventing a replaced socket from receiving an action
+// intended for another retained init process.
+func DoControlWithExpectedPeer(ctx context.Context, socketPath string, expectedPeerPID int, request ControlRequest) (ControlResponse, int, error) {
+	if expectedPeerPID <= 0 {
+		return ControlResponse{}, 0, newError(CodeInvalidArgument, "expected control peer PID must be positive", nil)
+	}
+	return doControl(ctx, socketPath, request, true, expectedPeerPID)
 }
 
 // doControl performs one fresh-connection exchange. Every call receives a
 // bounded client deadline, including background recovery contexts, so a
 // connected but unresponsive wrapper cannot stall reconciliation.
-func doControl(ctx context.Context, socketPath string, request ControlRequest, requirePeer bool) (ControlResponse, int, error) {
+func doControl(ctx context.Context, socketPath string, request ControlRequest, requirePeer bool, expectedPeerPID int) (ControlResponse, int, error) {
 	if ctx == nil {
 		return ControlResponse{}, 0, errors.New("control client context must not be nil")
 	}
@@ -458,6 +463,9 @@ func doControl(ctx context.Context, socketPath string, request ControlRequest, r
 		if err != nil {
 			return ControlResponse{}, 0, newError(CodeUnavailable, "authenticate wrapper control peer", err)
 		}
+		if expectedPeerPID > 0 && peerPID != expectedPeerPID {
+			return ControlResponse{}, 0, newError(CodeUnavailable, "wrapper control peer differs from retained process evidence", nil)
+		}
 	}
 	deadline, _ := controlContext.Deadline()
 	_ = connection.SetDeadline(deadline)
@@ -475,14 +483,9 @@ func doControl(ctx context.Context, socketPath string, request ControlRequest, r
 	if len(payload) > MaxControlBytes {
 		return ControlResponse{}, 0, newError(CodeUnavailable, "wrapper control response exceeds size limit", nil)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
 	var response ControlResponse
-	if err := decoder.Decode(&response); err != nil {
+	if err := strictjson.Decode(payload, &response); err != nil {
 		return ControlResponse{}, 0, newError(CodeUnavailable, "decode wrapper control response", err)
-	}
-	if err := requireJSONEOF(decoder); err != nil {
-		return ControlResponse{}, 0, newError(CodeUnavailable, "wrapper control response has trailing data", err)
 	}
 	if err := response.Validate(); err != nil {
 		return ControlResponse{}, 0, newError(CodeUnavailable, "invalid wrapper control response", err)

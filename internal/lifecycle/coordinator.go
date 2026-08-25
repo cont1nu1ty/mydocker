@@ -11,6 +11,7 @@ import (
 	"mydocker/internal/operation"
 	"mydocker/internal/ownership"
 	"mydocker/internal/state"
+	"mydocker/internal/strictjson"
 )
 
 // resolvedOperation carries the deterministic retry decision and any existing CAS record.
@@ -482,7 +483,7 @@ func decodeSandboxResponse(encoded json.RawMessage) (sandboxResponse, error) {
 	if len(encoded) == 0 {
 		return response, errors.New("sandbox operation has no replay response")
 	}
-	if err := json.Unmarshal(encoded, &response); err != nil {
+	if err := strictjson.Decode(encoded, &response); err != nil {
 		return sandboxResponse{}, fmt.Errorf("decode sandbox replay response: %w", err)
 	}
 	return response, nil
@@ -494,7 +495,7 @@ func decodeContainerResponse(encoded json.RawMessage) (containerResponse, error)
 	if len(encoded) == 0 {
 		return response, errors.New("container operation has no replay response")
 	}
-	if err := json.Unmarshal(encoded, &response); err != nil {
+	if err := strictjson.Decode(encoded, &response); err != nil {
 		return containerResponse{}, fmt.Errorf("decode container replay response: %w", err)
 	}
 	if response.HostBinding != nil {
@@ -517,14 +518,68 @@ func decodeKillResponse(encoded json.RawMessage) (killResponse, error) {
 	if len(encoded) == 0 {
 		return response, errors.New("kill operation has no replay response")
 	}
-	if err := json.Unmarshal(encoded, &response); err != nil {
+	if err := strictjson.Decode(encoded, &response); err != nil {
 		return killResponse{}, fmt.Errorf("decode kill replay response: %w", err)
 	}
 	return response, nil
 }
 
+// ActiveKillPolicy strictly restores an actionable Kill policy and proves its
+// semantic request still matches the immutable operation fingerprint before a
+// daemon watcher may cause any signal side effect.
+func ActiveKillPolicy(active operation.Operation) (domain.TerminationPolicy, error) {
+	if err := active.Validate(); err != nil {
+		return domain.TerminationPolicy{}, fmt.Errorf("validate active Kill operation: %w", err)
+	}
+	if active.Type != operation.TypeKill || active.Target.Kind != operation.TargetContainer || !active.State.Active() {
+		return domain.TerminationPolicy{}, errors.New("operation is not an active Container Kill")
+	}
+	response, err := decodeKillResponse(active.Response)
+	if err != nil {
+		return domain.TerminationPolicy{}, err
+	}
+	if !response.Actionable || response.ContainerAttempt == nil {
+		return domain.TerminationPolicy{}, errors.New("active Kill response is not an actionable Container Attempt plan")
+	}
+	if err := response.ContainerAttempt.Validate(); err != nil {
+		return domain.TerminationPolicy{}, fmt.Errorf("validate active Kill Container Attempt: %w", err)
+	}
+	containerID := domain.ContainerID(active.Target.ID)
+	if response.ContainerAttempt.Container.ID != containerID {
+		return domain.TerminationPolicy{}, errors.New("active Kill response targets a different Container")
+	}
+	if err := response.ProcessIdentity.Validate(); err != nil {
+		return domain.TerminationPolicy{}, fmt.Errorf("validate active Kill process identity: %w", err)
+	}
+	if response.ContainerAttempt.Attempt.ProcessIdentity == nil || *response.ContainerAttempt.Attempt.ProcessIdentity != response.ProcessIdentity {
+		return domain.TerminationPolicy{}, errors.New("active Kill response process identity differs from its Attempt")
+	}
+	policy := domain.TerminationPolicy{
+		Signal: response.Plan.Signal, GracePeriod: response.Plan.GracePeriod,
+		EscalationSignal: response.Plan.EscalationSignal,
+	}
+	expectedPlan, err := domain.NewKillPlan(policy)
+	if err != nil {
+		return domain.TerminationPolicy{}, fmt.Errorf("validate active Kill policy: %w", err)
+	}
+	if expectedPlan != response.Plan {
+		return domain.TerminationPolicy{}, errors.New("active Kill response contains a noncanonical plan")
+	}
+	fingerprint, err := operation.CanonicalRequestFingerprint(killSemantic{ContainerID: containerID, Policy: policy})
+	if err != nil {
+		return domain.TerminationPolicy{}, fmt.Errorf("fingerprint active Kill policy: %w", err)
+	}
+	if !fingerprint.Equal(active.Fingerprint) {
+		return domain.TerminationPolicy{}, errors.New("active Kill policy differs from its immutable request fingerprint")
+	}
+	return policy, nil
+}
+
 // sandboxResultFromRecord translates a persisted operation response into a caller-owned result.
 func sandboxResultFromRecord(resolution operation.Resolution, record state.OperationRecord) (SandboxResult, error) {
+	if record.Operation.Result == operation.ResultFailed && record.Operation.Reason == operation.ReasonConflict {
+		return SandboxResult{Resolution: resolution, Operation: record.Operation.Clone(), Fingerprint: record.Operation.Fingerprint}, nil
+	}
 	response, err := decodeSandboxResponse(record.Operation.Response)
 	if err != nil {
 		return SandboxResult{}, err
@@ -534,6 +589,9 @@ func sandboxResultFromRecord(resolution operation.Resolution, record state.Opera
 
 // containerResultFromRecord translates a persisted operation response into a caller-owned result.
 func containerResultFromRecord(resolution operation.Resolution, record state.OperationRecord) (ContainerResult, error) {
+	if record.Operation.Result == operation.ResultFailed && record.Operation.Reason == operation.ReasonConflict {
+		return ContainerResult{Resolution: resolution, Operation: record.Operation.Clone(), Fingerprint: record.Operation.Fingerprint}, nil
+	}
 	response, err := decodeContainerResponse(record.Operation.Response)
 	if err != nil {
 		return ContainerResult{}, err
@@ -546,6 +604,9 @@ func containerResultFromRecord(resolution operation.Resolution, record state.Ope
 
 // killResultFromRecord translates a persisted kill response into a caller-owned plan or terminal result.
 func killResultFromRecord(resolution operation.Resolution, record state.OperationRecord) (KillResult, error) {
+	if record.Operation.Result == operation.ResultFailed && record.Operation.Reason == operation.ReasonConflict {
+		return KillResult{Resolution: resolution, Operation: record.Operation.Clone(), Fingerprint: record.Operation.Fingerprint}, nil
+	}
 	response, err := decodeKillResponse(record.Operation.Response)
 	if err != nil {
 		return KillResult{}, err

@@ -30,13 +30,25 @@ type fakeService struct {
 	getSandboxHook  func(context.Context, v1.RequestContext, string) (v1.SandboxResponse, error)
 	eventsHook      func(context.Context, v1.RequestContext, v1.ListEventsRequest) ([]v1.Event, error)
 	logsHook        func(context.Context, v1.RequestContext, v1.ListLogsRequest) ([]v1.LogFrame, error)
+	info            v1.InfoResponse
 	events          []v1.Event
 	logs            []v1.LogFrame
 }
 
 // newFakeService initializes the replay map used to model service-level operation idempotency.
 func newFakeService() *fakeService {
-	return &fakeService{createResponses: make(map[string]v1.SandboxResponse)}
+	modified := false
+	return &fakeService{
+		createResponses: make(map[string]v1.SandboxResponse),
+		info: v1.InfoResponse{DaemonBuild: v1.DaemonBuildIdentity{
+			Source: v1.DaemonBuildIdentitySource, GoVersion: "go-test", VCSRevision: "test-revision", VCSModified: &modified,
+		}},
+	}
+}
+
+// Info returns the fake immutable daemon binary identity for read-only transport tests.
+func (service *fakeService) Info(context.Context, v1.RequestContext, v1.GetInfoRequest) (v1.InfoResponse, error) {
+	return service.info, nil
 }
 
 // CreateSandbox replays a prior operation result or records exactly one fake side effect.
@@ -196,6 +208,19 @@ func TestUDSSocketModeAndIdempotentReplay(t *testing.T) {
 	defer service.mu.Unlock()
 	if service.createCalls != 2 || service.createEffects != 1 {
 		t.Fatalf("calls/effects = %d/%d, want 2/1", service.createCalls, service.createEffects)
+	}
+}
+
+// TestUDSInfoReturnsDaemonBinaryIdentity verifies the typed client and UDS route preserve strict build metadata.
+func TestUDSInfoReturnsDaemonBinaryIdentity(t *testing.T) {
+	_, apiClient, _ := startTestServer(t, newFakeService(), Config{})
+	response, err := apiClient.Info(context.Background())
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	identity := response.DaemonBuild
+	if identity.Source != v1.DaemonBuildIdentitySource || identity.Unavailable || identity.VCSRevision != "test-revision" || identity.VCSModified == nil || *identity.VCSModified {
+		t.Fatalf("Info() identity = %#v", identity)
 	}
 }
 

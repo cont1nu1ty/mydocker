@@ -10,11 +10,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 	"unicode"
 
+	v1 "mydocker/api/runtime/v1"
 	"mydocker/internal/cgroupv2"
 	"mydocker/internal/daemon"
 	"mydocker/internal/engine"
@@ -29,6 +32,11 @@ import (
 
 const defaultShutdownTimeout = 15 * time.Second
 const terminalWatchInterval = 250 * time.Millisecond
+
+var errAPIStoppedUnexpectedly = errors.New("daemon API stopped unexpectedly")
+var errAPIShutdownTimeout = errors.New("daemon API shutdown timed out")
+var errAPIWaitUnconfirmed = errors.New("daemon API shutdown returned before Wait confirmed serving stopped")
+var errBackgroundShutdownTimeout = errors.New("daemon lifecycle supervisor shutdown timed out")
 
 // daemonConfig contains every host ownership boundary needed by production
 // composition; path-bearing values are accepted only from daemon startup flags.
@@ -65,6 +73,54 @@ func (values *preparedRootFSFlags) Set(value string) error {
 	return nil
 }
 
+// collectDaemonInfo reads immutable Go build metadata from this daemon binary without consulting a working tree.
+func collectDaemonInfo() v1.InfoResponse {
+	buildInfo, ok := debug.ReadBuildInfo()
+	return daemonInfoFromBuildInfo(buildInfo, ok)
+}
+
+// daemonInfoFromBuildInfo converts one Go build snapshot into the bounded v1 daemon identity contract.
+func daemonInfoFromBuildInfo(buildInfo *debug.BuildInfo, available bool) v1.InfoResponse {
+	identity := v1.DaemonBuildIdentity{
+		Source:            v1.DaemonBuildIdentitySource,
+		Unavailable:       true,
+		UnavailableReason: v1.DaemonBuildUnavailableBuildInfo,
+	}
+	if !available || buildInfo == nil {
+		return v1.InfoResponse{DaemonBuild: identity}
+	}
+	identity.GoVersion = buildInfo.GoVersion
+	identity.MainPath = buildInfo.Main.Path
+	identity.MainVersion = buildInfo.Main.Version
+	identity.MainSum = buildInfo.Main.Sum
+	for _, setting := range buildInfo.Settings {
+		switch setting.Key {
+		case "vcs":
+			identity.VCS = setting.Value
+		case "vcs.revision":
+			identity.VCSRevision = setting.Value
+		case "vcs.time":
+			identity.VCSTime = setting.Value
+		case "vcs.modified":
+			modified, err := strconv.ParseBool(setting.Value)
+			if err == nil {
+				identity.VCSModified = &modified
+			}
+		}
+	}
+	if !v1.UsableVCSRevision(identity.VCSRevision) {
+		identity.UnavailableReason = v1.DaemonBuildUnavailableRevision
+		return v1.InfoResponse{DaemonBuild: identity}
+	}
+	if identity.VCSModified == nil {
+		identity.UnavailableReason = v1.DaemonBuildUnavailableModified
+		return v1.InfoResponse{DaemonBuild: identity}
+	}
+	identity.Unavailable = false
+	identity.UnavailableReason = ""
+	return v1.InfoResponse{DaemonBuild: identity}
+}
+
 // daemonRuntime is the ordered startup boundary used by runDaemon; tests
 // replace it so no host provider, process, cgroup, or namespace action occurs.
 type daemonRuntime interface {
@@ -80,7 +136,7 @@ type backgroundRuntime interface {
 }
 
 // managedServer is the lifecycle subset of the UDS server needed by the
-// command; tests use a temporary Unix listener with no HTTP or host effects.
+// command; a nil Shutdown result must prove serving and handlers are quiescent.
 type managedServer interface {
 	Start() error
 	Wait() error
@@ -126,7 +182,7 @@ func main() {
 }
 
 // runDaemon parses explicit ownership paths, completes preflight and recovery
-// before binding UDS, then drains the endpoint when its context is canceled.
+// before binding UDS, then quiesces API and watcher work before closing state.
 func runDaemon(ctx context.Context, arguments []string, logOutput io.Writer, openRuntime runtimeFactory, openServer serverFactory) (resultErr error) {
 	if ctx == nil {
 		return errors.New("mydockerd context must not be nil")
@@ -148,7 +204,11 @@ func runDaemon(ctx context.Context, arguments []string, logOutput io.Writer, ope
 		logDaemonFailure(logger, "daemon runtime open failed", err)
 		return err
 	}
+	runtimeMayClose := true
 	defer func() {
+		if !runtimeMayClose {
+			return
+		}
 		if closeErr := runtime.Close(); closeErr != nil {
 			logDaemonFailure(logger, "daemon runtime close failed", closeErr)
 			resultErr = errors.Join(resultErr, closeErr)
@@ -172,12 +232,13 @@ func runDaemon(ctx context.Context, arguments []string, logOutput io.Writer, ope
 		logDaemonFailure(logger, "daemon API start failed", err)
 		return err
 	}
+	runtimeMayClose = false
 	logDaemonInfo(logger, "daemon API serving")
 	waitResult := make(chan error, 1)
 	go func() {
 		waitResult <- endpoint.Wait()
 	}()
-	backgroundContext, stopBackground := context.WithCancel(ctx)
+	backgroundContext, stopBackground := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopBackground()
 	var backgroundResult <-chan error
 	if background, ok := runtime.(backgroundRuntime); ok {
@@ -187,54 +248,128 @@ func runDaemon(ctx context.Context, arguments []string, logOutput io.Writer, ope
 			result <- background.RunBackground(backgroundContext)
 		}()
 	}
+	var exitErr error
 	select {
 	case waitErr := <-waitResult:
-		if waitErr != nil {
-			logDaemonFailure(logger, "daemon API stopped unexpectedly", waitErr)
-			return waitErr
+		waitResult = nil
+		exitErr = endpointExitError(waitErr)
+		if exitErr != nil {
+			logDaemonFailure(logger, "daemon API stopped unexpectedly", exitErr)
 		}
-		logDaemonInfo(logger, "daemon API stopped")
-		return nil
 	case <-ctx.Done():
-		stopBackground()
-		shutdownContext, cancel := context.WithTimeout(context.Background(), config.shutdown)
-		defer cancel()
-		if shutdownErr := endpoint.Shutdown(shutdownContext); shutdownErr != nil {
-			logDaemonFailure(logger, "daemon API shutdown failed", shutdownErr)
-			return shutdownErr
-		}
-		logDaemonInfo(logger, "daemon API stopped")
-		return nil
 	case backgroundErr := <-backgroundResult:
-		stopBackground()
-		backgroundErr = backgroundExitError(ctx, backgroundErr)
-		shutdownContext, cancel := context.WithTimeout(context.Background(), config.shutdown)
-		defer cancel()
-		shutdownErr := endpoint.Shutdown(shutdownContext)
-		if backgroundErr == nil {
-			if shutdownErr != nil {
-				logDaemonFailure(logger, "daemon API shutdown failed", shutdownErr)
-				return shutdownErr
-			}
-			logDaemonInfo(logger, "daemon API stopped")
-			return nil
+		backgroundResult = nil
+		exitErr = backgroundExitError(backgroundErr)
+		if exitErr != nil {
+			logDaemonFailure(logger, "daemon lifecycle supervisor stopped", exitErr)
 		}
-		logDaemonFailure(logger, "daemon lifecycle supervisor stopped", backgroundErr)
-		return errors.Join(backgroundErr, shutdownErr)
+	}
+	// Preserve any other result that was already ready when the first select
+	// completed; the parent context cannot cancel either independently owned loop.
+	if waitResult != nil {
+		select {
+		case waitErr := <-waitResult:
+			waitResult = nil
+			if waitErr = endpointExitError(waitErr); waitErr != nil {
+				logDaemonFailure(logger, "daemon API stopped unexpectedly", waitErr)
+				exitErr = errors.Join(exitErr, waitErr)
+			}
+		default:
+		}
+	}
+	if backgroundResult != nil {
+		select {
+		case backgroundErr := <-backgroundResult:
+			backgroundResult = nil
+			if backgroundErr = backgroundExitError(backgroundErr); backgroundErr != nil {
+				logDaemonFailure(logger, "daemon lifecycle supervisor stopped", backgroundErr)
+				exitErr = errors.Join(exitErr, backgroundErr)
+			}
+		default:
+		}
+	}
+
+	shutdownErr, apiQuiescent := shutdownEndpoint(endpoint, waitResult, config.shutdown)
+	waitResult = nil
+	if shutdownErr != nil {
+		logDaemonFailure(logger, "daemon API shutdown failed", shutdownErr)
+	} else {
+		logDaemonInfo(logger, "daemon API stopped")
+	}
+	stopBackground()
+	backgroundErr, backgroundQuiescent := joinBackground(backgroundResult, config.shutdown)
+	if !expectedBackgroundShutdown(backgroundErr) {
+		logDaemonFailure(logger, "daemon lifecycle supervisor shutdown failed", backgroundErr)
+		exitErr = errors.Join(exitErr, backgroundErr)
+	}
+	runtimeMayClose = apiQuiescent && backgroundQuiescent
+	return errors.Join(exitErr, shutdownErr)
+}
+
+// endpointExitError classifies an endpoint result observed before runDaemon asks it to shut down.
+func endpointExitError(waitErr error) error {
+	if waitErr == nil {
+		return errAPIStoppedUnexpectedly
+	}
+	return waitErr
+}
+
+// shutdownEndpoint gives Shutdown and the already-running Wait call one shared
+// bounded drain interval. Quiescence requires both confirmations unless Wait
+// was observed before shutdown began.
+func shutdownEndpoint(endpoint managedServer, waitResult <-chan error, timeout time.Duration) (error, bool) {
+	shutdownContext, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- endpoint.Shutdown(shutdownContext)
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			return err, false
+		}
+	case <-shutdownContext.Done():
+		return errors.Join(errAPIShutdownTimeout, shutdownContext.Err()), false
+	}
+	if waitResult == nil {
+		return nil, true
+	}
+	select {
+	case err := <-waitResult:
+		return err, true
+	case <-shutdownContext.Done():
+		return errors.Join(errAPIShutdownTimeout, errAPIWaitUnconfirmed, shutdownContext.Err()), false
 	}
 }
 
-// backgroundExitError treats a watcher that returns because the daemon context
-// was canceled as normal shutdown even when its select case wins the race with
-// the simultaneously ready context channel.
-func backgroundExitError(ctx context.Context, watcherErr error) error {
-	if ctx != nil && ctx.Err() != nil {
-		return nil
+// joinBackground waits at most one configured shutdown interval for the
+// watcher to finish after cancellation; timeout never proves state is idle.
+func joinBackground(result <-chan error, timeout time.Duration) (error, bool) {
+	if result == nil {
+		return nil, true
 	}
+	joinContext, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	select {
+	case err := <-result:
+		return err, true
+	case <-joinContext.Done():
+		return errors.Join(errBackgroundShutdownTimeout, joinContext.Err()), false
+	}
+}
+
+// backgroundExitError classifies any watcher result observed before runDaemon requests cancellation.
+func backgroundExitError(watcherErr error) error {
 	if watcherErr == nil {
 		return errors.New("daemon lifecycle supervisor stopped unexpectedly")
 	}
 	return watcherErr
+}
+
+// expectedBackgroundShutdown accepts only nil or the exact cancellation sentinel after an explicit stop request.
+func expectedBackgroundShutdown(err error) bool {
+	return err == nil || err == context.Canceled
 }
 
 // parseDaemonConfig requires every host path on the command line and converts
@@ -250,7 +385,7 @@ func parseDaemonConfig(arguments []string) (daemonConfig, error) {
 	flags.StringVar(&config.cgroupRoot, "cgroup-root", "", "absolute delegated cgroup v2 directory")
 	flags.StringVar(&config.shimPath, "shim", "", "absolute mydocker-shim executable path")
 	flags.Var(&prepared, "prepared-rootfs", "repeatable opaque-id=/absolute/prepared/rootfs mapping")
-	flags.DurationVar(&config.shutdown, "shutdown-timeout", defaultShutdownTimeout, "graceful API shutdown bound")
+	flags.DurationVar(&config.shutdown, "shutdown-timeout", defaultShutdownTimeout, "per-phase graceful shutdown bound")
 	if err := flags.Parse(arguments); err != nil {
 		return daemonConfig{}, err
 	}
@@ -372,7 +507,7 @@ func openProductionRuntime(ctx context.Context, config daemonConfig) (_ daemonRu
 	if err != nil {
 		return nil, err
 	}
-	apiService, err := daemon.NewService(runtimeEngine, logRegistry)
+	apiService, err := daemon.NewServiceWithInfo(runtimeEngine, logRegistry, collectDaemonInfo())
 	if err != nil {
 		return nil, err
 	}
@@ -495,8 +630,9 @@ func newProductionServer(config server.Config, service server.Service) (managedS
 	return server.New(config, service)
 }
 
-// logDaemonInfo emits one fixed low-detail startup fact; lifecycle identifiers
-// remain available in request and operation logs rather than metric labels.
+// logDaemonInfo emits one fixed low-detail process-lifecycle fact. Per-request
+// diagnostic correlation is not yet wired; durable stage events remain the
+// current operation-correlated source and concrete IDs never become metrics.
 func logDaemonInfo(logger *observability.JSONLogger, message string) {
 	if logger == nil {
 		return

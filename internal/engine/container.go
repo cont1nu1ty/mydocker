@@ -755,7 +755,7 @@ func (engine *Engine) StartContainer(ctx context.Context, request lifecycle.Cont
 		completion := engine.finishOperationMeasurement(operationStartedAt, result.Resolution)
 		return engine.lifecycle.RecordContainerStartTerminal(ctx, lifecycle.ContainerStartTerminalRequest{
 			OperationID: request.OperationID, ContainerID: request.ContainerID, Fingerprint: result.Fingerprint,
-			Outcome: workload.Outcome, Conditions: terminalConditions(workload.Outcome),
+			Outcome: workload.Outcome, OperationFailed: workload.StartFailed, Conditions: terminalConditions(workload.Outcome),
 			Verification: lifecycle.Verification{
 				Kind: lifecycle.VerificationAttemptStopped, Verified: true, Evidence: workload.Evidence,
 				ObservedAt: completion.occurredAt, Duration: completion.duration,

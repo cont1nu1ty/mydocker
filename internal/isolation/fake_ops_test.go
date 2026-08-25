@@ -29,7 +29,9 @@ type fakeOps struct {
 	mutations     []string
 	allowedRootFD int
 	rootfsFD      int
+	mountedRootFD int
 	rootfsFileFD  int
+	rootfsOpens   int
 	setnsInode    uint64
 	setnsCalls    int
 	setnsFailAt   map[int]error
@@ -91,6 +93,7 @@ func newFakeOps() *fakeOps {
 		setnsFailAt:   make(map[int]error),
 		allowedRootFD: 800,
 		rootfsFD:      801,
+		mountedRootFD: 803,
 		rootfsFileFD:  802,
 		hostnameValue: "host-inherited",
 	}
@@ -102,6 +105,7 @@ func newFakeOps() *fakeOps {
 	}
 	value.fdStats[value.allowedRootFD] = FileInfo{Mode: 0040000, Dev: 1, Ino: 10}
 	value.fdStats[value.rootfsFD] = FileInfo{Mode: 0040000, Dev: 1, Ino: 11}
+	value.fdStats[value.mountedRootFD] = FileInfo{Mode: 0040000, Dev: 1, Ino: 11}
 	value.fdStats[value.rootfsFileFD] = FileInfo{Mode: 0100000, Dev: 1, Ino: 12}
 	return value
 }
@@ -293,7 +297,11 @@ func (f *fakeOps) OpenDirectoryAt(baseFD int, relative string) (int, error) {
 	if err := f.failure(name); err != nil {
 		return -1, err
 	}
-	return f.rootfsFD, nil
+	f.rootfsOpens++
+	if f.rootfsOpens == 1 {
+		return f.rootfsFD, nil
+	}
+	return f.mountedRootFD, nil
 }
 
 // OpenFileAt records descriptor-relative file resolution and returns the configured DNS target descriptor.
@@ -545,6 +553,24 @@ func (f *fakeOps) mkdir(path string, mode uint32) error {
 	name := fmt.Sprintf("mkdir:%s:%o", path, mode)
 	f.record(name, true)
 	return f.failure("mkdir:" + path)
+}
+
+// mknod records one fixed device-node creation inside the synthetic private /dev.
+func (f *fakeOps) mknod(path string, mode uint32, device int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name := fmt.Sprintf("mknod:%s:%o:%d", path, mode, device)
+	f.record(name, true)
+	return f.failure("mknod:" + path)
+}
+
+// chmod records canonical device permissions applied after synthetic umask handling.
+func (f *fakeOps) chmod(path string, mode uint32) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	name := fmt.Sprintf("chmod:%s:%o", path, mode)
+	f.record(name, true)
+	return f.failure("chmod:" + path)
 }
 
 // remove records one fake empty-directory removal.

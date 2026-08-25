@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"syscall"
 
 	"mydocker/internal/ownership"
@@ -15,6 +16,25 @@ import (
 )
 
 const maxArtifactBytes = 64 << 10
+
+const (
+	artifactStateClosed    = "closed"
+	artifactStateConsuming = "consuming"
+	artifactStateReleased  = "released"
+	artifactStateReady     = "ready"
+)
+
+var artifactTransitionLocks sync.Map
+var sharedOwnerOperationLocks sync.Map
+
+// sharedOwnerOperationLock returns the process-wide action lock for one
+// runtime-root/owner pair. Launcher recovery and provider control actions use
+// the same lock even when reached through different provider instances.
+func sharedOwnerOperationLock(root, token string) *sync.Mutex {
+	lockKey := root + "\x00" + token
+	value, _ := sharedOwnerOperationLocks.LoadOrStore(lockKey, &sync.Mutex{})
+	return value.(*sync.Mutex)
+}
 
 // artifactRecord is one checksummed gate or stream identity under a deterministic owner directory.
 type artifactRecord struct {
@@ -40,11 +60,11 @@ func (record artifactRecord) Validate() error {
 	}
 	switch record.Kind {
 	case ownership.KindStartGate:
-		if record.State != "closed" && record.State != "released" {
+		if record.State != artifactStateClosed && record.State != artifactStateConsuming && record.State != artifactStateReleased {
 			return errors.New("start-gate artifact has unsupported state")
 		}
 	case ownership.KindStreams:
-		if record.State != "ready" {
+		if record.State != artifactStateReady {
 			return errors.New("stream artifact must be ready")
 		}
 	default:
@@ -107,6 +127,8 @@ func newArtifactStore(root string) (*artifactStore, error) {
 
 // Ensure creates or validates one deterministic gate or stream artifact and returns its current record.
 func (store *artifactStore) Ensure(owner ownership.OwnerKey, kind ownership.Kind, receiptEvidence, initialState string) (artifactRecord, error) {
+	unlock := store.lockTransition(owner)
+	defer unlock()
 	if err := store.ensureOwnerDirectory(owner); err != nil {
 		return artifactRecord{}, err
 	}
@@ -185,12 +207,20 @@ func (store *artifactStore) Read(owner ownership.OwnerKey, kind ownership.Kind) 
 
 // Transition atomically updates the state of one exact existing artifact while retaining receipt identity.
 func (store *artifactStore) Transition(owner ownership.OwnerKey, kind ownership.Kind, receiptEvidence, state string) error {
+	unlock := store.lockTransition(owner)
+	defer unlock()
 	record, found, err := store.Read(owner, kind)
 	if err != nil {
 		return err
 	}
 	if !found || record.ReceiptEvidence != receiptEvidence {
 		return fmt.Errorf("%w: artifact to transition is absent or belongs to another receipt", ErrArtifactUnsafe)
+	}
+	if kind != ownership.KindStartGate ||
+		(record.State == artifactStateClosed && state != artifactStateConsuming) ||
+		(record.State == artifactStateConsuming && state != artifactStateReleased) ||
+		record.State == artifactStateReleased {
+		return fmt.Errorf("%w: unsupported artifact transition %q -> %q", ErrArtifactUnsafe, record.State, state)
 	}
 	updated, err := newArtifactRecord(owner, kind, receiptEvidence, state)
 	if err != nil {
@@ -199,8 +229,43 @@ func (store *artifactStore) Transition(owner ownership.OwnerKey, kind ownership.
 	return store.write(updated)
 }
 
+// ConfirmState re-reads one exact artifact and fsyncs its parent before a
+// caller relies on a state whose earlier rename may have returned uncertain
+// directory durability.
+func (store *artifactStore) ConfirmState(owner ownership.OwnerKey, kind ownership.Kind, receiptEvidence, state string) error {
+	unlock := store.lockTransition(owner)
+	defer unlock()
+	record, found, err := store.Read(owner, kind)
+	if err != nil {
+		return err
+	}
+	if !found || record.ReceiptEvidence != receiptEvidence || record.State != state {
+		return fmt.Errorf("%w: artifact state confirmation differs from the exact receipt", ErrArtifactUnsafe)
+	}
+	path, err := store.artifactPath(owner, kind)
+	if err != nil {
+		return err
+	}
+	if err := store.syncDirectory(filepath.Dir(path)); err != nil {
+		return fmt.Errorf("confirm artifact state durability: %w", err)
+	}
+	return nil
+}
+
+// lockTransition serializes monotonic state changes and durability replays for
+// one runtime-root/owner pair across all store instances in this process.
+func (store *artifactStore) lockTransition(owner ownership.OwnerKey) func() {
+	lockKey := store.root + "\x00" + owner.Token
+	value, _ := artifactTransitionLocks.LoadOrStore(lockKey, &sync.Mutex{})
+	lock := value.(*sync.Mutex)
+	lock.Lock()
+	return lock.Unlock
+}
+
 // Remove deletes one exact gate or stream artifact and prunes only empty deterministic owner directories.
 func (store *artifactStore) Remove(owner ownership.OwnerKey, kind ownership.Kind, receiptEvidence string) (provider.CleanupDisposition, error) {
+	unlock := store.lockTransition(owner)
+	defer unlock()
 	record, found, err := store.Read(owner, kind)
 	if err != nil {
 		return "", err

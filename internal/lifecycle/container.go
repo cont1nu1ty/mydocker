@@ -431,6 +431,9 @@ func (c *Coordinator) RecordContainerStartTerminal(ctx context.Context, request 
 	if err := request.Outcome.Validate(); err != nil {
 		return ContainerResult{}, err
 	}
+	if request.Outcome.Presence == domain.OutcomeNotApplicable && !request.OperationFailed {
+		return ContainerResult{}, errors.New("not-applicable terminal Start outcome requires a failed operation result")
+	}
 	binding, err := suppliedBinding(
 		request.OperationID, operation.TypeStart,
 		operation.Target{Kind: operation.TargetContainer, ID: string(request.ContainerID)},
@@ -483,7 +486,7 @@ func (c *Coordinator) RecordContainerStartTerminal(ctx context.Context, request 
 		}
 		operationResult := operation.ResultSucceeded
 		operationRecord := state.OperationRecord{}
-		if request.Outcome.Presence == domain.OutcomeNotApplicable {
+		if request.OperationFailed {
 			operationResult = operation.ResultFailed
 			operationRecord, putErr = failOperation(tx, *resolved.Record, operation.ReasonInternal, nil)
 		} else {
@@ -540,9 +543,13 @@ func (c *Coordinator) PlanKill(ctx context.Context, request KillRequest) (KillRe
 			return resolveErr
 		}
 		if resolved.Resolution == operation.ResolutionResume {
-			prior, decodeErr := decodeKillResponse(resolved.Record.Operation.Response)
-			if decodeErr != nil {
-				return decodeErr
+			retainedPolicy, policyErr := ActiveKillPolicy(resolved.Record.Operation)
+			if policyErr != nil {
+				return policyErr
+			}
+			plan, planErr := domain.NewKillPlan(retainedPolicy)
+			if planErr != nil {
+				return planErr
 			}
 			pairRecord, getErr := tx.GetContainerAttempt(request.ContainerID)
 			if getErr != nil {
@@ -552,7 +559,7 @@ func (c *Coordinator) PlanKill(ctx context.Context, request KillRequest) (KillRe
 			if verifyErr != nil {
 				return verifyErr
 			}
-			result = KillResult{Resolution: resolved.Resolution, Operation: resolved.Record.Operation.Clone(), Fingerprint: binding.Fingerprint, Plan: prior.Plan, Actionable: true, ProcessIdentity: identity, ContainerAttempt: pairPointer(pairRecord.ContainerAttempt)}
+			result = KillResult{Resolution: resolved.Resolution, Operation: resolved.Record.Operation.Clone(), Fingerprint: binding.Fingerprint, Plan: plan, Actionable: true, ProcessIdentity: identity, ContainerAttempt: pairPointer(pairRecord.ContainerAttempt)}
 			return nil
 		}
 		pairRecord, getErr := tx.GetContainerAttempt(request.ContainerID)

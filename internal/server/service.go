@@ -10,6 +10,8 @@ import (
 // the daemon engine. Its methods receive the request context unchanged so the
 // engine can bind client operation IDs to canonical request fingerprints.
 type Service interface {
+	// Info returns immutable build identity read from the running daemon binary.
+	Info(context.Context, v1.RequestContext, v1.GetInfoRequest) (v1.InfoResponse, error)
 	// CreateSandbox persists and reconciles one immutable Sandbox create intent.
 	CreateSandbox(context.Context, v1.RequestContext, v1.CreateSandboxRequest) (v1.SandboxResponse, error)
 	// StopSandbox advances a Ready Sandbox toward a confirmed stopped state.

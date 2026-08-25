@@ -114,6 +114,15 @@ func (c *Client) CloseIdleConnections() {
 	}
 }
 
+// Info returns the build identity read from the running daemon binary without creating an operation.
+func (c *Client) Info(ctx context.Context) (v1.InfoResponse, error) {
+	var response v1.InfoResponse
+	if err := c.doJSON(ctx, http.MethodGet, v1.BasePath+"/info", "", nil, &response); err != nil {
+		return v1.InfoResponse{}, err
+	}
+	return response, nil
+}
+
 // CreateSandbox submits immutable Sandbox intent using the caller's durable operation ID.
 func (c *Client) CreateSandbox(ctx context.Context, operationID string, input v1.CreateSandboxRequest) (v1.SandboxResponse, error) {
 	if err := input.Validate(); err != nil {

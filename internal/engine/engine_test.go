@@ -41,6 +41,7 @@ type fakeHost struct {
 	releaseFailedOnce       bool
 	releaseCalls            int
 	terminalAfterRelease    bool
+	unknownStartFailure     bool
 	signalResponses         map[string]provider.SignalObservation
 	signalDeliveries        int
 	failAfterSignal         bool
@@ -619,6 +620,29 @@ func TestStartContainerRecordsTerminalBeforeRunning(t *testing.T) {
 	}
 }
 
+// TestStartContainerFailsUnknownLaunchAbort verifies a post-exec runtime
+// publication failure preserves the Attempt's unknown outcome but cannot mark
+// the Start operation successful.
+func TestStartContainerFailsUnknownLaunchAbort(t *testing.T) {
+	host := newFakeHost()
+	host.unknownStartFailure = true
+	engine, _ := testEngine(t, host)
+	prepareCreatedContainer(t, engine)
+	request := lifecycle.ContainerActionRequest{OperationID: "op-start-launch-aborted", ContainerID: "container-start-test"}
+	result, err := engine.StartContainer(context.Background(), request)
+	if err == nil {
+		t.Fatal("StartContainer() launch-aborted error = nil, want stable failed-operation error")
+	}
+	if result.Operation.Result != operation.ResultFailed || result.ContainerAttempt == nil ||
+		result.ContainerAttempt.Attempt.Phase != domain.AttemptStopped || result.ContainerAttempt.Attempt.Outcome.Presence != domain.OutcomeUnknown {
+		t.Fatalf("StartContainer() launch-aborted result = %#v", result)
+	}
+	replayed, err := engine.StartContainer(context.Background(), request)
+	if err == nil || replayed.Resolution != operation.ResolutionReplay || !reflect.DeepEqual(replayed.ContainerAttempt, result.ContainerAttempt) {
+		t.Fatalf("StartContainer() launch-aborted replay = (%#v, %v)", replayed, err)
+	}
+}
+
 // TestKillContainerRecoversSignalResponseLoss proves a transport retry reuses the same action key and never delivers the initial signal twice.
 func TestKillContainerRecoversSignalResponseLoss(t *testing.T) {
 	host := newFakeHost()
@@ -1023,8 +1047,12 @@ func (host *fakeHost) ReleaseStartGate(_ context.Context, request provider.Relea
 	host.mu.Lock()
 	defer host.mu.Unlock()
 	host.releaseCalls++
-	if host.terminalAfterRelease {
-		host.attempt = AttemptObservation{Terminal: true, Outcome: domain.NotApplicableOutcome(), Evidence: "terminal-before-running-evidence"}
+	if host.unknownStartFailure {
+		host.attempt = AttemptObservation{
+			Terminal: true, StartFailed: true, Outcome: domain.UnknownOutcome(domain.EvidenceUnknown), Evidence: "launch-aborted-before-running-evidence",
+		}
+	} else if host.terminalAfterRelease {
+		host.attempt = AttemptObservation{Terminal: true, StartFailed: true, Outcome: domain.NotApplicableOutcome(), Evidence: "terminal-before-running-evidence"}
 	} else {
 		host.attempt = AttemptObservation{Running: true, Evidence: "running-evidence"}
 	}

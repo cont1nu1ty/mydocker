@@ -16,6 +16,16 @@ const (
 	HeaderOperationID = "X-Mydocker-Operation-ID"
 	// MediaTypeJSON is the only request and response encoding accepted by v1.
 	MediaTypeJSON = "application/json"
+	// DaemonBuildIdentitySource identifies Go build metadata read from the running daemon binary.
+	DaemonBuildIdentitySource = "daemon_binary_go_build_info"
+	// DaemonBuildUnavailableNotConfigured identifies an explicitly uninjected service identity.
+	DaemonBuildUnavailableNotConfigured = "not_configured"
+	// DaemonBuildUnavailableBuildInfo identifies a binary without readable Go build metadata.
+	DaemonBuildUnavailableBuildInfo = "build_info_unavailable"
+	// DaemonBuildUnavailableRevision identifies build metadata without a usable VCS revision.
+	DaemonBuildUnavailableRevision = "vcs_revision_unavailable"
+	// DaemonBuildUnavailableModified identifies build metadata without a trustworthy dirty-worktree bit.
+	DaemonBuildUnavailableModified = "vcs_modified_unavailable"
 )
 
 // RequestContext identifies one transport attempt and, for mutations, the
@@ -286,6 +296,29 @@ type GetOperationRequest struct {
 type ListEventsRequest struct {
 	AfterSequence uint64 `json:"-"`
 	Limit         int    `json:"-"`
+}
+
+// GetInfoRequest represents the side-effect-free daemon information lookup.
+type GetInfoRequest struct{}
+
+// DaemonBuildIdentity reports immutable Go and VCS metadata read from the running daemon binary.
+type DaemonBuildIdentity struct {
+	Source            string `json:"source"`
+	Unavailable       bool   `json:"unavailable"`
+	UnavailableReason string `json:"unavailable_reason,omitempty"`
+	GoVersion         string `json:"go_version,omitempty"`
+	MainPath          string `json:"main_path,omitempty"`
+	MainVersion       string `json:"main_version,omitempty"`
+	MainSum           string `json:"main_sum,omitempty"`
+	VCS               string `json:"vcs,omitempty"`
+	VCSRevision       string `json:"vcs_revision,omitempty"`
+	VCSTime           string `json:"vcs_time,omitempty"`
+	VCSModified       *bool  `json:"vcs_modified,omitempty"`
+}
+
+// InfoResponse returns the daemon binary identity used to qualify evaluation evidence.
+type InfoResponse struct {
+	DaemonBuild DaemonBuildIdentity `json:"daemon_build"`
 }
 
 // SandboxResponse returns one authoritative Sandbox and an optional mutation operation.

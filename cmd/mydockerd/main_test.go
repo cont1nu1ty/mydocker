@@ -5,14 +5,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"sync"
 	"testing"
 	"time"
 
+	v1 "mydocker/api/runtime/v1"
 	"mydocker/internal/provider"
 	"mydocker/internal/server"
 )
@@ -25,6 +28,41 @@ type fakeDaemonRuntime struct {
 	preflightErr error
 	reconcileErr error
 	closed       bool
+	closedSignal chan struct{}
+}
+
+// TestDaemonInfoFromBuildInfoUsesOnlyBinaryMetadata verifies the v1 identity preserves Go VCS settings and explicit gaps.
+func TestDaemonInfoFromBuildInfoUsesOnlyBinaryMetadata(t *testing.T) {
+	buildInfo := &debug.BuildInfo{
+		GoVersion: "go-test",
+		Main:      debug.Module{Path: "mydocker", Version: "devel"},
+		Settings: []debug.BuildSetting{
+			{Key: "vcs", Value: "git"},
+			{Key: "vcs.revision", Value: "revision-one"},
+			{Key: "vcs.time", Value: "2026-08-24T00:00:00Z"},
+			{Key: "vcs.modified", Value: "false"},
+		},
+	}
+	response := daemonInfoFromBuildInfo(buildInfo, true)
+	if err := response.Validate(); err != nil {
+		t.Fatalf("InfoResponse.Validate() error = %v", err)
+	}
+	identity := response.DaemonBuild
+	if identity.Source != v1.DaemonBuildIdentitySource || identity.Unavailable || identity.VCSRevision != "revision-one" || identity.VCSModified == nil || *identity.VCSModified || identity.MainSum != "" {
+		t.Fatalf("daemon binary identity = %#v", identity)
+	}
+
+	missingRevision := *buildInfo
+	missingRevision.Settings = []debug.BuildSetting{{Key: "vcs.modified", Value: "false"}}
+	identity = daemonInfoFromBuildInfo(&missingRevision, true).DaemonBuild
+	if !identity.Unavailable || identity.UnavailableReason != v1.DaemonBuildUnavailableRevision {
+		t.Fatalf("missing revision identity = %#v", identity)
+	}
+
+	identity = daemonInfoFromBuildInfo(nil, false).DaemonBuild
+	if !identity.Unavailable || identity.UnavailableReason != v1.DaemonBuildUnavailableBuildInfo {
+		t.Fatalf("missing build info identity = %#v", identity)
+	}
 }
 
 // Preflight proves the public socket is still absent at the read-only host
@@ -56,7 +94,32 @@ func (runtime *fakeDaemonRuntime) APIService() server.Service { return nil }
 func (runtime *fakeDaemonRuntime) Close() error {
 	*runtime.order = append(*runtime.order, "close")
 	runtime.closed = true
+	if runtime.closedSignal != nil {
+		close(runtime.closedSignal)
+	}
 	return nil
+}
+
+// blockingBackgroundRuntime observes cancellation but deliberately withholds
+// its return until a test releases it, modeling a checkpoint still in flight.
+type blockingBackgroundRuntime struct {
+	*fakeDaemonRuntime
+	started   chan struct{}
+	canceled  chan struct{}
+	release   chan struct{}
+	returned  chan struct{}
+	returnErr error
+}
+
+// RunBackground exposes cancellation separately from completion so tests can
+// prove runtime Close cannot overtake an unfinished lifecycle projection.
+func (runtime *blockingBackgroundRuntime) RunBackground(ctx context.Context) error {
+	close(runtime.started)
+	<-ctx.Done()
+	close(runtime.canceled)
+	<-runtime.release
+	close(runtime.returned)
+	return runtime.returnErr
 }
 
 // fakeManagedServer owns only one temporary Unix listener and never creates an
@@ -68,6 +131,63 @@ type fakeManagedServer struct {
 	done    chan struct{}
 	once    sync.Once
 	listen  *net.UnixListener
+}
+
+// immediatelyStoppedServer models an API serve loop that returns nil without
+// any shutdown request, which must still terminate the daemon unsuccessfully.
+type immediatelyStoppedServer struct {
+	order    *[]string
+	started  chan struct{}
+	shutdown sync.Once
+}
+
+// shutdownWithoutWaitServer violates the managed endpoint contract by
+// returning successfully from Shutdown while its Wait result remains blocked.
+// It lets runDaemon prove this implementation error is bounded and fail-closed.
+type shutdownWithoutWaitServer struct {
+	order   *[]string
+	started chan struct{}
+	release chan struct{}
+}
+
+// Start publishes the fake endpoint without creating a listener.
+func (endpoint *shutdownWithoutWaitServer) Start() error {
+	*endpoint.order = append(*endpoint.order, "start")
+	close(endpoint.started)
+	return nil
+}
+
+// Wait remains unresolved until test cleanup releases the intentionally broken endpoint.
+func (endpoint *shutdownWithoutWaitServer) Wait() error {
+	<-endpoint.release
+	return nil
+}
+
+// Shutdown deliberately violates the interface contract by returning before Wait.
+func (endpoint *shutdownWithoutWaitServer) Shutdown(context.Context) error {
+	*endpoint.order = append(*endpoint.order, "shutdown")
+	return nil
+}
+
+// Start records publication without touching the filesystem, then allows the
+// independently invoked Wait method to report its unexpected nil result.
+func (endpoint *immediatelyStoppedServer) Start() error {
+	*endpoint.order = append(*endpoint.order, "start")
+	close(endpoint.started)
+	return nil
+}
+
+// Wait returns nil immediately to simulate a normalized Serve loop stopping
+// while the parent daemon context remains active.
+func (endpoint *immediatelyStoppedServer) Wait() error { return nil }
+
+// Shutdown records the cleanup request and succeeds idempotently because this
+// fake owns no listener or handler goroutine.
+func (endpoint *immediatelyStoppedServer) Shutdown(context.Context) error {
+	endpoint.shutdown.Do(func() {
+		*endpoint.order = append(*endpoint.order, "shutdown")
+	})
+	return nil
 }
 
 // Start binds the temporary UDS and announces readiness to the controlling
@@ -260,19 +380,266 @@ func TestRunDaemonRecoversBeforeBindingAndShutsDown(t *testing.T) {
 	requireJSONLogLines(t, logs.Bytes())
 }
 
-// TestBackgroundExitErrorTreatsCanceledWatcherAsNormal verifies a watcher that
-// observes cancellation first cannot turn graceful daemon shutdown into failure.
-func TestBackgroundExitErrorTreatsCanceledWatcherAsNormal(t *testing.T) {
+// TestRunDaemonJoinsBackgroundBeforeClosingRuntime verifies context shutdown
+// remains successful while a canceled watcher finishes its last checkpoint.
+func TestRunDaemonJoinsBackgroundBeforeClosingRuntime(t *testing.T) {
+	root := t.TempDir()
+	socketPath := filepath.Join(root, "api", "mydockerd.sock")
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	closedSignal := make(chan struct{})
+	baseRuntime := &fakeDaemonRuntime{socketPath: socketPath, order: &order, closedSignal: closedSignal}
+	runtime := &blockingBackgroundRuntime{
+		fakeDaemonRuntime: baseRuntime,
+		started:           make(chan struct{}),
+		canceled:          make(chan struct{}),
+		release:           make(chan struct{}),
+		returned:          make(chan struct{}),
+	}
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(runtime.release) })
+	endpointStarted := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	var logs bytes.Buffer
+	go func() {
+		result <- runDaemon(ctx, validDaemonArguments(root), &logs,
+			func(context.Context, daemonConfig) (daemonRuntime, error) {
+				order = append(order, "open")
+				return runtime, nil
+			},
+			newFakeEndpointFactory(socketPath, &order, endpointStarted))
+	}()
+	select {
+	case <-endpointStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("temporary UDS did not start")
+	}
+	select {
+	case <-runtime.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background lifecycle supervisor did not start")
+	}
 	cancel()
-	if err := backgroundExitError(ctx, nil); err != nil {
-		t.Fatalf("backgroundExitError(canceled, nil) = %v", err)
+	select {
+	case <-runtime.canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background lifecycle supervisor did not observe cancellation")
 	}
-	if err := backgroundExitError(ctx, errors.New("late watcher error")); err != nil {
-		t.Fatalf("backgroundExitError(canceled, error) = %v", err)
+	select {
+	case <-closedSignal:
+		t.Fatal("runtime closed before the background lifecycle supervisor returned")
+	default:
 	}
-	if err := backgroundExitError(context.Background(), nil); err == nil {
-		t.Fatal("backgroundExitError(active, nil) error = nil")
+	select {
+	case err := <-result:
+		t.Fatalf("runDaemon returned before background release: %v", err)
+	default:
+	}
+	wantBeforeRelease := []string{"open", "preflight", "reconcile", "construct-server", "start", "shutdown"}
+	if !reflect.DeepEqual(order, wantBeforeRelease) {
+		t.Fatalf("shutdown order before background release = %v, want %v", order, wantBeforeRelease)
+	}
+	releaseOnce.Do(func() { close(runtime.release) })
+	select {
+	case <-runtime.returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background lifecycle supervisor did not return after release")
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("context shutdown error = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not return after background lifecycle supervisor joined")
+	}
+	select {
+	case <-closedSignal:
+	default:
+		t.Fatal("runtime was not closed after background lifecycle supervisor joined")
+	}
+	wantOrder := append(wantBeforeRelease, "close")
+	if !reflect.DeepEqual(order, wantOrder) {
+		t.Fatalf("complete shutdown order = %v, want %v", order, wantOrder)
+	}
+	requireJSONLogLines(t, logs.Bytes())
+}
+
+// TestRunDaemonPreservesCheckpointFailureAfterCancellation verifies joined cancellation cannot hide a watcher error.
+func TestRunDaemonPreservesCheckpointFailureAfterCancellation(t *testing.T) {
+	root := t.TempDir()
+	socketPath := filepath.Join(root, "api", "mydockerd.sock")
+	if err := os.MkdirAll(filepath.Dir(socketPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var order []string
+	checkpointFailure := errors.New("injected checkpoint failure")
+	runtime := &blockingBackgroundRuntime{
+		fakeDaemonRuntime: &fakeDaemonRuntime{socketPath: socketPath, order: &order},
+		started:           make(chan struct{}),
+		canceled:          make(chan struct{}),
+		release:           make(chan struct{}),
+		returned:          make(chan struct{}),
+		returnErr:         errors.Join(context.Canceled, checkpointFailure),
+	}
+	endpointStarted := make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	var logs bytes.Buffer
+	go func() {
+		result <- runDaemon(ctx, validDaemonArguments(root), &logs,
+			func(context.Context, daemonConfig) (daemonRuntime, error) {
+				order = append(order, "open")
+				return runtime, nil
+			},
+			newFakeEndpointFactory(socketPath, &order, endpointStarted))
+	}()
+	select {
+	case <-runtime.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background lifecycle supervisor did not start")
+	}
+	cancel()
+	select {
+	case <-runtime.canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("background lifecycle supervisor did not observe cancellation")
+	}
+	close(runtime.release)
+	select {
+	case err := <-result:
+		if !errors.Is(err, checkpointFailure) {
+			t.Fatalf("runDaemon error = %v, want checkpoint failure", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("daemon did not join failed background watcher")
+	}
+	if !runtime.closed {
+		t.Fatal("quiescent failed watcher did not permit ordered runtime close")
+	}
+	requireJSONLogLines(t, logs.Bytes())
+}
+
+// TestRunDaemonRejectsUnexpectedNilEndpointWait verifies a normalized nil
+// Serve result is not mistaken for success while the daemon context is active.
+func TestRunDaemonRejectsUnexpectedNilEndpointWait(t *testing.T) {
+	root := t.TempDir()
+	socketPath := filepath.Join(root, "api", "mydockerd.sock")
+	var order []string
+	runtime := &fakeDaemonRuntime{socketPath: socketPath, order: &order}
+	endpointStarted := make(chan struct{})
+	var logs bytes.Buffer
+	err := runDaemon(context.Background(), validDaemonArguments(root), &logs,
+		func(context.Context, daemonConfig) (daemonRuntime, error) {
+			order = append(order, "open")
+			return runtime, nil
+		},
+		func(server.Config, server.Service) (managedServer, error) {
+			order = append(order, "construct-server")
+			return &immediatelyStoppedServer{order: &order, started: endpointStarted}, nil
+		})
+	if !errors.Is(err, errAPIStoppedUnexpectedly) {
+		t.Fatalf("error = %v, want unexpected API stop", err)
+	}
+	select {
+	case <-endpointStarted:
+	default:
+		t.Fatal("immediately stopped endpoint was not started")
+	}
+	wantOrder := []string{"open", "preflight", "reconcile", "construct-server", "start", "shutdown", "close"}
+	if !reflect.DeepEqual(order, wantOrder) {
+		t.Fatalf("unexpected API stop order = %v, want %v", order, wantOrder)
+	}
+	if !runtime.closed {
+		t.Fatal("quiescent runtime was not closed after unexpected API stop")
+	}
+	requireJSONLogLines(t, logs.Bytes())
+}
+
+// TestRunDaemonRejectsShutdownWithoutWaitConfirmation verifies a broken future
+// endpoint cannot turn the API shutdown phase into an unbounded receive or
+// authorize FileStore close while its serving-loop completion is unknown.
+func TestRunDaemonRejectsShutdownWithoutWaitConfirmation(t *testing.T) {
+	root := t.TempDir()
+	socketPath := filepath.Join(root, "api", "mydockerd.sock")
+	var order []string
+	runtime := &fakeDaemonRuntime{socketPath: socketPath, order: &order}
+	endpoint := &shutdownWithoutWaitServer{order: &order, started: make(chan struct{}), release: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	arguments := append(validDaemonArguments(root), "--shutdown-timeout", "20ms")
+	go func() {
+		result <- runDaemon(ctx, arguments, &bytes.Buffer{},
+			func(context.Context, daemonConfig) (daemonRuntime, error) {
+				order = append(order, "open")
+				return runtime, nil
+			},
+			func(server.Config, server.Service) (managedServer, error) {
+				order = append(order, "construct-server")
+				return endpoint, nil
+			})
+	}()
+	select {
+	case <-endpoint.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("endpoint did not start")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, errAPIWaitUnconfirmed) {
+			t.Fatalf("runDaemon error = %v, want unconfirmed API Wait", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runDaemon blocked on an unconfirmed endpoint Wait result")
+	}
+	if runtime.closed {
+		t.Fatal("runtime closed without API Wait confirmation")
+	}
+	close(endpoint.release)
+}
+
+// TestEndpointExitErrorPreservesUnexpectedResults verifies parent cancellation cannot normalize an independently stopped API.
+func TestEndpointExitErrorPreservesUnexpectedResults(t *testing.T) {
+	serveFailure := errors.New("injected serve failure")
+	if err := endpointExitError(nil); !errors.Is(err, errAPIStoppedUnexpectedly) {
+		t.Fatalf("endpointExitError(nil) = %v", err)
+	}
+	if err := endpointExitError(serveFailure); !errors.Is(err, serveFailure) {
+		t.Fatalf("endpointExitError(failure) = %v", err)
+	}
+}
+
+// TestJoinBackgroundTimeoutDoesNotClaimQuiescence verifies an unresponsive
+// watcher produces a bounded failure instead of authorizing runtime Close.
+func TestJoinBackgroundTimeoutDoesNotClaimQuiescence(t *testing.T) {
+	result := make(chan error)
+	err, quiescent := joinBackground(result, time.Nanosecond)
+	if !errors.Is(err, errBackgroundShutdownTimeout) {
+		t.Fatalf("join error = %v, want background shutdown timeout", err)
+	}
+	if quiescent {
+		t.Fatal("timed-out background watcher was reported quiescent")
+	}
+}
+
+// TestBackgroundExitClassificationPreservesRealErrors verifies only an exact post-stop cancellation is normal.
+func TestBackgroundExitClassificationPreservesRealErrors(t *testing.T) {
+	checkpointFailure := errors.New("late watcher error")
+	if err := backgroundExitError(nil); err == nil {
+		t.Fatal("backgroundExitError(nil) error = nil")
+	}
+	if err := backgroundExitError(checkpointFailure); !errors.Is(err, checkpointFailure) {
+		t.Fatalf("backgroundExitError(error) = %v", err)
+	}
+	if !expectedBackgroundShutdown(nil) || !expectedBackgroundShutdown(context.Canceled) {
+		t.Fatal("nil or exact context.Canceled was not accepted after explicit stop")
+	}
+	if expectedBackgroundShutdown(fmt.Errorf("checkpoint: %w", context.Canceled)) || expectedBackgroundShutdown(errors.Join(context.Canceled, checkpointFailure)) {
+		t.Fatal("wrapped or joined cancellation swallowed a checkpoint failure")
 	}
 }
 

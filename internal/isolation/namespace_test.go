@@ -282,8 +282,11 @@ func TestRunNamespaceSessionPIDUsesChildrenView(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunNamespaceSession() error = %v", err)
 	}
-	if !containsCall(ops.calls, "/proc/self/ns/pid_for_children") {
+	if !containsCall(ops.calls, "/proc/thread-self/ns/pid_for_children") {
 		t.Fatalf("PID session calls = %v, want pid_for_children", ops.calls)
+	}
+	if containsCall(ops.calls, "/proc/self/ns/") {
+		t.Fatalf("PID session inspected the thread-group leader instead of the locked thread: %v", ops.calls)
 	}
 }
 

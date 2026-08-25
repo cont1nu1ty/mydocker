@@ -18,6 +18,7 @@ import (
 
 	"mydocker/internal/domain"
 	"mydocker/internal/ownership"
+	"mydocker/internal/strictjson"
 )
 
 const maxTerminalBytes = 1 << 20
@@ -39,13 +40,16 @@ const (
 	TerminalChildExit TerminalReason = "child_exit"
 	// TerminalStartFailed records the consumed one-shot gate when fork/exec failed before a child existed.
 	TerminalStartFailed TerminalReason = "start_failed"
+	// TerminalLaunchAborted records a workload that exec'd but was killed and
+	// fully reaped before a strong child handle could be published.
+	TerminalLaunchAborted TerminalReason = "launch_aborted"
 	// TerminalWaitFailed records a child that existed but could not yield a trustworthy wait result.
 	TerminalWaitFailed TerminalReason = "wait_failed"
 )
 
 // Valid reports whether reason is in the durable M3 terminal vocabulary.
 func (reason TerminalReason) Valid() bool {
-	return reason == TerminalChildExit || reason == TerminalStartFailed || reason == TerminalWaitFailed
+	return reason == TerminalChildExit || reason == TerminalStartFailed || reason == TerminalLaunchAborted || reason == TerminalWaitFailed
 }
 
 // TerminalRecord is the immutable owner-scoped result written by the long-lived init wrapper.
@@ -104,6 +108,10 @@ func (record TerminalRecord) Validate() error {
 	case TerminalStartFailed:
 		if record.ChildExit != nil || record.Outcome.Presence != domain.OutcomeNotApplicable || record.Diagnostic == "" {
 			return errors.New("start failure requires no child, a not-applicable outcome, and a diagnostic")
+		}
+	case TerminalLaunchAborted:
+		if record.ChildExit != nil || record.Outcome.Presence != domain.OutcomeUnknown || record.Diagnostic == "" {
+			return errors.New("aborted launch requires no publishable child, an unknown outcome, and a diagnostic")
 		}
 	case TerminalChildExit, TerminalWaitFailed:
 		if record.ChildExit == nil {
@@ -218,13 +226,8 @@ func (store *FileTerminalStore) Load() (TerminalRecord, bool, error) {
 		return TerminalRecord{}, false, fmt.Errorf("%w: record exceeds %d bytes", ErrTerminalCorrupt, maxTerminalBytes)
 	}
 	var record TerminalRecord
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&record); err != nil {
+	if err := strictjson.Decode(payload, &record); err != nil {
 		return TerminalRecord{}, false, fmt.Errorf("%w: decode: %v", ErrTerminalCorrupt, err)
-	}
-	if err := requireJSONEOF(decoder); err != nil {
-		return TerminalRecord{}, false, fmt.Errorf("%w: %v", ErrTerminalCorrupt, err)
 	}
 	if err := record.Validate(); err != nil {
 		return TerminalRecord{}, false, fmt.Errorf("%w: %v", ErrTerminalCorrupt, err)
@@ -495,17 +498,4 @@ func writeAll(writer io.Writer, payload []byte) error {
 		payload = payload[written:]
 	}
 	return nil
-}
-
-// requireJSONEOF rejects a second JSON value or non-whitespace trailing data.
-func requireJSONEOF(decoder *json.Decoder) error {
-	var trailing any
-	err := decoder.Decode(&trailing)
-	if errors.Is(err, io.EOF) {
-		return nil
-	}
-	if err == nil {
-		return errors.New("unexpected second JSON value")
-	}
-	return fmt.Errorf("invalid trailing JSON: %w", err)
 }

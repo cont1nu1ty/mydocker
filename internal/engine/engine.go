@@ -33,12 +33,13 @@ func (wallClock) Now() time.Time { return time.Now() }
 // AttemptObservation is the shim/supervisor fact needed to distinguish a
 // prepared wrapper, a running workload child, and a terminal outcome.
 type AttemptObservation struct {
-	Prepared bool
-	Starting bool
-	Running  bool
-	Terminal bool
-	Outcome  domain.Outcome
-	Evidence string
+	Prepared    bool
+	Starting    bool
+	Running     bool
+	Terminal    bool
+	StartFailed bool
+	Outcome     domain.Outcome
+	Evidence    string
 }
 
 // Validate rejects contradictory supervisor facts and terminal results without explicit outcome presence.
@@ -66,8 +67,13 @@ func (observation AttemptObservation) Validate() error {
 		if observation.Outcome.Presence == domain.OutcomePending {
 			return errors.New("terminal attempt observation requires a terminal outcome")
 		}
+		if observation.Outcome.Presence == domain.OutcomeNotApplicable && !observation.StartFailed {
+			return errors.New("not-applicable terminal attempt requires explicit start failure")
+		}
 	} else if observation.Outcome.Presence != "" && observation.Outcome.Presence != domain.OutcomePending {
 		return errors.New("non-terminal attempt observation cannot contain a terminal outcome")
+	} else if observation.StartFailed {
+		return errors.New("non-terminal attempt observation cannot report start failure")
 	}
 	return nil
 }

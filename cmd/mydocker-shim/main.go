@@ -9,8 +9,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strconv"
 	"syscall"
 
 	"mydocker/internal/isolation"
@@ -158,34 +156,11 @@ func runInit(ctx context.Context, config shim.RuntimeConfig) (resultErr error) {
 	if err != nil {
 		return err
 	}
-	wrapper, err := shim.NewInitWithRootfs(config.InitSpec(), shim.OSChildRunner{}, stdout, stderr, terminal, shim.NewPID1RootfsPreparer())
+	wrapper, err := shim.NewInitWithRootfs(config.InitSpec(), shim.OSChildRunner{}, stdout, stderr, terminal, shim.NewPID1RootfsPreparer(int(ownerDirectory.Fd())))
 	if err != nil {
 		return err
 	}
 	return serve(ctx, retainedConfig.ControlSocket, wrapper)
-}
-
-// retainInitArtifacts opens the trusted owner directory once and rewrites only
-// shim-local control/terminal paths through that FD so they survive pivot_root.
-func retainInitArtifacts(config shim.RuntimeConfig) (*os.File, shim.RuntimeConfig, error) {
-	ownerRoot := filepath.Dir(config.ControlSocket)
-	if filepath.Dir(config.TerminalPath) != ownerRoot || filepath.Dir(config.LogPath) != ownerRoot {
-		return nil, shim.RuntimeConfig{}, errors.New("init artifacts must share one owner directory")
-	}
-	directory, err := os.Open(ownerRoot)
-	if err != nil {
-		return nil, shim.RuntimeConfig{}, fmt.Errorf("retain init artifact directory: %w", err)
-	}
-	info, err := directory.Stat()
-	if err != nil || !info.IsDir() {
-		_ = directory.Close()
-		return nil, shim.RuntimeConfig{}, errors.New("retained init artifact descriptor is not a directory")
-	}
-	retainedRoot := filepath.Join("/proc/self/fd", strconv.FormatUint(uint64(directory.Fd()), 10))
-	retained := config
-	retained.ControlSocket = filepath.Join(retainedRoot, filepath.Base(config.ControlSocket))
-	retained.TerminalPath = filepath.Join(retainedRoot, filepath.Base(config.TerminalPath))
-	return directory, retained, nil
 }
 
 // serve binds the private control endpoint, keeps the wrapper resident across

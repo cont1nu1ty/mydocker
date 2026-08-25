@@ -261,6 +261,23 @@ func TestContainerLifecycleStructuredInputKillAndDelete(t *testing.T) {
 	if planned.Operation.State != operation.StateRunning || !planned.Actionable || planned.Plan.Signal != "SIGTERM" || planned.ProcessIdentity != identity {
 		t.Fatalf("PlanKill() = %#v", planned)
 	}
+	restoredPolicy, err := ActiveKillPolicy(planned.Operation)
+	if err != nil || !reflect.DeepEqual(restoredPolicy, policy) {
+		t.Fatalf("ActiveKillPolicy() = (%#v, %v), want original policy", restoredPolicy, err)
+	}
+	tamperedOperation := planned.Operation.Clone()
+	tamperedResponse, err := decodeKillResponse(tamperedOperation.Response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tamperedResponse.Plan.Signal = "SIGUSR1"
+	tamperedOperation.Response, err = encodeResponse(tamperedResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ActiveKillPolicy(tamperedOperation); err == nil {
+		t.Fatal("ActiveKillPolicy() accepted a plan that differed from the immutable request fingerprint")
+	}
 	verifier, ok := coordinator.verifier.(*acceptingVerifier)
 	if !ok || verifier.calls != 1 {
 		t.Fatalf("action-time verifier = %#v, want one call", coordinator.verifier)

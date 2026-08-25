@@ -1,7 +1,6 @@
 package state
 
 import (
-	"bytes"
 	"context"
 	cryptorand "crypto/rand"
 	"crypto/sha256"
@@ -21,6 +20,7 @@ import (
 
 	"mydocker/internal/domain"
 	"mydocker/internal/operation"
+	"mydocker/internal/strictjson"
 )
 
 const (
@@ -673,24 +673,12 @@ func loadFileData(directory *os.File, name, path string, files filePrimitives) (
 	return data, identity, true, envelope.SchemaVersion, nil
 }
 
-// decodeFileEnvelope rejects unknown fields, unknown schema versions, missing
-// payloads, checksum mismatches, malformed JSON, and any trailing JSON data.
+// decodeFileEnvelope rejects noncanonical, duplicate, unknown, non-UTF-8, or
+// trailing JSON before validating schema, payload presence, and checksum.
 func decodeFileEnvelope(encoded []byte) (fileEnvelope, error) {
-	if err := rejectDuplicateJSONKeys(encoded); err != nil {
-		return fileEnvelope{}, err
-	}
-	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	decoder.DisallowUnknownFields()
 	var envelope fileEnvelope
-	if err := decoder.Decode(&envelope); err != nil {
+	if err := strictjson.Decode(encoded, &envelope); err != nil {
 		return fileEnvelope{}, fmt.Errorf("decode persistence envelope: %w: %w", ErrInvalidRecord, err)
-	}
-	var trailing json.RawMessage
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return fileEnvelope{}, fmt.Errorf("persistence envelope has trailing JSON value: %w", ErrInvalidRecord)
-		}
-		return fileEnvelope{}, fmt.Errorf("persistence envelope has trailing data: %w: %w", ErrInvalidRecord, err)
 	}
 	if envelope.SchemaVersion != fileSchemaVersionV1 && envelope.SchemaVersion != fileSchemaVersionV2 &&
 		envelope.SchemaVersion != fileSchemaVersionV3 {
@@ -707,60 +695,6 @@ func decodeFileEnvelope(encoded []byte) (fileEnvelope, error) {
 		return fileEnvelope{}, fmt.Errorf("persistence payload checksum mismatch: %w", ErrInvalidRecord)
 	}
 	return envelope, nil
-}
-
-// rejectDuplicateJSONKeys walks the first JSON value and rejects ambiguous
-// object members at any depth before typed decoding can silently keep the last.
-func rejectDuplicateJSONKeys(encoded []byte) error {
-	decoder := json.NewDecoder(bytes.NewReader(encoded))
-	var walkValue func() error
-	walkValue = func() error {
-		token, err := decoder.Token()
-		if err != nil {
-			return err
-		}
-		delimiter, composite := token.(json.Delim)
-		if !composite {
-			return nil
-		}
-		switch delimiter {
-		case '{':
-			seen := make(map[string]struct{})
-			for decoder.More() {
-				keyToken, err := decoder.Token()
-				if err != nil {
-					return err
-				}
-				key, ok := keyToken.(string)
-				if !ok {
-					return fmt.Errorf("JSON object key is not a string")
-				}
-				if _, exists := seen[key]; exists {
-					return fmt.Errorf("duplicate JSON object key %q", key)
-				}
-				seen[key] = struct{}{}
-				if err := walkValue(); err != nil {
-					return err
-				}
-			}
-		case '[':
-			for decoder.More() {
-				if err := walkValue(); err != nil {
-					return err
-				}
-			}
-		default:
-			return fmt.Errorf("unexpected JSON delimiter %q", delimiter)
-		}
-		if _, err := decoder.Token(); err != nil {
-			return err
-		}
-		return nil
-	}
-	if err := walkValue(); err != nil {
-		return fmt.Errorf("ambiguous persistence JSON: %w: %w", ErrInvalidRecord, err)
-	}
-	return nil
 }
 
 // filePayloadDigest computes the canonical lowercase SHA-256 used to detect

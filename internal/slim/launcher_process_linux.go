@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"mydocker/internal/shim"
@@ -18,9 +19,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// OSProcessFactory uses Linux clone-time cgroup placement, pidfd capture,
-// Pdeathsig, and a parent-owned release pipe; construction has no side effects.
+// OSProcessFactory uses Linux clone-time cgroup placement, pidfd capture, and
+// a parent-owned release pipe; construction has no side effects. The pipe is
+// deliberately the sole parent-liveness gate because Linux parent-death
+// signals bind to the creating thread rather than the daemon process.
 type OSProcessFactory struct{}
+
+var errUnpublishedCleanupTimeout = errors.New("timed out waiting for unpublished shim process cleanup")
 
 // clone3ProbeArgs mirrors the stable Linux clone_args layout through the
 // cgroup field so a feature-specific preflight never depends on libc wrappers.
@@ -37,6 +42,12 @@ type clone3ProbeArgs struct {
 	setTIDSize uint64
 	cgroup     uint64
 }
+
+// clone3ProbeInvalidCgroupFD is representable by the kernel's signed file
+// descriptor type but cannot be opened under Linux's NR_OPEN ceiling. Using
+// an all-bits-set uint64 would be rejected as EINVAL before clone3 resolves
+// the descriptor, so it could not prove CLONE_INTO_CGROUP support.
+const clone3ProbeInvalidCgroupFD = uint64(1<<31 - 1)
 
 // Preflight submits a clone3 request with CLONE_PIDFD, CLONE_INTO_CGROUP, a
 // valid pidfd output pointer, and an intentionally invalid cgroup descriptor;
@@ -58,7 +69,7 @@ func clone3CgroupPIDFDProbe() syscall.Errno {
 	arguments := clone3ProbeArgs{
 		flags:  uint64(unix.CLONE_PIDFD) | uint64(unix.CLONE_INTO_CGROUP),
 		pidfd:  uint64(uintptr(unsafe.Pointer(&pidfd))),
-		cgroup: ^uint64(0),
+		cgroup: clone3ProbeInvalidCgroupFD,
 	}
 	_, _, errno := unix.Syscall(unix.SYS_CLONE3, uintptr(unsafe.Pointer(&arguments)), unsafe.Sizeof(arguments), 0)
 	return errno
@@ -119,7 +130,7 @@ func (OSProcessFactory) Start(ctx context.Context, spec ProcessLaunchSpec) (_ St
 	command.Env = append([]string(nil), spec.Environment...)
 	command.ExtraFiles = extraFiles
 	command.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: spec.CloneFlags, Pdeathsig: syscall.SIGKILL, Setsid: true,
+		Cloneflags: spec.CloneFlags, Setsid: true,
 		UseCgroupFD: true, CgroupFD: spec.CgroupFD, PidFD: &pidfd,
 	}
 	startErr := command.Start()
@@ -131,21 +142,25 @@ func (OSProcessFactory) Start(ctx context.Context, spec ProcessLaunchSpec) (_ St
 		return nil, errors.Join(append([]error{fmt.Errorf("start shim process: %w", startErr)}, closeErrors...)...)
 	}
 	if closeErr := errors.Join(closeErrors...); closeErr != nil {
-		_ = command.Process.Kill()
-		_ = command.Wait()
-		return nil, fmt.Errorf("close transferred launch descriptors: %w", closeErr)
+		terminate := command.Process.Kill
+		if pidfd >= 0 {
+			terminate = func() error {
+				return errors.Join(unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0), unix.Close(pidfd))
+			}
+		}
+		cleanupErr := terminateUnpublishedCommand(command, terminate, defaultLauncherCleanupTimeout)
+		return nil, errors.Join(fmt.Errorf("close transferred launch descriptors: %w", closeErr), cleanupErr)
 	}
 	if pidfd < 0 {
-		_ = command.Process.Kill()
-		_ = command.Wait()
-		return nil, errors.New("kernel did not return a clone-time pidfd")
+		cleanupErr := terminateUnpublishedCommand(command, command.Process.Kill, defaultLauncherCleanupTimeout)
+		return nil, errors.Join(errors.New("kernel did not return a clone-time pidfd"), cleanupErr)
 	}
 	cleanupFD, err := unix.FcntlInt(uintptr(pidfd), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
-		_ = unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0)
-		_ = command.Wait()
-		_ = unix.Close(pidfd)
-		return nil, fmt.Errorf("duplicate cleanup pidfd: %w", err)
+		cleanupErr := terminateUnpublishedCommand(command, func() error {
+			return errors.Join(unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0), unix.Close(pidfd))
+		}, defaultLauncherCleanupTimeout)
+		return nil, errors.Join(fmt.Errorf("duplicate cleanup pidfd: %w", err), cleanupErr)
 	}
 	done := make(chan error, 1)
 	go func() { done <- command.Wait() }()
@@ -155,6 +170,27 @@ func (OSProcessFactory) Start(ctx context.Context, spec ProcessLaunchSpec) (_ St
 		signalPIDFD: func(fd int) error { return unix.PidfdSendSignal(fd, unix.SIGKILL, nil, 0) },
 		closeFD:     unix.Close, abortDone: make(chan struct{}),
 	}, nil
+}
+
+// terminateUnpublishedCommand makes post-exec construction failures bounded.
+// Wait continues in one background goroutine after the deadline so the exact
+// child is eventually reaped without allowing Start to hang on an unkillable
+// task. The caller must supply the strongest available termination handle.
+func terminateUnpublishedCommand(command *exec.Cmd, terminate func() error, timeout time.Duration) error {
+	if command == nil || command.Process == nil || terminate == nil || timeout <= 0 {
+		return errors.New("unpublished process cleanup dependencies are incomplete")
+	}
+	terminateErr := terminate()
+	done := make(chan error, 1)
+	go func() { done <- command.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case waitErr := <-done:
+		return errors.Join(terminateErr, normalizeAbortedWait(waitErr))
+	case <-timer.C:
+		return errors.Join(terminateErr, errUnpublishedCleanupTimeout)
+	}
 }
 
 // closeTransferredFDs closes each unique valid transferred descriptor once

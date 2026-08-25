@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 	"unicode"
+
+	"mydocker/internal/strictjson"
 )
 
 // SchemaVersion is the only durable operation-record schema understood by this
@@ -432,8 +434,8 @@ func (o Operation) Validate() error {
 	if o.Result != ResultFailed && o.Reason != ReasonNone {
 		return errors.New("non-failed operation must use reason class none")
 	}
-	if len(o.Response) > 0 && !json.Valid(o.Response) {
-		return errors.New("operation response must be valid JSON")
+	if err := validateOpaqueJSON("operation response", o.Response); err != nil {
+		return err
 	}
 	if o.State == StatePending && o.Stage != StageValidate {
 		return fmt.Errorf("pending operation must remain at %q stage", StageValidate)
@@ -528,8 +530,21 @@ func (e Event) Validate() error {
 	if e.ObservedGeneration > e.Generation {
 		return errors.New("event observed generation must not exceed generation")
 	}
-	if len(e.Details) > 0 && !json.Valid(e.Details) {
-		return errors.New("event details must be valid JSON")
+	if err := validateOpaqueJSON("event details", e.Details); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateOpaqueJSON rejects bytes that the strict FileStore reader could not
+// later reopen, including duplicate decoded keys, invalid UTF-8, and trailing values.
+func validateOpaqueJSON(field string, payload json.RawMessage) error {
+	if len(payload) == 0 {
+		return nil
+	}
+	var document json.RawMessage
+	if err := strictjson.Decode(payload, &document); err != nil {
+		return fmt.Errorf("%s must contain one unambiguous JSON value: %w", field, err)
 	}
 	return nil
 }

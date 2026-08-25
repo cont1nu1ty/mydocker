@@ -81,6 +81,15 @@ func TestEventValidateRejectsInvalidFields(t *testing.T) {
 		},
 		"success with reason": func(event *Event) { event.Reason = ReasonInternal },
 		"invalid details":     func(event *Event) { event.Details = []byte("{") },
+		"duplicate details key": func(event *Event) {
+			event.Details = []byte(`{"from":"creating","from":"ready"}`)
+		},
+		"invalid details UTF-8": func(event *Event) {
+			event.Details = []byte{'"', 0xff, '"'}
+		},
+		"multiple details values": func(event *Event) {
+			event.Details = []byte(`{"from":"creating"} null`)
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

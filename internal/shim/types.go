@@ -305,7 +305,80 @@ type Child interface {
 // ChildRunner forks and execs one child without replacing the long-lived init wrapper process.
 type ChildRunner interface {
 	// Start receives structured process data and injected output writers, and returns only after strong identity capture.
+	// A failure must explicitly return either PreExecChildStartError (no workload
+	// ran) or ExecutedChildStartError (exec succeeded); unclassified failures are
+	// treated as unknown side effects and can never become not-applicable terminal state.
 	Start(domain.ProcessSpec, io.Writer, io.Writer) (Child, error)
+}
+
+// PreExecChildStartError proves that a ChildRunner returned before any workload
+// exec succeeded, which is the only error eligible for a not-applicable outcome.
+type PreExecChildStartError struct {
+	cause error
+}
+
+// NewPreExecChildStartError constructs explicit no-workload-effect evidence
+// while retaining a non-nil local diagnostic cause.
+func NewPreExecChildStartError(cause error) *PreExecChildStartError {
+	if cause == nil {
+		cause = errors.New("workload exec did not start")
+	}
+	return &PreExecChildStartError{cause: cause}
+}
+
+// Error returns the local pre-exec failure diagnostic.
+func (failure *PreExecChildStartError) Error() string {
+	if failure == nil || failure.cause == nil {
+		return ""
+	}
+	return failure.cause.Error()
+}
+
+// Unwrap exposes the proven pre-exec failure for local diagnosis.
+func (failure *PreExecChildStartError) Unwrap() error {
+	if failure == nil {
+		return nil
+	}
+	return failure.cause
+}
+
+// ExecutedChildStartError reports that exec succeeded but the runner could not
+// publish a usable Child handle; ProcessTreeQuiescent distinguishes a sealed
+// abort from cleanup whose absence proof is still unknown.
+type ExecutedChildStartError struct {
+	cause                error
+	processTreeQuiescent bool
+}
+
+// NewExecutedChildStartError constructs the mandatory post-exec failure signal
+// for ChildRunner implementations without allowing a nil diagnostic cause.
+func NewExecutedChildStartError(cause error, processTreeQuiescent bool) *ExecutedChildStartError {
+	if cause == nil {
+		cause = errors.New("executed workload could not be published")
+	}
+	return &ExecutedChildStartError{cause: cause, processTreeQuiescent: processTreeQuiescent}
+}
+
+// Error returns the bounded local post-exec failure diagnostic.
+func (failure *ExecutedChildStartError) Error() string {
+	if failure == nil || failure.cause == nil {
+		return ""
+	}
+	return failure.cause.Error()
+}
+
+// Unwrap exposes the underlying publication or cleanup failure for local diagnosis.
+func (failure *ExecutedChildStartError) Unwrap() error {
+	if failure == nil {
+		return nil
+	}
+	return failure.cause
+}
+
+// ProcessTreeQuiescent reports whether a final PID1 ECHILD observation proved
+// that the aborted workload left no direct or adopted child behind.
+func (failure *ExecutedChildStartError) ProcessTreeQuiescent() bool {
+	return failure != nil && failure.processTreeQuiescent
 }
 
 // TerminalStore is the durable boundary for the one immutable terminal record of an Attempt.

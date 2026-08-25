@@ -1,8 +1,6 @@
 package shim
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +9,7 @@ import (
 
 	"mydocker/internal/domain"
 	"mydocker/internal/ownership"
+	"mydocker/internal/strictjson"
 )
 
 const maxRuntimeConfigBytes = 1 << 20
@@ -129,14 +128,9 @@ func LoadRuntimeConfig(path string) (RuntimeConfig, error) {
 	if len(payload) > maxRuntimeConfigBytes {
 		return RuntimeConfig{}, errors.New("runtime config exceeds size limit")
 	}
-	decoder := json.NewDecoder(bytes.NewReader(payload))
-	decoder.DisallowUnknownFields()
 	var config RuntimeConfig
-	if err := decoder.Decode(&config); err != nil {
+	if err := strictjson.Decode(payload, &config); err != nil {
 		return RuntimeConfig{}, fmt.Errorf("decode runtime config: %w", err)
-	}
-	if err := requireJSONEOF(decoder); err != nil {
-		return RuntimeConfig{}, fmt.Errorf("runtime config trailing data: %w", err)
 	}
 	if err := config.Validate(); err != nil {
 		return RuntimeConfig{}, err

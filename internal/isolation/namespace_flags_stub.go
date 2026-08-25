@@ -26,5 +26,11 @@ func safeProcFlags() uintptr { return 0 }
 // safeDevFlags returns a harmless sentinel on unsupported platforms.
 func safeDevFlags() uintptr { return 0 }
 
+// characterDeviceMode returns only permissions before non-Linux Ops rejects mutation.
+func characterDeviceMode(permissions uint32) uint32 { return permissions }
+
+// deviceNumber returns a harmless sentinel before non-Linux Ops rejects mutation.
+func deviceNumber(uint32, uint32) int { return 0 }
+
 // detachUnmountFlag returns a harmless sentinel on unsupported platforms.
 func detachUnmountFlag() int { return 0 }

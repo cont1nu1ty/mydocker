@@ -48,6 +48,44 @@ func TestArtifactDirectoryCreationSyncsEachParent(t *testing.T) {
 	}
 }
 
+// TestStartGateTransitionPersistsConsumptionBeforeRelease verifies the gate
+// can only advance closed -> consuming -> released and an init launch can no
+// longer treat the durable consumption intent as a fresh closed gate.
+func TestStartGateTransitionPersistsConsumptionBeforeRelease(t *testing.T) {
+	root := privateSlimRoot(t)
+	store, err := newArtifactStore(root)
+	if err != nil {
+		t.Fatalf("newArtifactStore() error = %v", err)
+	}
+	owner := testOwner(t, "artifact-gate-consume", operation.TargetContainer, "container-artifact-gate")
+	receipt, err := newSlimReceipt(owner, ownership.KindStartGate, map[string]string{attemptIDAttribute: "attempt-artifact-gate"})
+	if err != nil {
+		t.Fatalf("newSlimReceipt() error = %v", err)
+	}
+	if _, err := store.Ensure(owner, ownership.KindStartGate, receipt.EvidenceSHA256, artifactStateClosed); err != nil {
+		t.Fatalf("Ensure() error = %v", err)
+	}
+	if err := store.Transition(owner, ownership.KindStartGate, receipt.EvidenceSHA256, artifactStateReleased); !errors.Is(err, ErrArtifactUnsafe) {
+		t.Fatalf("direct closed -> released error = %v, want ErrArtifactUnsafe", err)
+	}
+	if err := store.Transition(owner, ownership.KindStartGate, receipt.EvidenceSHA256, artifactStateConsuming); err != nil {
+		t.Fatalf("Transition(consuming) error = %v", err)
+	}
+	record, found, err := store.Read(owner, ownership.KindStartGate)
+	if err != nil || !found || record.State != artifactStateConsuming {
+		t.Fatalf("Read(consuming) = (%+v, %t, %v)", record, found, err)
+	}
+	if err := validateInitArtifact(store, owner, receipt, ownership.KindStartGate, "attempt-artifact-gate", artifactStateClosed); err == nil {
+		t.Fatal("init artifact validation accepted a consuming gate as closed")
+	}
+	if err := store.Transition(owner, ownership.KindStartGate, receipt.EvidenceSHA256, artifactStateReleased); err != nil {
+		t.Fatalf("Transition(released) error = %v", err)
+	}
+	if err := store.Transition(owner, ownership.KindStartGate, receipt.EvidenceSHA256, artifactStateConsuming); !errors.Is(err, ErrArtifactUnsafe) {
+		t.Fatalf("released -> consuming error = %v, want ErrArtifactUnsafe", err)
+	}
+}
+
 // TestArtifactRemovalRetryConfirmsDirectoryDurability verifies a sync failure
 // after unlink remains retryable and an already-absent retry fsyncs the parents.
 func TestArtifactRemovalRetryConfirmsDirectoryDurability(t *testing.T) {

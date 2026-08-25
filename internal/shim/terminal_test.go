@@ -64,6 +64,31 @@ func TestSameTerminalRecordRequiresCanonicalPayload(t *testing.T) {
 	}
 }
 
+// TestLaunchAbortedTerminalRequiresUnknownOutcome verifies the durable reason
+// distinguishes an executed workload from both pre-exec failure and known exit.
+func TestLaunchAbortedTerminalRequiresUnknownOutcome(t *testing.T) {
+	spec := testInitSpec(t, "op-launch-aborted", "container-launch-aborted", "attempt-launch-aborted")
+	record, err := NewTerminalRecord(
+		spec, TerminalLaunchAborted, domain.UnknownOutcome(domain.EvidenceUnknown), nil,
+		"pidfd publication failed after exec; process tree reaped", testTime(),
+	)
+	if err != nil {
+		t.Fatalf("NewTerminalRecord() error = %v", err)
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("record.Validate() error = %v", err)
+	}
+	record.Outcome = domain.NotApplicableOutcome()
+	checksum, err := terminalChecksum(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record.ChecksumSHA256 = checksum
+	if err := record.Validate(); err == nil {
+		t.Fatal("launch-aborted record accepted a not-applicable outcome")
+	}
+}
+
 // TestFileTerminalStoreSyncOrder verifies file sync precedes rename and directory sync follows publication.
 func TestFileTerminalStoreSyncOrder(t *testing.T) {
 	directory := privateTempDir(t)

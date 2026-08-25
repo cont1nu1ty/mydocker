@@ -1,11 +1,10 @@
 package server
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"net/url"
@@ -27,6 +26,8 @@ const (
 func (s *Server) route(writer http.ResponseWriter, request *http.Request) error {
 	path := request.URL.EscapedPath()
 	switch {
+	case path == v1.BasePath+"/info":
+		return s.handleInfo(writer, request)
 	case path == v1.BasePath+"/sandboxes":
 		return s.handleSandboxes(writer, request)
 	case strings.HasPrefix(path, v1.BasePath+"/sandboxes/"):
@@ -40,6 +41,32 @@ func (s *Server) route(writer http.ResponseWriter, request *http.Request) error 
 	default:
 		return v1.NewError(v1.CodeNotFound, "path", "v1 endpoint does not exist")
 	}
+}
+
+// handleInfo returns a validated immutable daemon identity through a bodyless read-only endpoint.
+func (s *Server) handleInfo(writer http.ResponseWriter, request *http.Request) error {
+	if err := requireMethod(writer, request, http.MethodGet); err != nil {
+		return err
+	}
+	if err := rejectUnknownQuery(request); err != nil {
+		return err
+	}
+	if err := rejectReadBody(request); err != nil {
+		return err
+	}
+	requestContext, err := readRequestContext(request, false)
+	if err != nil {
+		return err
+	}
+	response, err := s.service.Info(request.Context(), requestContext, v1.GetInfoRequest{})
+	if err != nil {
+		return err
+	}
+	if err := response.Validate(); err != nil {
+		return fmt.Errorf("validate daemon info response: %w", err)
+	}
+	writeSuccess(writer, requestContext, http.StatusOK, response)
+	return nil
 }
 
 // handleSandboxes serves top-level Sandbox creation and deterministic listing.
@@ -328,7 +355,8 @@ func parseLogLimit(value string) (int, error) {
 	return limit, nil
 }
 
-// validateLogPage fails closed on cross-Attempt frames, invalid checksums, or regressing stream positions.
+// validateLogPage fails closed on cross-Attempt frames, invalid checksums, or
+// any global cursor gap that would make the returned resume boundary incomplete.
 func validateLogPage(input v1.ListLogsRequest, frames []v1.LogFrame) error {
 	if len(frames) > input.Limit {
 		return v1.NewError(v1.CodeInternal, "logs", "service returned more frames than requested")
@@ -336,21 +364,17 @@ func validateLogPage(input v1.ListLogsRequest, frames []v1.LogFrame) error {
 	previousCursor := input.AfterCursor
 	streamSequences := make(map[string]uint64, 2)
 	for _, frame := range frames {
+		if err := frame.Validate(); err != nil {
+			return v1.WrapError(v1.CodeInternal, "logs", "service returned an invalid log frame", false, err)
+		}
 		if frame.ContainerID != input.ContainerID || frame.AttemptID != input.AttemptID {
 			return v1.NewError(v1.CodeInternal, "logs", "service returned a frame for a different Container Attempt")
 		}
-		if frame.Stream != "stdout" && frame.Stream != "stderr" {
-			return v1.NewError(v1.CodeInternal, "logs", "service returned an unsupported stream")
-		}
-		if frame.Cursor <= previousCursor || frame.Sequence == 0 || len(frame.Payload) == 0 {
-			return v1.NewError(v1.CodeInternal, "logs", "service returned an invalid cursor, sequence, or payload")
+		if previousCursor == math.MaxUint64 || frame.Cursor != previousCursor+1 {
+			return v1.NewError(v1.CodeInternal, "logs", "service returned a non-contiguous global cursor")
 		}
 		if previous := streamSequences[frame.Stream]; previous != 0 && frame.Sequence != previous+1 {
 			return v1.NewError(v1.CodeInternal, "logs", "service returned a non-contiguous per-stream sequence")
-		}
-		digest := sha256.Sum256(frame.Payload)
-		if frame.PayloadSHA256 != hex.EncodeToString(digest[:]) {
-			return v1.NewError(v1.CodeInternal, "logs", "service returned a frame with invalid payload evidence")
 		}
 		previousCursor = frame.Cursor
 		streamSequences[frame.Stream] = frame.Sequence
@@ -526,12 +550,14 @@ func parseEventLimit(value string) (int, error) {
 	return limit, nil
 }
 
-// validateEventPage fails closed when a Service returns unordered or non-resumable events.
+// validateEventPage permits the first retained suffix to start above one only
+// for an empty cursor, and otherwise requires every returned sequence to be contiguous.
 func validateEventPage(after uint64, events []v1.Event) error {
 	previous := after
-	for _, event := range events {
-		if event.Sequence <= previous {
-			return v1.NewError(v1.CodeInternal, "events", "service returned unordered event sequences")
+	for index, event := range events {
+		initialRetainedSuffix := index == 0 && after == 0
+		if event.Sequence == 0 || (!initialRetainedSuffix && event.Sequence != previous+1) {
+			return v1.NewError(v1.CodeInternal, "events", "service returned a non-contiguous event sequence")
 		}
 		previous = event.Sequence
 	}

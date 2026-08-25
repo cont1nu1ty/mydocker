@@ -221,6 +221,10 @@ func TestFileStoreRejectsInvalidDiskEnvelope(t *testing.T) {
 	schemaField := []byte(fmt.Sprintf("\"schema_version\":%d,", currentFileSchemaVersion))
 	duplicateSchemaField := []byte(fmt.Sprintf("\"schema_version\":%d,\"schema_version\":%d,", currentFileSchemaVersion, currentFileSchemaVersion))
 	duplicateField := bytes.Replace(valid, schemaField, duplicateSchemaField, 1)
+	decodedDuplicateField := bytes.Replace(valid, schemaField,
+		[]byte(fmt.Sprintf("\"schema_version\":%d,\"\\u0073chema_version\":%d,", currentFileSchemaVersion, currentFileSchemaVersion)), 1)
+	caseAliasedField := bytes.Replace(valid, []byte(`"schema_version"`), []byte(`"Schema_Version"`), 1)
+	invalidUTF8 := append(append([]byte(nil), valid...), 0xff)
 	duplicate := duplicateOperationEnvelope(t)
 
 	tests := []struct {
@@ -233,6 +237,9 @@ func TestFileStoreRejectsInvalidDiskEnvelope(t *testing.T) {
 		{name: "future file schema", data: future, want: ErrUnsupportedSchema},
 		{name: "unknown field", data: unknownField, want: ErrInvalidRecord},
 		{name: "duplicate JSON field", data: duplicateField, want: ErrInvalidRecord},
+		{name: "duplicate decoded JSON field", data: decodedDuplicateField, want: ErrInvalidRecord},
+		{name: "case aliased JSON field", data: caseAliasedField, want: ErrInvalidRecord},
+		{name: "invalid UTF-8", data: invalidUTF8, want: ErrInvalidRecord},
 		{name: "checksum mismatch", data: badChecksum, want: ErrInvalidRecord},
 		{name: "missing collection", data: missingCollection, want: ErrInvalidRecord},
 		{name: "duplicate operation", data: duplicate, want: ErrInvalidRecord},

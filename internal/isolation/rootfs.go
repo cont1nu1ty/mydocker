@@ -14,6 +14,23 @@ const (
 	maximumDevSizeBytes int64 = 64 << 20
 )
 
+// minimalDevice describes one fixed character device created only inside the
+// new private /dev tmpfs; arbitrary device numbers never enter the API.
+type minimalDevice struct {
+	name  string
+	major uint32
+	minor uint32
+}
+
+var minimalDevices = [...]minimalDevice{
+	{name: "null", major: 1, minor: 3},
+	{name: "zero", major: 1, minor: 5},
+	{name: "full", major: 1, minor: 7},
+	{name: "random", major: 1, minor: 8},
+	{name: "urandom", major: 1, minor: 9},
+	{name: "tty", major: 5, minor: 0},
+}
+
 // RootfsConfig identifies one owned rootfs and the only host subtree from which it may be opened.
 type RootfsConfig struct {
 	AllowedRoot  string `json:"allowed_root"`
@@ -123,6 +140,19 @@ func (h *LockedHelper) prepareRoot(ctx context.Context, config RootfsConfig, dns
 	if err := h.mount(rootfsDescriptorPath, rootfsDescriptorPath, "", selfBindRecursiveFlags(), ""); err != nil {
 		return fmt.Errorf("self-bind rootfs: %w", err)
 	}
+	// An FD opened before the self-bind remains attached to the covered lower
+	// mount. Reopen the same verified directory through the retained ownership
+	// root so pivot_root receives an FD for the new topmost bind mount.
+	mountedRootfsFD, err := h.ops.OpenDirectoryAt(allowedFD, relativeRootfs)
+	if err != nil {
+		return fmt.Errorf("%w: reopen self-bound rootfs beneath allowed root: %v", ErrUnsafePath, err)
+	}
+	defer h.ops.Close(mountedRootfsFD)
+	mountedRootfsStat, err := h.ops.Fstat(mountedRootfsFD)
+	if err != nil || !mountedRootfsStat.IsDirectory() || mountedRootfsStat.Dev != rootfsStat.Dev || mountedRootfsStat.Ino != rootfsStat.Ino {
+		return fmt.Errorf("%w: self-bound rootfs no longer names the verified directory", ErrUnsafeIdentity)
+	}
+	rootfsDescriptorPath = "/proc/self/fd/" + strconv.Itoa(mountedRootfsFD)
 	if dnsFD >= 0 {
 		if err := h.bindDNSFile(ctx, allowedFD, relativeRootfs, dnsFD); err != nil {
 			return err
@@ -165,6 +195,15 @@ func (h *LockedHelper) prepareRoot(ctx context.Context, config RootfsConfig, dns
 	data := "mode=0755,size=" + strconv.FormatInt(devSize, 10) + ",nr_inodes=1024"
 	if err := h.mount("tmpfs", "/dev", "tmpfs", safeDevFlags(), data); err != nil {
 		return fmt.Errorf("mount minimal /dev tmpfs: %w", err)
+	}
+	for _, device := range minimalDevices {
+		path := "/dev/" + device.name
+		if err := h.mknod(path, characterDeviceMode(0o666), deviceNumber(device.major, device.minor)); err != nil {
+			return fmt.Errorf("create minimal %s device: %w", path, err)
+		}
+		if err := h.chmod(path, 0o666); err != nil {
+			return fmt.Errorf("set minimal %s device permissions: %w", path, err)
+		}
 	}
 	h.rootfsPrepared = true
 	return nil

@@ -224,7 +224,7 @@ func verifyBootstrapNamespaces(ops Ops, bootstrap PID1Bootstrap) error {
 
 // activeNamespaceInode opens the caller's active namespace entry rather than PID pid_for_children.
 func activeNamespaceInode(ops Ops, namespaceType NamespaceType) (uint64, error) {
-	path := fmt.Sprintf("/proc/self/ns/%s", namespaceType.procName())
+	path := fmt.Sprintf("/proc/thread-self/ns/%s", namespaceType.procName())
 	fd, err := ops.OpenNamespace(path)
 	if err != nil {
 		return 0, err

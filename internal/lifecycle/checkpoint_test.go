@@ -643,7 +643,7 @@ func TestRecordContainerStartTerminalPersistsExactFailure(t *testing.T) {
 	}
 	terminalRequest := ContainerStartTerminalRequest{
 		OperationID: startRequest.OperationID, ContainerID: startRequest.ContainerID, Fingerprint: starting.Fingerprint,
-		Outcome: domain.NotApplicableOutcome(), Verification: testVerification(VerificationAttemptStopped, nil),
+		Outcome: domain.NotApplicableOutcome(), OperationFailed: true, Verification: testVerification(VerificationAttemptStopped, nil),
 	}
 	failed, err := coordinator.RecordContainerStartTerminal(context.Background(), terminalRequest)
 	if err == nil {

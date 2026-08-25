@@ -60,12 +60,13 @@ func TestPrepareRootSequence(t *testing.T) {
 	if locker.locks != 1 || locker.unlocks != 0 {
 		t.Fatalf("helper lock transitions = (%d, %d), want discarded tainted thread (1, 0)", locker.locks, locker.unlocks)
 	}
-	root := "/proc/self/fd/801"
+	lowerRoot := "/proc/self/fd/801"
+	mountedRoot := "/proc/self/fd/803"
 	want := []string{
 		"mount::/:" + ":" + unsignedString(privateRecursiveFlags()) + ":",
-		"mount:" + root + ":" + root + "::" + unsignedString(selfBindRecursiveFlags()) + ":",
-		"mkdir:" + root + "/.pivot_old:700",
-		"pivot:" + root + ":" + root + "/.pivot_old",
+		"mount:" + lowerRoot + ":" + lowerRoot + "::" + unsignedString(selfBindRecursiveFlags()) + ":",
+		"mkdir:" + mountedRoot + "/.pivot_old:700",
+		"pivot:" + mountedRoot + ":" + mountedRoot + "/.pivot_old",
 		"chdir:/",
 		"unmount:/.pivot_old:" + integerString(detachUnmountFlag()),
 		"remove:/.pivot_old",
@@ -73,6 +74,13 @@ func TestPrepareRootSequence(t *testing.T) {
 		"mount:proc:/proc:proc:" + unsignedString(safeProcFlags()) + ":",
 		"mkdir:/dev:755",
 		"mount:tmpfs:/dev:tmpfs:" + unsignedString(safeDevFlags()) + ":mode=0755,size=4194304,nr_inodes=1024",
+	}
+	for _, device := range minimalDevices {
+		path := "/dev/" + device.name
+		want = append(want,
+			fmt.Sprintf("mknod:%s:%o:%d", path, characterDeviceMode(0o666), deviceNumber(device.major, device.minor)),
+			fmt.Sprintf("chmod:%s:%o", path, uint32(0o666)),
+		)
 	}
 	if !reflect.DeepEqual(ops.mutations, want) {
 		t.Fatalf("PrepareRoot() mutations =\n%v\nwant\n%v", ops.mutations, want)
@@ -95,7 +103,7 @@ func TestPrepareRootWithDNSBindsDescriptorBeforePivot(t *testing.T) {
 		t.Fatalf("PrepareRootWithDNS() error = %v", err)
 	}
 	bind := "mount:/proc/self/fd/900:/proc/self/fd/802::" + unsignedString(fileBindFlags()) + ":"
-	pivot := "pivot:/proc/self/fd/801:/proc/self/fd/801/.pivot_old"
+	pivot := "pivot:/proc/self/fd/803:/proc/self/fd/803/.pivot_old"
 	bindIndex, pivotIndex := -1, -1
 	for index, mutation := range ops.mutations {
 		if mutation == bind {
@@ -146,7 +154,7 @@ func TestPrepareRootRetainsOneAllowedRootDescriptor(t *testing.T) {
 	if strings.Count(calls, "open-root:"+bootstrap.Rootfs.AllowedRoot) != 1 {
 		t.Fatalf("allowed-root opens:\n%s", calls)
 	}
-	if !strings.Contains(calls, "open-directory-at:800:attempt-1") ||
+	if strings.Count(calls, "open-directory-at:800:attempt-1") != 2 ||
 		strings.Count(calls, "open-file-at:800:attempt-1/etc/resolv.conf") != 2 {
 		t.Fatalf("descriptor-relative opens:\n%s", calls)
 	}
@@ -155,11 +163,26 @@ func TestPrepareRootRetainsOneAllowedRootDescriptor(t *testing.T) {
 	}
 }
 
+// TestPrepareRootRejectsSelfBindReopenIdentityChange verifies pivot never uses
+// a post-bind path lookup unless it resolves to the exact directory inode that
+// was opened and validated before any mount mutation.
+func TestPrepareRootRejectsSelfBindReopenIdentityChange(t *testing.T) {
+	ops := newFakeOps()
+	ops.fdStats[ops.mountedRootFD] = FileInfo{Mode: 0040000, Dev: 1, Ino: 99}
+	_, err := prepareTestRoot(ops, testRootfsConfig())
+	if !errors.Is(err, ErrUnsafeIdentity) {
+		t.Fatalf("PrepareRoot() error = %v, want ErrUnsafeIdentity", err)
+	}
+	if containsCall(ops.mutations, "pivot:") {
+		t.Fatalf("PrepareRoot() pivoted through changed rootfs identity: %v", ops.mutations)
+	}
+}
+
 // TestPrepareRootRejectsPlantedDirectories verifies pivot and mount targets cannot be preplanted links.
 func TestPrepareRootRejectsPlantedDirectories(t *testing.T) {
 	t.Run("put old must be new", func(t *testing.T) {
 		ops := newFakeOps()
-		ops.fail["mkdir:/proc/self/fd/801/.pivot_old"] = syscall.EEXIST
+		ops.fail["mkdir:/proc/self/fd/803/.pivot_old"] = syscall.EEXIST
 		_, err := prepareTestRoot(ops, testRootfsConfig())
 		if !errors.Is(err, ErrUnsafePath) {
 			t.Fatalf("PrepareRoot() error = %v, want ErrUnsafePath", err)
@@ -195,6 +218,7 @@ func TestPrepareRootFaultBoundaries(t *testing.T) {
 		{name: "old root detach", fail: "unmount:/.pivot_old", last: "unmount:/.pivot_old:"},
 		{name: "proc mount", fail: "mount:/proc", last: "mount:proc:/proc:"},
 		{name: "dev mount", fail: "mount:/dev", last: "mount:tmpfs:/dev:"},
+		{name: "null device", fail: "mknod:/dev/null", last: "mknod:/dev/null:"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

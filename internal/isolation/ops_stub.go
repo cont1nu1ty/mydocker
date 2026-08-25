@@ -102,6 +102,12 @@ func (systemOps) pivotRoot(string, string) error { return ErrUnsupportedPlatform
 // mkdir fails closed because rootfs preparation is Linux-only.
 func (systemOps) mkdir(string, uint32) error { return ErrUnsupportedPlatform }
 
+// mknod fails closed because device-node creation is Linux-only.
+func (systemOps) mknod(string, uint32, int) error { return ErrUnsupportedPlatform }
+
+// chmod fails closed because rootfs device permission changes are Linux-only.
+func (systemOps) chmod(string, uint32) error { return ErrUnsupportedPlatform }
+
 // remove fails closed because rootfs preparation is Linux-only.
 func (systemOps) remove(string) error { return ErrUnsupportedPlatform }
 

@@ -17,6 +17,8 @@ func (provider *IsolationProvider) ObserveAttempt(ctx context.Context, request p
 	if err := request.ValidateFor(ownership.ProviderLinux, ownership.KindInitProcess); err != nil {
 		return engine.AttemptObservation{}, err
 	}
+	unlockOwner := provider.lockOwner(request.Owner.Token)
+	defer unlockOwner()
 	reference, err := provider.resolver.Resolve(request)
 	if err != nil {
 		return engine.AttemptObservation{}, err
@@ -48,6 +50,7 @@ func (provider *IsolationProvider) ObserveAttempt(ctx context.Context, request p
 			return engine.AttemptObservation{}, errors.New("terminal shim observation omitted its record")
 		}
 		result.Terminal = true
+		result.StartFailed = terminalReasonFailsStart(observation.Terminal.Reason)
 		result.Outcome = observation.Terminal.Outcome.Clone()
 	default:
 		return engine.AttemptObservation{}, fmt.Errorf("unsupported shim state %q", observation.State)
@@ -56,6 +59,13 @@ func (provider *IsolationProvider) ObserveAttempt(ctx context.Context, request p
 		return engine.AttemptObservation{}, err
 	}
 	return result, nil
+}
+
+// terminalReasonFailsStart distinguishes failure to establish a publishable
+// workload from a child that was published and only later exited or lost
+// trustworthy wait evidence.
+func terminalReasonFailsStart(reason shim.TerminalReason) bool {
+	return reason == shim.TerminalStartFailed || reason == shim.TerminalLaunchAborted
 }
 
 // inspectAttemptShim performs one fresh owner-scoped inspection and validates all wrapper identity fields.
@@ -111,7 +121,7 @@ func (provider *IsolationProvider) doShimWithID(ctx context.Context, reference R
 	if err := request.Validate(); err != nil {
 		return shim.ControlResponse{}, err
 	}
-	response, err := provider.shim.Do(ctx, reference.Paths.ControlSocket, request)
+	response, peerPID, err := provider.shim.Do(ctx, reference.Paths.ControlSocket, reference.ProcessEvidence.PID, request)
 	if err != nil {
 		return shim.ControlResponse{}, err
 	}
@@ -120,6 +130,9 @@ func (provider *IsolationProvider) doShimWithID(ctx context.Context, reference R
 	}
 	if response.RequestID != requestID {
 		return shim.ControlResponse{}, errors.New("shim response request ID does not match request")
+	}
+	if peerPID != reference.ProcessEvidence.PID {
+		return shim.ControlResponse{}, errors.New("shim control peer does not match the exact init process evidence")
 	}
 	return response, nil
 }

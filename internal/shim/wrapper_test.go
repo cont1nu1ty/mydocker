@@ -321,7 +321,7 @@ func TestForwardSignalRejectsRetainedInvalidIdentity(t *testing.T) {
 func TestStartFailureConsumesGateAndRestoresTerminal(t *testing.T) {
 	spec := testInitSpec(t, "op-start-fail", "container-start-fail", "attempt-start-fail")
 	store := &memoryTerminalStore{}
-	runner := &fakeRunner{err: errors.New("injected fork failure")}
+	runner := &fakeRunner{err: NewPreExecChildStartError(errors.New("injected fork failure"))}
 	wrapper, err := NewInit(spec, InitDependencies{
 		Runner: runner, Stdout: io.Discard, Stderr: io.Discard, Terminal: store,
 		Clock: fixedClock{now: testTime()},
@@ -352,6 +352,110 @@ func TestStartFailureConsumesGateAndRestoresTerminal(t *testing.T) {
 	}
 	if restartRunner.starts.Load() != 0 {
 		t.Fatalf("restart runner starts=%d, want 0", restartRunner.starts.Load())
+	}
+}
+
+// TestUnclassifiedStartFailureCannotClaimWorkloadNeverRan verifies plain
+// adapter errors default to unknown side effects instead of not-applicable.
+func TestUnclassifiedStartFailureCannotClaimWorkloadNeverRan(t *testing.T) {
+	store := &memoryTerminalStore{}
+	wrapper, err := NewInit(
+		testInitSpec(t, "op-start-unclassified", "container-start-unclassified", "attempt-start-unclassified"),
+		InitDependencies{
+			Runner: &fakeRunner{err: errors.New("unclassified adapter failure")},
+			Stdout: io.Discard, Stderr: io.Discard, Terminal: store, Clock: fixedClock{now: testTime()},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wrapper.Release(); !IsCode(err, CodeUnavailable) {
+		t.Fatalf("Release() error = %v, want unavailable", err)
+	}
+	if _, err := wrapper.Inspect(); !IsCode(err, CodeUnavailable) {
+		t.Fatalf("Inspect() error = %v, want unavailable", err)
+	}
+	if store.CommitCount() != 0 {
+		t.Fatalf("terminal commits = %d, want 0 for unclassified side effects", store.CommitCount())
+	}
+}
+
+// TestNilChildWithoutFailureClassificationFailsClosed verifies a broken
+// runner cannot turn an ambiguous empty return into a never-ran terminal fact.
+func TestNilChildWithoutFailureClassificationFailsClosed(t *testing.T) {
+	store := &memoryTerminalStore{}
+	wrapper, err := NewInit(
+		testInitSpec(t, "op-start-nil", "container-start-nil", "attempt-start-nil"),
+		InitDependencies{
+			Runner: &fakeRunner{}, Stdout: io.Discard, Stderr: io.Discard,
+			Terminal: store, Clock: fixedClock{now: testTime()},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wrapper.Release(); !IsCode(err, CodeUnavailable) {
+		t.Fatalf("Release() error = %v, want unavailable", err)
+	}
+	if store.CommitCount() != 0 {
+		t.Fatalf("terminal commits = %d, want 0 for nil unclassified result", store.CommitCount())
+	}
+}
+
+// TestExecutedStartFailureRecordsUnknown verifies a workload that passed exec
+// can never be rewritten as the not-applicable result reserved for pre-exec failure.
+func TestExecutedStartFailureRecordsUnknown(t *testing.T) {
+	spec := testInitSpec(t, "op-exec-abort", "container-exec-abort", "attempt-exec-abort")
+	store := &memoryTerminalStore{}
+	injected := errors.New("injected pidfd publication failure")
+	wrapper, err := NewInit(spec, InitDependencies{
+		Runner: &fakeRunner{err: NewExecutedChildStartError(injected, true)},
+		Stdout: io.Discard, Stderr: io.Discard, Terminal: store, Clock: fixedClock{now: testTime()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wrapper.Release(); !IsCode(err, CodeStartFailed) || !errors.Is(err, injected) {
+		t.Fatalf("Release() error = %v, want start_failed wrapping publication failure", err)
+	}
+	observation, err := wrapper.Inspect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observation.State != StateTerminal || observation.Terminal == nil {
+		t.Fatalf("observation = %+v, want terminal launch abort", observation)
+	}
+	terminal := observation.Terminal
+	if terminal.Reason != TerminalLaunchAborted || terminal.Outcome.Presence != domain.OutcomeUnknown || terminal.ChildExit != nil {
+		t.Fatalf("terminal = %+v, want launch_aborted with unknown outcome and no invented child identity", terminal)
+	}
+	if store.CommitCount() != 1 {
+		t.Fatalf("terminal commits = %d, want 1", store.CommitCount())
+	}
+}
+
+// TestUnconfirmedExecutedStartCleanupBlocksTerminal verifies a post-exec
+// publication failure cannot become terminal until PID1 proves the tree absent.
+func TestUnconfirmedExecutedStartCleanupBlocksTerminal(t *testing.T) {
+	store := &memoryTerminalStore{}
+	wrapper, err := NewInit(
+		testInitSpec(t, "op-exec-unknown", "container-exec-unknown", "attempt-exec-unknown"),
+		InitDependencies{
+			Runner: &fakeRunner{err: NewExecutedChildStartError(errors.New("injected reap failure"), false)},
+			Stdout: io.Discard, Stderr: io.Discard, Terminal: store, Clock: fixedClock{now: testTime()},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wrapper.Release(); !IsCode(err, CodeUnavailable) {
+		t.Fatalf("Release() error = %v, want unavailable", err)
+	}
+	if _, err := wrapper.Inspect(); !IsCode(err, CodeUnavailable) {
+		t.Fatalf("Inspect() error = %v, want unavailable", err)
+	}
+	if store.CommitCount() != 0 {
+		t.Fatalf("terminal commits = %d, want 0 while post-exec cleanup is unconfirmed", store.CommitCount())
 	}
 }
 

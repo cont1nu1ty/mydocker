@@ -1787,6 +1787,11 @@ func validateOperationAdvance(current, next operation.Operation) error {
 	if current.State.Terminal() {
 		return nil
 	}
+	responseInitializedWithIntent := current.State == operation.StatePending && current.Stage == operation.StageValidate && len(current.Response) == 0 &&
+		next.State == operation.StateRunning && next.Stage == operation.StagePersistIntent && len(next.Response) != 0
+	if current.State.Active() && next.State.Active() && !bytes.Equal(current.Response, next.Response) && !responseInitializedWithIntent {
+		return fmt.Errorf("active operation response changed after durable intent: %w", ErrInvalidRecord)
+	}
 	if current.State == operation.StateRunning && next.State == operation.StatePending {
 		return fmt.Errorf("operation state regressed from running to pending: %w", ErrInvalidRecord)
 	}

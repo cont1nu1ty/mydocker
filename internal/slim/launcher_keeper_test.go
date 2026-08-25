@@ -170,6 +170,7 @@ func TestLinuxShimLauncherEnsureKeeperKillsStuckAuthorizedChildAndRelaunches(t *
 		fixture.runtime.present = false
 		fixture.manager.setMembers()
 		fixture.control.unavailable = 0
+		fixture.launcher.readinessTimeout = time.Second
 	}
 	fixture.factory.onStart = func(ProcessLaunchSpec) error {
 		fixture.manager.setMembers(fixture.evidence.PID)
@@ -215,6 +216,7 @@ func TestLinuxShimLauncherEnsureKeeperAcceptsExactAbsenceAfterSignalRace(t *test
 		fixture.runtime.present = false
 		fixture.manager.setMembers()
 		fixture.control.unavailable = 0
+		fixture.launcher.readinessTimeout = time.Second
 	}
 	fixture.factory.onStart = func(ProcessLaunchSpec) error {
 		fixture.manager.setMembers(fixture.evidence.PID)
@@ -581,13 +583,14 @@ func (process *fakeKeeperStartedProcess) Commit() error {
 
 // fakeKeeperProcessRuntime returns fresh inert strong handles from configured evidence.
 type fakeKeeperProcessRuntime struct {
-	evidence     isolation.ProcessEvidence
-	present      bool
-	captureCalls int
-	restoreCalls int
-	signalCalls  int
-	signalErr    error
-	onSignal     func()
+	evidence           isolation.ProcessEvidence
+	present            bool
+	presenceByEvidence map[isolation.ProcessEvidence]bool
+	captureCalls       int
+	restoreCalls       int
+	signalCalls        int
+	signalErr          error
+	onSignal           func()
 }
 
 // CaptureFromPIDFD binds the supplied fake PID to the configured evidence without opening procfs.
@@ -600,6 +603,9 @@ func (runtime *fakeKeeperProcessRuntime) CaptureFromPIDFD(ctx context.Context, p
 	}
 	runtime.captureCalls++
 	runtime.present = true
+	if runtime.presenceByEvidence != nil {
+		runtime.presenceByEvidence[runtime.evidence] = true
+	}
 	return &fakeKeeperProcessHandle{evidence: runtime.evidence, runtime: runtime}, nil
 }
 
@@ -624,6 +630,13 @@ func (runtime *fakeKeeperProcessRuntime) Restore(ctx context.Context, evidence i
 func (runtime *fakeKeeperProcessRuntime) Present(ctx context.Context, evidence isolation.ProcessEvidence) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
+	}
+	if runtime.presenceByEvidence != nil {
+		present, known := runtime.presenceByEvidence[evidence]
+		if !known {
+			return false, errors.New("fake presence evidence is not registered")
+		}
+		return present, nil
 	}
 	if evidence != runtime.evidence {
 		return false, errors.New("fake presence evidence mismatch")

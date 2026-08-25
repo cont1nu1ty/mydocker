@@ -10,6 +10,7 @@ import (
 	"mydocker/internal/domain"
 	"mydocker/internal/operation"
 	"mydocker/internal/state"
+	"mydocker/internal/strictjson"
 )
 
 // ReconcileConditionRequest records or clears one orthogonal recovery fact as
@@ -76,7 +77,7 @@ func (c *Coordinator) ReconcileCondition(ctx context.Context, request ReconcileC
 		}
 		if resolved.Resolution == operation.ResolutionReplay {
 			result.Operation = resolved.Record.Operation.Clone()
-			return decodeReconcileResponse(resolved.Record.Operation.Response, &result)
+			return decodeReconcileResponse(resolved.Record.Operation.Response, request.Target, &result)
 		}
 		if resolved.Resolution != operation.ResolutionNew {
 			return errors.New("new reconciliation state operation unexpectedly resolved as active")
@@ -161,22 +162,45 @@ type reconcileResponse struct {
 	ContainerAttempt *domain.ContainerAttempt `json:"container_attempt,omitempty"`
 }
 
-// decodeReconcileResponse restores the exact terminal state projection without consulting mutable current state.
-func decodeReconcileResponse(encoded json.RawMessage, result *ReconcileConditionResult) error {
+// decodeReconcileResponse restores the exact target-bound terminal projection
+// without consulting mutable current state or accepting an ambiguous payload shape.
+func decodeReconcileResponse(encoded json.RawMessage, target operation.Target, result *ReconcileConditionResult) error {
 	var response reconcileResponse
 	if len(encoded) == 0 {
 		return errors.New("reconciliation operation has no replay response")
 	}
-	if err := json.Unmarshal(encoded, &response); err != nil {
+	if err := strictjson.Decode(encoded, &response); err != nil {
 		return fmt.Errorf("decode reconciliation replay response: %w", err)
 	}
-	if response.Sandbox != nil {
+	switch target.Kind {
+	case operation.TargetSandbox:
+		if response.Sandbox == nil || response.ContainerAttempt != nil {
+			return errors.New("Sandbox reconciliation replay response must contain only one Sandbox")
+		}
+		if err := response.Sandbox.Validate(); err != nil {
+			return fmt.Errorf("validate reconciliation replay Sandbox: %w", err)
+		}
+		if string(response.Sandbox.ID) != target.ID {
+			return errors.New("reconciliation replay Sandbox differs from its operation target")
+		}
 		sandbox := response.Sandbox.Clone()
 		result.Sandbox = &sandbox
-	}
-	if response.ContainerAttempt != nil {
+		result.ContainerAttempt = nil
+	case operation.TargetContainer:
+		if response.ContainerAttempt == nil || response.Sandbox != nil {
+			return errors.New("Container reconciliation replay response must contain only one Container Attempt")
+		}
+		if err := response.ContainerAttempt.Validate(); err != nil {
+			return fmt.Errorf("validate reconciliation replay Container Attempt: %w", err)
+		}
+		if string(response.ContainerAttempt.Container.ID) != target.ID {
+			return errors.New("reconciliation replay Container Attempt differs from its operation target")
+		}
 		pair := response.ContainerAttempt.Clone()
 		result.ContainerAttempt = &pair
+		result.Sandbox = nil
+	default:
+		return fmt.Errorf("unsupported reconciliation replay target kind %q", target.Kind)
 	}
 	return nil
 }

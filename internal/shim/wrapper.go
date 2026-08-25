@@ -233,6 +233,29 @@ func (wrapper *Wrapper) Release() (Observation, error) {
 
 	child, startErr := runner.Start(process, stdout, stderr)
 	if startErr != nil {
+		var executedFailure *ExecutedChildStartError
+		if errors.As(startErr, &executedFailure) {
+			if !executedFailure.ProcessTreeQuiescent() {
+				wrapper.mu.Lock()
+				wrapper.starting = false
+				wrapper.quiescenceErr = errors.Join(errDescendantCleanupUnconfirmed, startErr)
+				wrapper.mu.Unlock()
+				return Observation{}, newError(CodeUnavailable, "executed workload cleanup is not confirmed", startErr)
+			}
+			persistErr := wrapper.recordLaunchAborted(startErr)
+			if persistErr != nil {
+				return Observation{}, newError(CodePersistenceFailed, "aborted launch result was not durable", errors.Join(startErr, persistErr))
+			}
+			return Observation{}, newError(CodeStartFailed, "workload executed but its strong handle could not be published", startErr)
+		}
+		var preExecFailure *PreExecChildStartError
+		if !errors.As(startErr, &preExecFailure) {
+			wrapper.mu.Lock()
+			wrapper.starting = false
+			wrapper.quiescenceErr = errors.Join(errDescendantCleanupUnconfirmed, errors.New("child start side effects were not classified"), startErr)
+			wrapper.mu.Unlock()
+			return Observation{}, newError(CodeUnavailable, "workload start side effects are unknown", startErr)
+		}
 		persistErr := wrapper.recordStartFailure(startErr)
 		if persistErr != nil {
 			return Observation{}, newError(CodePersistenceFailed, "child start failed and terminal result was not durable", errors.Join(startErr, persistErr))
@@ -240,12 +263,12 @@ func (wrapper *Wrapper) Release() (Observation, error) {
 		return Observation{}, newError(CodeStartFailed, "workload child could not be started", startErr)
 	}
 	if child == nil {
-		startErr = errors.New("child runner returned nil child")
-		persistErr := wrapper.recordStartFailure(startErr)
-		if persistErr != nil {
-			return Observation{}, newError(CodePersistenceFailed, "nil child result was not durably recorded", errors.Join(startErr, persistErr))
-		}
-		return Observation{}, newError(CodeStartFailed, "workload child could not be started", startErr)
+		startErr = errors.New("child runner returned neither a child nor classified failure")
+		wrapper.mu.Lock()
+		wrapper.starting = false
+		wrapper.quiescenceErr = errors.Join(errDescendantCleanupUnconfirmed, startErr)
+		wrapper.mu.Unlock()
+		return Observation{}, newError(CodeUnavailable, "workload start side effects are unknown", startErr)
 	}
 	identity := child.Identity()
 	if err := identity.Validate(); err != nil {
@@ -326,6 +349,19 @@ func (wrapper *Wrapper) recordStartFailure(startErr error) error {
 	record, err := NewTerminalRecord(
 		wrapper.initSpec(), TerminalStartFailed, domain.NotApplicableOutcome(), nil,
 		boundedDiagnostic(startErr), recordedAt,
+	)
+	if err != nil {
+		return err
+	}
+	return wrapper.commitTerminal(record)
+}
+
+// recordLaunchAborted persists an unknown terminal result only after the runner
+// proves an executed but unpublishable workload tree reached PID1 ECHILD.
+func (wrapper *Wrapper) recordLaunchAborted(startErr error) error {
+	record, err := NewTerminalRecord(
+		wrapper.initSpec(), TerminalLaunchAborted, domain.UnknownOutcome(domain.EvidenceUnknown), nil,
+		boundedDiagnostic(startErr), wrapper.clock.Now(),
 	)
 	if err != nil {
 		return err

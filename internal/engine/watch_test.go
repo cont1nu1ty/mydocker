@@ -185,7 +185,7 @@ func TestSynchronizeTerminalsSkipsActiveOperation(t *testing.T) {
 		t.Fatalf("PlanKill() error = %v", err)
 	}
 	host.mu.Lock()
-	host.attempt = AttemptObservation{Terminal: true, Evidence: "terminal-hidden-by-active-operation", Outcome: domain.NotApplicableOutcome()}
+	host.attempt = AttemptObservation{Terminal: true, StartFailed: true, Evidence: "terminal-hidden-by-active-operation", Outcome: domain.NotApplicableOutcome()}
 	host.mu.Unlock()
 	recorded, err := engine.SynchronizeTerminals(context.Background())
 	if err != nil || len(recorded) != 0 {

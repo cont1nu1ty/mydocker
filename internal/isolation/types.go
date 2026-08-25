@@ -114,6 +114,8 @@ type helperOps interface {
 	unmount(target string, flags int) error
 	pivotRoot(newRoot, putOld string) error
 	mkdir(path string, mode uint32) error
+	mknod(path string, mode uint32, device int) error
+	chmod(path string, mode uint32) error
 	remove(path string) error
 	chdir(path string) error
 }

@@ -113,6 +113,35 @@ func (source *fakeLogSource) Read(after logstore.Cursor, limit int) ([]logstore.
 	return result, nil
 }
 
+// TestServiceInfoSnapshotsInjectedBuildIdentity verifies callers cannot mutate the daemon's immutable v1 metadata.
+func TestServiceInfoSnapshotsInjectedBuildIdentity(t *testing.T) {
+	coordinator, _ := seededCoordinator(t)
+	modified := false
+	info := v1.InfoResponse{DaemonBuild: v1.DaemonBuildIdentity{
+		Source: v1.DaemonBuildIdentitySource, VCSRevision: "revision-one", VCSModified: &modified,
+	}}
+	service, err := newServiceWithInfo(&recordingMutator{}, coordinator, NewLogRegistry(), info)
+	if err != nil {
+		t.Fatalf("newServiceWithInfo() error = %v", err)
+	}
+	modified = true
+	first, err := service.Info(context.Background(), v1.RequestContext{RequestID: "request-info-1"}, v1.GetInfoRequest{})
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	if first.DaemonBuild.VCSModified == nil || *first.DaemonBuild.VCSModified {
+		t.Fatalf("Info() observed caller mutation: %#v", first)
+	}
+	*first.DaemonBuild.VCSModified = true
+	second, err := service.Info(context.Background(), v1.RequestContext{RequestID: "request-info-2"}, v1.GetInfoRequest{})
+	if err != nil {
+		t.Fatalf("second Info() error = %v", err)
+	}
+	if second.DaemonBuild.VCSModified == nil || *second.DaemonBuild.VCSModified {
+		t.Fatalf("Info() response aliased service state: %#v", second)
+	}
+}
+
 // TestServiceQueriesProjectMemoryStoreFacts verifies Coordinator reads preserve public state while hiding internal response, event, stream, and process data.
 func TestServiceQueriesProjectMemoryStoreFacts(t *testing.T) {
 	coordinator, pair := seededCoordinator(t)

@@ -279,10 +279,11 @@ type SourceCatalog interface {
 	Resolve(context.Context, provider.OpaqueID) (isolation.RootfsConfig, error)
 }
 
-// ShimClient sends one owner-scoped request to an internally derived private control socket.
+// ShimClient sends one owner-scoped request to an internally derived private
+// control socket and returns the kernel-authenticated serving peer PID.
 type ShimClient interface {
-	// Do performs one fresh-connection shim control exchange.
-	Do(context.Context, string, shim.ControlRequest) (shim.ControlResponse, error)
+	// Do performs one fresh-connection shim control exchange with peer identity.
+	Do(context.Context, string, int, shim.ControlRequest) (shim.ControlResponse, int, error)
 }
 
 // RequestIDs supplies non-replayed shim request IDs across one daemon session.

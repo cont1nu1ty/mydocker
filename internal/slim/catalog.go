@@ -55,9 +55,9 @@ func (catalog *StaticSourceCatalog) Resolve(ctx context.Context, id provider.Opa
 // unixShimClient uses the production fresh-connection control implementation.
 type unixShimClient struct{}
 
-// Do delegates one owner-scoped exchange to shim.DoControl.
-func (unixShimClient) Do(ctx context.Context, path string, request shim.ControlRequest) (shim.ControlResponse, error) {
-	return shim.DoControl(ctx, path, request)
+// Do delegates one owner-scoped exchange to shim.DoControlWithPeer.
+func (unixShimClient) Do(ctx context.Context, path string, expectedPeerPID int, request shim.ControlRequest) (shim.ControlResponse, int, error) {
+	return shim.DoControlWithExpectedPeer(ctx, path, expectedPeerPID, request)
 }
 
 // sessionRequestIDs combines one random daemon-session prefix with a monotonic local counter.

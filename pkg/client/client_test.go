@@ -300,6 +300,45 @@ func TestStrictResponseRejectsUnknownFields(t *testing.T) {
 	}
 }
 
+// TestInfoUsesReadOnlyV1EndpointAndValidatesIdentity verifies the typed call sends no operation identity and rejects semantic drift.
+func TestInfoUsesReadOnlyV1EndpointAndValidatesIdentity(t *testing.T) {
+	modified := false
+	valid := v1.InfoResponse{DaemonBuild: v1.DaemonBuildIdentity{
+		Source: v1.DaemonBuildIdentitySource, VCSRevision: "revision-one", VCSModified: &modified,
+	}}
+	t.Run("valid response", func(t *testing.T) {
+		transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			if request.Method != http.MethodGet || request.URL.EscapedPath() != v1.BasePath+"/info" || request.Header.Get(v1.HeaderOperationID) != "" {
+				t.Fatalf("Info request = %s %s operation=%q", request.Method, request.URL.EscapedPath(), request.Header.Get(v1.HeaderOperationID))
+			}
+			return successfulResponse(t, request, http.StatusOK, valid), nil
+		})
+		apiClient := newWithTransport(
+			Config{Timeout: time.Second, MaxResponseBytes: 4096}, transport,
+			func() (string, error) { return "request-info", nil },
+		)
+		response, err := apiClient.Info(context.Background())
+		if err != nil {
+			t.Fatalf("Info() error = %v", err)
+		}
+		if response.DaemonBuild.VCSRevision != "revision-one" {
+			t.Fatalf("Info() = %#v", response)
+		}
+	})
+	t.Run("invalid response", func(t *testing.T) {
+		transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			return rawResponse(request, http.StatusOK, `{"daemon_build":{"source":"daemon_binary_go_build_info","unavailable":false,"vcs_revision":"unknown","vcs_modified":false}}`), nil
+		})
+		apiClient := newWithTransport(
+			Config{Timeout: time.Second, MaxResponseBytes: 4096}, transport,
+			func() (string, error) { return "request-info", nil },
+		)
+		if _, err := apiClient.Info(context.Background()); err == nil || !strings.Contains(err.Error(), "usable VCS revision") {
+			t.Fatalf("Info() error = %v, want semantic identity rejection", err)
+		}
+	})
+}
+
 // TestPaginationRejectsSkippedEventAndLogPositions verifies a response cannot
 // advance an opaque resume position past data omitted from the returned page.
 func TestPaginationRejectsSkippedEventAndLogPositions(t *testing.T) {

@@ -47,5 +47,11 @@ func safeProcFlags() uintptr { return unix.MS_NOSUID | unix.MS_NODEV | unix.MS_N
 // safeDevFlags returns restrictive flags for the minimal tmpfs /dev mount.
 func safeDevFlags() uintptr { return unix.MS_NOSUID | unix.MS_NOEXEC }
 
+// characterDeviceMode combines the Linux character-device type with explicit permissions.
+func characterDeviceMode(permissions uint32) uint32 { return unix.S_IFCHR | permissions }
+
+// deviceNumber encodes one bounded Linux major/minor pair for mknod.
+func deviceNumber(major, minor uint32) int { return int(unix.Mkdev(major, minor)) }
+
 // detachUnmountFlag returns the non-blocking detach flag for the old root mount.
 func detachUnmountFlag() int { return unix.MNT_DETACH }

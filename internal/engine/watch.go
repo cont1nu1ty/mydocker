@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -260,18 +259,9 @@ func (engine *Engine) operationAlreadyTerminal(ctx context.Context, operationID 
 // killPolicyFromOperation restores the immutable termination policy retained
 // in an active Kill response without deriving it from mutable Container state.
 func killPolicyFromOperation(active operation.Operation) (domain.TerminationPolicy, error) {
-	var response struct {
-		Plan domain.KillPlan `json:"plan"`
-	}
-	if err := json.Unmarshal(active.Response, &response); err != nil {
-		return domain.TerminationPolicy{}, fmt.Errorf("decode active Kill %q plan: %w", active.ID, err)
-	}
-	policy := domain.TerminationPolicy{
-		Signal: response.Plan.Signal, GracePeriod: response.Plan.GracePeriod,
-		EscalationSignal: response.Plan.EscalationSignal,
-	}
-	if err := policy.Validate(); err != nil {
-		return domain.TerminationPolicy{}, fmt.Errorf("validate active Kill %q policy: %w", active.ID, err)
+	policy, err := lifecycle.ActiveKillPolicy(active)
+	if err != nil {
+		return domain.TerminationPolicy{}, fmt.Errorf("restore active Kill %q policy: %w", active.ID, err)
 	}
 	return policy, nil
 }

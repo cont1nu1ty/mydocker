@@ -36,6 +36,14 @@ type IsolationProvider struct {
 	resolver    *receiptResolver
 }
 
+// lockOwner serializes gate consumption and action-time control with launcher
+// recovery for one runtime-root/owner pair, including across provider instances.
+func (provider *IsolationProvider) lockOwner(token string) func() {
+	lock := sharedOwnerOperationLock(provider.runtimeRoot, token)
+	lock.Lock()
+	return lock.Unlock
+}
+
 // New constructs a provider without performing host mutation or privileged preflight.
 func New(config Config) (*IsolationProvider, error) {
 	if config.Launcher == nil || config.Sources == nil {
@@ -182,6 +190,9 @@ func (provider *IsolationProvider) InspectProcess(ctx context.Context, request p
 
 // RemoveProcess action-time verifies and removes the exact wrapper, never a PID supplied by persistence.
 func (provider *IsolationProvider) RemoveProcess(ctx context.Context, request providerapi.OwnedReceiptRequest) (providerapi.CleanupObservation, error) {
+	if err := request.ValidateFor(ownership.ProviderLinux, ownership.KindKeeperProcess, ownership.KindInitProcess); err != nil {
+		return providerapi.CleanupObservation{}, err
+	}
 	reference, err := provider.resolver.Resolve(request)
 	if err != nil {
 		return providerapi.CleanupObservation{}, err
@@ -407,11 +418,13 @@ func (provider *IsolationProvider) EnsureStartGate(ctx context.Context, request 
 	if err := request.Validate(); err != nil {
 		return ownership.Receipt{}, err
 	}
+	unlockOwner := provider.lockOwner(request.Owner.Token)
+	defer unlockOwner()
 	receipt, err := newSlimReceipt(request.Owner, ownership.KindStartGate, map[string]string{attemptIDAttribute: string(request.AttemptID)})
 	if err != nil {
 		return ownership.Receipt{}, err
 	}
-	if _, err := provider.artifacts.Ensure(request.Owner, receipt.Kind, receipt.EvidenceSHA256, "closed"); err != nil {
+	if _, err := provider.artifacts.Ensure(request.Owner, receipt.Kind, receipt.EvidenceSHA256, artifactStateClosed); err != nil {
 		return ownership.Receipt{}, err
 	}
 	return receipt, nil
@@ -430,6 +443,11 @@ func (provider *IsolationProvider) RemoveStartGate(ctx context.Context, request 
 	if err := validateContext(ctx); err != nil {
 		return providerapi.CleanupObservation{}, err
 	}
+	if err := request.ValidateFor(ownership.ProviderLinux, ownership.KindStartGate); err != nil {
+		return providerapi.CleanupObservation{}, err
+	}
+	unlockOwner := provider.lockOwner(request.Owner.Token)
+	defer unlockOwner()
 	return provider.removeArtifact(request, ownership.KindStartGate)
 }
 
@@ -448,7 +466,7 @@ func (provider *IsolationProvider) EnsureStreams(ctx context.Context, request pr
 	if err != nil {
 		return ownership.Receipt{}, err
 	}
-	if _, err := provider.artifacts.Ensure(request.Owner, receipt.Kind, receipt.EvidenceSHA256, "ready"); err != nil {
+	if _, err := provider.artifacts.Ensure(request.Owner, receipt.Kind, receipt.EvidenceSHA256, artifactStateReady); err != nil {
 		return ownership.Receipt{}, err
 	}
 	return receipt, nil
@@ -475,6 +493,8 @@ func (provider *IsolationProvider) ReleaseStartGate(ctx context.Context, request
 	if err := request.Validate(); err != nil {
 		return providerapi.ResourceObservation{}, err
 	}
+	unlockOwner := provider.lockOwner(request.Owner.Token)
+	defer unlockOwner()
 	for _, receipt := range []ownership.Receipt{request.Gate, request.Process, request.Rootfs} {
 		if err := validateSlimReceipt(receipt); err != nil {
 			return providerapi.ResourceObservation{}, err
@@ -483,6 +503,18 @@ func (provider *IsolationProvider) ReleaseStartGate(ctx context.Context, request
 	attemptID := request.Process.Attributes[attemptIDAttribute]
 	if attemptID == "" || request.Gate.Attributes[attemptIDAttribute] != attemptID || request.Rootfs.Attributes[attemptIDAttribute] != attemptID {
 		return providerapi.ResourceObservation{}, errors.New("release receipts do not belong to one Attempt")
+	}
+	sandboxID := request.Process.Attributes[sandboxIDAttribute]
+	if sandboxID == "" || request.Rootfs.Attributes[sandboxIDAttribute] != sandboxID ||
+		request.Rootfs.Attributes[processEvidenceAttribute] != request.Process.Attributes[processEvidenceAttribute] {
+		return providerapi.ResourceObservation{}, errors.New("release rootfs does not belong to the exact init process")
+	}
+	cgroupScope, err := validateCgroupReceipt(providerapi.OwnedReceiptRequest{Owner: request.Owner, Receipt: request.Cgroup}, ownership.KindAttemptCgroup)
+	if err != nil {
+		return providerapi.ResourceObservation{}, fmt.Errorf("release Attempt cgroup: %w", err)
+	}
+	if string(cgroupScope.sandboxID) != sandboxID || string(cgroupScope.attemptID) != attemptID {
+		return providerapi.ResourceObservation{}, errors.New("release cgroup does not belong to the exact Sandbox and Attempt")
 	}
 	record, found, err := provider.artifacts.Read(request.Owner, ownership.KindStartGate)
 	if err != nil {
@@ -495,13 +527,46 @@ func (provider *IsolationProvider) ReleaseStartGate(ctx context.Context, request
 	if err != nil {
 		return providerapi.ResourceObservation{}, err
 	}
-	if record.State == "released" {
+	if record.State == artifactStateReleased {
+		if err := provider.artifacts.ConfirmState(request.Owner, ownership.KindStartGate, request.Gate.EvidenceSHA256, artifactStateReleased); err != nil {
+			return providerapi.ResourceObservation{}, err
+		}
 		observation, err := provider.inspectAttemptShim(ctx, process)
 		if err != nil {
 			return providerapi.ResourceObservation{}, err
 		}
 		if observation.State == shim.StatePrepared {
 			return providerapi.ResourceObservation{}, errors.New("released start gate conflicts with prepared wrapper state")
+		}
+		return presentObservation(request.Gate), nil
+	}
+	releaseRequired := record.State == artifactStateClosed
+	if releaseRequired {
+		if err := provider.artifacts.Transition(request.Owner, ownership.KindStartGate, request.Gate.EvidenceSHA256, artifactStateConsuming); err != nil {
+			return providerapi.ResourceObservation{}, fmt.Errorf("persist start-gate consumption intent: %w", err)
+		}
+	} else if record.State == artifactStateConsuming {
+		if err := provider.artifacts.ConfirmState(request.Owner, ownership.KindStartGate, request.Gate.EvidenceSHA256, artifactStateConsuming); err != nil {
+			return providerapi.ResourceObservation{}, err
+		}
+		observation, err := provider.inspectAttemptShim(ctx, process)
+		if err != nil {
+			return providerapi.ResourceObservation{}, err
+		}
+		switch observation.State {
+		case shim.StatePrepared:
+			releaseRequired = true
+		case shim.StateStarting, shim.StateRunning, shim.StateTerminal:
+			releaseRequired = false
+		default:
+			return providerapi.ResourceObservation{}, fmt.Errorf("unsupported shim state %q while recovering start-gate consumption", observation.State)
+		}
+	} else {
+		return providerapi.ResourceObservation{}, fmt.Errorf("unsupported start-gate state %q", record.State)
+	}
+	if !releaseRequired {
+		if err := provider.artifacts.Transition(request.Owner, ownership.KindStartGate, request.Gate.EvidenceSHA256, artifactStateReleased); err != nil {
+			return providerapi.ResourceObservation{}, err
 		}
 		return presentObservation(request.Gate), nil
 	}
@@ -531,7 +596,7 @@ func (provider *IsolationProvider) ReleaseStartGate(ctx context.Context, request
 			return providerapi.ResourceObservation{}, errors.New("shim release did not consume the gate")
 		}
 	}
-	if err := provider.artifacts.Transition(request.Owner, ownership.KindStartGate, request.Gate.EvidenceSHA256, "released"); err != nil {
+	if err := provider.artifacts.Transition(request.Owner, ownership.KindStartGate, request.Gate.EvidenceSHA256, artifactStateReleased); err != nil {
 		return providerapi.ResourceObservation{}, err
 	}
 	return presentObservation(request.Gate), nil
@@ -542,6 +607,8 @@ func (provider *IsolationProvider) SignalVerified(ctx context.Context, request p
 	if err := request.Validate(); err != nil {
 		return providerapi.SignalObservation{}, err
 	}
+	unlockOwner := provider.lockOwner(request.Owner.Token)
+	defer unlockOwner()
 	reference, err := provider.resolver.Resolve(providerapi.OwnedReceiptRequest{Owner: request.Owner, Receipt: request.Process})
 	if err != nil {
 		return providerapi.SignalObservation{}, err

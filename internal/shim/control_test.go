@@ -1,6 +1,7 @@
 package shim
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -17,6 +19,39 @@ import (
 	"mydocker/internal/operation"
 	"mydocker/internal/ownership"
 )
+
+// TestDecodeControlRequestRejectsAmbiguousJSON verifies the private shim
+// protocol applies the same no-alias, no-duplicate, valid-UTF-8 framing rules
+// as the public API and durable state loaders.
+func TestDecodeControlRequestRejectsAmbiguousJSON(t *testing.T) {
+	request := ControlRequest{
+		SchemaVersion: SchemaVersion, RequestID: "request-strict-json",
+		Owner: testKeeperSpec(t).Owner, Action: ActionInspect,
+	}
+	encoded, err := json.Marshal(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalidUTF8 := append([]byte(nil), encoded...)
+	requestIDOffset := bytes.Index(invalidUTF8, []byte("request-strict-json"))
+	if requestIDOffset < 0 {
+		t.Fatal("encoded request ID not found")
+	}
+	invalidUTF8[requestIDOffset] = 0xff
+	tests := map[string][]byte{
+		"duplicate decoded key": bytes.Replace(encoded, []byte(`"request_id":`), []byte(`"request_id":"duplicate","request_id":`), 1),
+		"case alias":            bytes.Replace(encoded, []byte(`"request_id"`), []byte(`"Request_ID"`), 1),
+		"invalid UTF-8":         invalidUTF8,
+		"second value":          append(append([]byte(nil), encoded...), []byte(` {}`)...),
+	}
+	for name, payload := range tests {
+		t.Run(name, func(t *testing.T) {
+			if _, err := decodeControlRequest(bytes.NewReader(payload)); err == nil {
+				t.Fatal("ambiguous control request was accepted")
+			}
+		})
+	}
+}
 
 // TestPrepareRootfsControlReplayAcrossIndependentDecodes verifies response-loss
 // retry compares canonical command content and never repeats the privileged preparer.
@@ -220,6 +255,66 @@ func TestUnixControlServerSurvivesClientDisconnect(t *testing.T) {
 	}
 }
 
+// TestRetainedDirectoryFDArtifactsWorkAcrossProcfs verifies the exact
+// descriptor-backed paths used by PID1 can persist terminal facts and serve a
+// private control socket after their original directory pathname is hidden by
+// pivot_root.
+func TestRetainedDirectoryFDArtifactsWorkAcrossProcfs(t *testing.T) {
+	directory := privateTempDir(t)
+	directoryFD, err := os.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer directoryFD.Close()
+	retainedRoot := fmt.Sprintf("/proc/self/fd/%d", directoryFD.Fd())
+	terminal, err := NewFileTerminalStore(filepath.Join(retainedRoot, "terminal.json"))
+	if err != nil {
+		t.Fatalf("NewFileTerminalStore(retained path) error = %v", err)
+	}
+	record := startFailureRecord(t)
+	if err := terminal.Commit(record); err != nil {
+		t.Fatalf("Commit(retained path) error = %v", err)
+	}
+	loaded, found, err := terminal.Load()
+	if err != nil || !found || !reflect.DeepEqual(loaded, record) {
+		t.Fatalf("Load(retained path) = (%+v, %t, %v), want exact record", loaded, found, err)
+	}
+
+	wrapper, err := NewKeeper(testKeeperSpec(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	socketPath := filepath.Join(retainedRoot, "control.sock")
+	server, err := NewControlServer(socketPath, wrapper)
+	if err != nil {
+		t.Fatalf("NewControlServer(retained path) error = %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(ctx) }()
+	response, err := DoControl(context.Background(), socketPath, ControlRequest{
+		SchemaVersion: SchemaVersion, RequestID: "retained-directory-inspect", Owner: wrapper.Owner(), Action: ActionInspect,
+	})
+	if err != nil || response.Error != nil || response.Observation == nil || response.Observation.State != StatePrepared {
+		t.Fatalf("retained control response = (%+v, %v)", response, err)
+	}
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("retained control server did not stop after cancellation")
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(directory, "control.sock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("control socket after Close() error = %v, want absent", err)
+	}
+}
+
 // TestControlServerCloseReplaysSocketReplacementFailure verifies repeated
 // cleanup cannot hide the first unsafe-inode diagnostic or delete a replacement.
 func TestControlServerCloseReplaysSocketReplacementFailure(t *testing.T) {
@@ -281,6 +376,50 @@ func TestDoControlWithPeerReturnsServingProcess(t *testing.T) {
 	}
 	if peerPID != os.Getpid() {
 		t.Fatalf("peer PID=%d, want %d", peerPID, os.Getpid())
+	}
+}
+
+// TestDoControlWithExpectedPeerRejectsBeforeRelease verifies socket
+// replacement detection happens before request bytes can consume the wrapper's
+// one-shot workload gate.
+func TestDoControlWithExpectedPeerRejectsBeforeRelease(t *testing.T) {
+	runner := &fakeRunner{child: newFakeChild()}
+	wrapper, err := NewInit(testInitSpec(t, "op-expected-peer", "container-expected-peer", "attempt-expected-peer"), InitDependencies{
+		Runner: runner, Stdout: io.Discard, Stderr: io.Discard,
+		Terminal: &memoryTerminalStore{}, Clock: fixedClock{now: testTime()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	directory := privateTempDir(t)
+	server, err := NewControlServer(filepath.Join(directory, "expected-peer.sock"), wrapper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	served := make(chan error, 1)
+	go func() { served <- server.Serve(ctx) }()
+	_, _, err = DoControlWithExpectedPeer(context.Background(), server.path, os.Getpid()+1, ControlRequest{
+		SchemaVersion: SchemaVersion, RequestID: "wrong-expected-peer-release", Owner: wrapper.Owner(), Action: ActionRelease,
+	})
+	if !IsCode(err, CodeUnavailable) {
+		t.Fatalf("DoControlWithExpectedPeer() error = %v, want unavailable", err)
+	}
+	observation, err := wrapper.Inspect()
+	if err != nil || observation.State != StatePrepared || runner.starts.Load() != 0 {
+		t.Fatalf("wrapper after rejected peer = (%+v, %v), starts=%d", observation, err, runner.starts.Load())
+	}
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("control server did not stop after expected-peer test")
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -200,6 +200,22 @@ func (h *LockedHelper) mkdir(path string, mode uint32) error {
 	return h.ops.mkdir(path, mode)
 }
 
+// mknod verifies the dedicated helper thread before creating one fixed device node.
+func (h *LockedHelper) mknod(path string, mode uint32, device int) error {
+	if err := h.checkThread(); err != nil {
+		return err
+	}
+	return h.ops.mknod(path, mode, device)
+}
+
+// chmod verifies the dedicated helper thread before normalizing device permissions.
+func (h *LockedHelper) chmod(path string, mode uint32) error {
+	if err := h.checkThread(); err != nil {
+		return err
+	}
+	return h.ops.chmod(path, mode)
+}
+
 // remove verifies the dedicated helper thread before removing a rootfs path.
 func (h *LockedHelper) remove(path string) error {
 	if err := h.checkThread(); err != nil {

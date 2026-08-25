@@ -113,7 +113,7 @@ func (h *LockedHelper) UnshareNamespaces(ctx context.Context, namespaceTypes ...
 
 // currentNamespaceInode opens and validates the current thread's namespace entry without joining or retaining it.
 func currentNamespaceInode(ops Ops, namespaceType NamespaceType) (uint64, error) {
-	path := fmt.Sprintf("/proc/self/ns/%s", namespaceType.threadProcName())
+	path := fmt.Sprintf("/proc/thread-self/ns/%s", namespaceType.threadProcName())
 	fd, err := ops.OpenNamespace(path)
 	if err != nil {
 		return 0, err
@@ -391,7 +391,7 @@ func beginNamespaceSession(ctx context.Context, helper *LockedHelper, namespaceT
 			_ = session.closeWithoutRestore()
 			return nil, fmt.Errorf("duplicate namespace %q", namespaceType)
 		}
-		fd, err := ops.OpenNamespace(fmt.Sprintf("/proc/self/ns/%s", namespaceType.threadProcName()))
+		fd, err := ops.OpenNamespace(fmt.Sprintf("/proc/thread-self/ns/%s", namespaceType.threadProcName()))
 		if err != nil {
 			_ = session.closeWithoutRestore()
 			return nil, fmt.Errorf("open original %s namespace: %w", namespaceType, err)
@@ -445,14 +445,14 @@ func (s *namespaceSession) join(ctx context.Context, handle *NamespaceHandle) er
 		if err := s.helper.setns(fd, flag); err != nil {
 			joinErr := fmt.Errorf("join %s namespace: %w", evidence.Type, err)
 			original := s.originals[evidence.Type]
-			probeErr := probeNamespaceInode(s.ops, fmt.Sprintf("/proc/self/ns/%s", evidence.Type.threadProcName()), evidence.Type, original.inode)
+			probeErr := probeNamespaceInode(s.ops, fmt.Sprintf("/proc/thread-self/ns/%s", evidence.Type.threadProcName()), evidence.Type, original.inode)
 			if probeErr == nil {
 				s.joined = s.joined[:len(s.joined)-1]
 				return joinErr
 			}
 			return errors.Join(joinErr, fmt.Errorf("verify namespace after failed setns: %w", probeErr))
 		}
-		if err := probeNamespaceInode(s.ops, fmt.Sprintf("/proc/self/ns/%s", evidence.Type.threadProcName()), evidence.Type, evidence.Inode); err != nil {
+		if err := probeNamespaceInode(s.ops, fmt.Sprintf("/proc/thread-self/ns/%s", evidence.Type.threadProcName()), evidence.Type, evidence.Inode); err != nil {
 			verifyErr := fmt.Errorf("verify joined %s namespace: %w", evidence.Type, err)
 			if restoreErr := s.restoreLocked(evidence.Type); restoreErr != nil {
 				return errors.Join(verifyErr, fmt.Errorf("restore after failed join verification: %w", restoreErr))
@@ -484,7 +484,7 @@ func (s *namespaceSession) restoreLocked(namespaceType NamespaceType) error {
 	if err := s.helper.setns(original.fd, flag); err != nil {
 		return fmt.Errorf("restore %s namespace: %w", namespaceType, err)
 	}
-	fd, err := s.ops.OpenNamespace(fmt.Sprintf("/proc/self/ns/%s", namespaceType.threadProcName()))
+	fd, err := s.ops.OpenNamespace(fmt.Sprintf("/proc/thread-self/ns/%s", namespaceType.threadProcName()))
 	if err != nil {
 		return fmt.Errorf("open restored %s namespace: %w", namespaceType, err)
 	}

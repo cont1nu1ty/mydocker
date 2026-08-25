@@ -7,16 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
+	"unicode/utf8"
 )
 
 const (
-	responseGeneration        uint64 = 1
-	maximumEventResponseCount        = 500
-	maximumEventResourceCount        = 16
-	maximumEventDetailsBytes         = 64 << 10
-	maximumLogResponseCount          = 100
-	maximumLogPayloadBytes           = 16 << 20
+	responseGeneration             uint64 = 1
+	maximumEventResponseCount             = 500
+	maximumEventResourceCount             = 16
+	maximumEventDetailsBytes              = 64 << 10
+	maximumLogResponseCount               = 100
+	maximumLogPayloadBytes                = 16 << 20
+	maximumBuildIdentityFieldBytes        = 4096
 )
 
 // Validate rejects malformed or internally inconsistent Sandbox projections.
@@ -424,6 +427,89 @@ func validOperationReason(reason string) bool {
 	default:
 		return false
 	}
+}
+
+// Validate rejects unbounded or contradictory daemon binary identity metadata.
+func (identity DaemonBuildIdentity) Validate() error {
+	if identity.Source != DaemonBuildIdentitySource {
+		return fmt.Errorf("daemon build identity source must be %q", DaemonBuildIdentitySource)
+	}
+	fields := []struct {
+		name  string
+		value string
+	}{
+		{"unavailable_reason", identity.UnavailableReason},
+		{"go_version", identity.GoVersion},
+		{"main_path", identity.MainPath},
+		{"main_version", identity.MainVersion},
+		{"main_sum", identity.MainSum},
+		{"vcs", identity.VCS},
+		{"vcs_revision", identity.VCSRevision},
+		{"vcs_time", identity.VCSTime},
+	}
+	for _, field := range fields {
+		if err := validateBuildIdentityField(field.name, field.value); err != nil {
+			return err
+		}
+	}
+	if identity.VCSTime != "" {
+		if _, err := time.Parse(time.RFC3339, identity.VCSTime); err != nil {
+			return errors.New("daemon build identity vcs_time must use RFC3339")
+		}
+	}
+	if identity.Unavailable {
+		if !validDaemonBuildUnavailableReason(identity.UnavailableReason) {
+			return errors.New("daemon build identity unavailable_reason is outside the v1 vocabulary")
+		}
+		return nil
+	}
+	if identity.UnavailableReason != "" {
+		return errors.New("available daemon build identity must omit unavailable_reason")
+	}
+	if !UsableVCSRevision(identity.VCSRevision) {
+		return errors.New("available daemon build identity must include a usable VCS revision")
+	}
+	if identity.VCSModified == nil {
+		return errors.New("available daemon build identity must include vcs_modified")
+	}
+	return nil
+}
+
+// validateBuildIdentityField keeps externally visible build metadata bounded and single-line.
+func validateBuildIdentityField(name, value string) error {
+	if len(value) > maximumBuildIdentityFieldBytes {
+		return fmt.Errorf("daemon build identity %s must not exceed %d bytes", name, maximumBuildIdentityFieldBytes)
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("daemon build identity %s must be valid UTF-8", name)
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return fmt.Errorf("daemon build identity %s must not contain control characters", name)
+		}
+	}
+	return nil
+}
+
+// validDaemonBuildUnavailableReason reports whether one unavailable identity uses a bounded v1 reason.
+func validDaemonBuildUnavailableReason(reason string) bool {
+	switch reason {
+	case DaemonBuildUnavailableNotConfigured, DaemonBuildUnavailableBuildInfo, DaemonBuildUnavailableRevision, DaemonBuildUnavailableModified:
+		return true
+	default:
+		return false
+	}
+}
+
+// UsableVCSRevision reports whether a VCS revision is present and not an explicit unknown placeholder.
+func UsableVCSRevision(revision string) bool {
+	trimmed := strings.TrimSpace(revision)
+	return trimmed != "" && trimmed == revision && !strings.EqualFold(trimmed, "unknown")
+}
+
+// Validate rejects malformed daemon information before callers trust its build identity.
+func (response InfoResponse) Validate() error {
+	return response.DaemonBuild.Validate()
 }
 
 // Validate rejects incomplete Sandbox responses and requires an attached mutation to target the returned Sandbox.

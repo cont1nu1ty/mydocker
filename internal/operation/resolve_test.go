@@ -166,6 +166,15 @@ func TestOperationValidateStateResultMatrix(t *testing.T) {
 			operation.Result = ResultFailed
 		},
 		"invalid response": func(operation *Operation) { operation.Response = []byte("{") },
+		"duplicate response key": func(operation *Operation) {
+			operation.Response = []byte(`{"sandbox_id":"sandbox-1","sandbox_id":"sandbox-2"}`)
+		},
+		"invalid response UTF-8": func(operation *Operation) {
+			operation.Response = []byte{'"', 0xff, '"'}
+		},
+		"multiple response values": func(operation *Operation) {
+			operation.Response = []byte(`{"sandbox_id":"sandbox-1"} null`)
+		},
 	}
 	for name, mutate := range tests {
 		t.Run(name, func(t *testing.T) {

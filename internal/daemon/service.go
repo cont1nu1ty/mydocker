@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -48,6 +49,7 @@ type Service struct {
 	queries        queryService
 	logs           LogAccess
 	containerLocks *serviceContainerLocks
+	info           v1.InfoResponse
 }
 
 // serviceContainerLocks serializes Container create/delete plus their
@@ -68,24 +70,57 @@ var _ server.Service = (*Service)(nil)
 
 // NewService wires one Engine into the v1 adapter and requires identity-scoped log registration and lookup; it performs no recovery or host mutation itself.
 func NewService(runtime *engine.Engine, logs LogAccess) (*Service, error) {
+	return NewServiceWithInfo(runtime, logs, defaultUnavailableInfo())
+}
+
+// NewServiceWithInfo wires one Engine into the v1 adapter with an immutable daemon-binary identity snapshot.
+func NewServiceWithInfo(runtime *engine.Engine, logs LogAccess, info v1.InfoResponse) (*Service, error) {
 	if runtime == nil {
 		return nil, errors.New("daemon service engine must not be nil")
 	}
-	return newService(runtime, runtime.Coordinator(), logs)
+	return newServiceWithInfo(runtime, runtime.Coordinator(), logs, info)
 }
 
 // newService accepts narrow mutation, query, and log-access dependencies for deterministic unprivileged adapter tests.
 func newService(mutations mutator, queries queryService, logs LogAccess) (*Service, error) {
+	return newServiceWithInfo(mutations, queries, logs, defaultUnavailableInfo())
+}
+
+// newServiceWithInfo accepts narrow dependencies plus a caller-owned identity snapshot for deterministic tests.
+func newServiceWithInfo(mutations mutator, queries queryService, logs LogAccess, info v1.InfoResponse) (*Service, error) {
 	if mutations == nil || queries == nil {
 		return nil, errors.New("daemon service requires mutation and query dependencies")
 	}
 	if logs == nil {
 		return nil, errors.New("daemon service log locator must not be nil")
 	}
+	if err := info.Validate(); err != nil {
+		return nil, fmt.Errorf("daemon service info: %w", err)
+	}
 	return &Service{
 		mutator: mutations, queries: queries, logs: logs,
 		containerLocks: &serviceContainerLocks{locks: make(map[domain.ContainerID]*serviceContainerLock)},
+		info:           cloneInfoResponse(info),
 	}, nil
+}
+
+// defaultUnavailableInfo keeps legacy and test service construction explicit about absent binary metadata.
+func defaultUnavailableInfo() v1.InfoResponse {
+	return v1.InfoResponse{DaemonBuild: v1.DaemonBuildIdentity{
+		Source:            v1.DaemonBuildIdentitySource,
+		Unavailable:       true,
+		UnavailableReason: v1.DaemonBuildUnavailableNotConfigured,
+	}}
+}
+
+// cloneInfoResponse prevents pointer aliasing from changing the service's immutable identity snapshot.
+func cloneInfoResponse(info v1.InfoResponse) v1.InfoResponse {
+	cloned := info
+	if info.DaemonBuild.VCSModified != nil {
+		modified := *info.DaemonBuild.VCSModified
+		cloned.DaemonBuild.VCSModified = &modified
+	}
+	return cloned
 }
 
 // lock holds one Container's API mutation and log-registry publication as one
@@ -391,6 +426,14 @@ func (service *Service) GetOperation(ctx context.Context, requestContext v1.Requ
 		return v1.OperationResponse{}, MapError(err)
 	}
 	return v1.OperationResponse{Operation: projected}, nil
+}
+
+// Info returns the immutable daemon binary identity without consulting mutable lifecycle state.
+func (service *Service) Info(ctx context.Context, requestContext v1.RequestContext, _ v1.GetInfoRequest) (v1.InfoResponse, error) {
+	if err := validateReadCall(ctx, requestContext); err != nil {
+		return v1.InfoResponse{}, err
+	}
+	return cloneInfoResponse(service.info), nil
 }
 
 // EventsAfter returns globally ordered public event facts and omits internal provider details.

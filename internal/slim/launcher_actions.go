@@ -161,17 +161,39 @@ func (launcher *LinuxShimLauncher) inspectLauncherAction(ctx context.Context, re
 
 // removeLauncherAction tears down a resource only by terminating its exact
 // retained wrapper identity, which also releases namespaces and rootfs bound to
-// that wrapper; raw cgroup member PIDs are never used as cleanup authority.
+// that wrapper. The complete observation, termination, absence proof, and
+// socket cleanup sequence is serialized with Ensure for the same owner.
 func (launcher *LinuxShimLauncher) removeLauncherAction(ctx context.Context, reference ResourceReference) (_ provider.CleanupObservation, resultErr error) {
 	if err := launcher.validateActionReference(ctx, reference); err != nil {
 		return provider.CleanupObservation{}, err
+	}
+	lock := launcher.ownerOperationLock(reference.Owner.Token)
+	lock.Lock()
+	defer lock.Unlock()
+	store, err := newLaunchStore(reference.Paths, reference.Owner)
+	if err != nil {
+		return provider.CleanupObservation{}, err
+	}
+	journal, found, err := store.Read()
+	if err != nil {
+		return provider.CleanupObservation{}, err
+	}
+	if !found {
+		return provider.CleanupObservation{}, errors.New("launcher removal requires a durable launch journal")
+	}
+	bound, err := launchJournalBindsActionProcess(journal, reference)
+	if err != nil {
+		return provider.CleanupObservation{}, err
+	}
+	if !bound {
+		return launcherCleanupObservation(provider.CleanupAlreadyAbsent)
 	}
 	process, present, err := launcher.restoreActionProcess(ctx, reference)
 	if err != nil {
 		return provider.CleanupObservation{}, err
 	}
 	if !present {
-		if err := launcher.cleanupActionSocket(reference); err != nil {
+		if err := cleanupStaleControlSocket(store); err != nil {
 			return provider.CleanupObservation{}, err
 		}
 		return launcherCleanupObservation(provider.CleanupAlreadyAbsent)
@@ -182,7 +204,7 @@ func (launcher *LinuxShimLauncher) removeLauncherAction(ctx context.Context, ref
 	if absentErr != nil {
 		return provider.CleanupObservation{}, errors.Join(terminateErr, absentErr)
 	}
-	if err := launcher.cleanupActionSocket(reference); err != nil {
+	if err := cleanupStaleControlSocket(store); err != nil {
 		return provider.CleanupObservation{}, errors.Join(terminateErr, err)
 	}
 	return launcherCleanupObservation(provider.CleanupRemoved)
@@ -607,14 +629,29 @@ func (launcher *LinuxShimLauncher) verifyProcessReceiptEvidence(reference Resour
 	return nil
 }
 
-// cleanupActionSocket removes a stale private endpoint only after the exact
-// process evidence was proven absent by the caller's cleanup path.
-func (launcher *LinuxShimLauncher) cleanupActionSocket(reference ResourceReference) error {
-	store, err := newLaunchStore(reference.Paths, reference.Owner)
-	if err != nil {
-		return err
+// launchJournalBindsActionProcess proves a cleanup receipt still names the
+// process currently authorized by this owner's durable launch journal. An
+// intent or a newer exact process makes an older Remove an idempotent no-op.
+func launchJournalBindsActionProcess(journal launchJournal, reference ResourceReference) (bool, error) {
+	if err := journal.Validate(); err != nil {
+		return false, err
 	}
-	return cleanupStaleControlSocket(store)
+	expectedMode := shim.ModeKeeper
+	expectedAttempt := domain.AttemptID("")
+	if resourceBacksInit(reference.Kind) {
+		expectedMode = shim.ModeInit
+		expectedAttempt = reference.AttemptID
+	}
+	if journal.Owner != reference.Owner || journal.Mode != expectedMode || journal.SandboxID != reference.SandboxID || journal.AttemptID != expectedAttempt {
+		return false, errors.New("launch journal scope differs from cleanup reference")
+	}
+	if journal.Phase == launchPhaseIntent {
+		return false, nil
+	}
+	if journal.ProcessEvidence == nil {
+		return false, errors.New("process-bound launch journal lacks exact process evidence")
+	}
+	return *journal.ProcessEvidence == reference.ProcessEvidence, nil
 }
 
 // resourceBacksInit identifies every Attempt-owned resource whose lifetime is

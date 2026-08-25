@@ -438,6 +438,59 @@ func TestMemoryStoreFinalizesTerminalResponseOnce(t *testing.T) {
 	}
 }
 
+// TestMemoryStoreRejectsActiveResponseDrift verifies a persisted side-effect
+// plan cannot be rewritten while retaining the same operation fingerprint.
+func TestMemoryStoreRejectsActiveResponseDrift(t *testing.T) {
+	store := NewMemoryStore()
+	active := testOperation("op-active-response", "sandbox-active-response")
+	active.State = operation.StateRunning
+	active.Stage = operation.StagePersistIntent
+	active.Response = []byte(`{"plan":{"Signal":"SIGTERM"}}`)
+	stored := putTestOperation(t, store, active)
+
+	rewritten := stored.Clone()
+	rewritten.Operation.Response = []byte(`{"plan":{"Signal":"SIGKILL"}}`)
+	err := store.Update(context.Background(), func(tx Tx) error {
+		_, putErr := tx.PutOperation(rewritten, stored.Revision)
+		return putErr
+	})
+	if !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("PutOperation(active response rewrite) error = %v, want ErrInvalidRecord", err)
+	}
+}
+
+// TestMemoryStoreAllowsInitialIntentResponseThenFreezesIt verifies the only
+// active response mutation is the first validate-to-persist-intent commit;
+// every later active checkpoint must retain those exact durable plan bytes.
+func TestMemoryStoreAllowsInitialIntentResponseThenFreezesIt(t *testing.T) {
+	store := NewMemoryStore()
+	pending := testOperation("op-initialize-response", "sandbox-initialize-response")
+	stored := putTestOperation(t, store, pending)
+
+	running := stored.Clone()
+	running.Operation.State = operation.StateRunning
+	running.Operation.Stage = operation.StagePersistIntent
+	running.Operation.Response = []byte(`{"plan":{"signal":"SIGTERM"}}`)
+	err := store.Update(context.Background(), func(tx Tx) error {
+		var putErr error
+		running, putErr = tx.PutOperation(running, stored.Revision)
+		return putErr
+	})
+	if err != nil {
+		t.Fatalf("PutOperation(initial intent response) error = %v", err)
+	}
+
+	rewritten := running.Clone()
+	rewritten.Operation.Response = []byte(`{"plan":{"signal":"SIGKILL"}}`)
+	err = store.Update(context.Background(), func(tx Tx) error {
+		_, putErr := tx.PutOperation(rewritten, running.Revision)
+		return putErr
+	})
+	if !errors.Is(err, ErrInvalidRecord) {
+		t.Fatalf("PutOperation(rewrite initialized response) error = %v, want ErrInvalidRecord", err)
+	}
+}
+
 // TestMemoryStoreSealsRollbackDescriptors verifies recovery cannot append acquisitions after any cleanup step started.
 func TestMemoryStoreSealsRollbackDescriptors(t *testing.T) {
 	store := NewMemoryStore()

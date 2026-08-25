@@ -277,6 +277,14 @@ func (systemOps) pivotRoot(newRoot, putOld string) error { return unix.PivotRoot
 // mkdir creates one rootfs preparation directory with an explicit mode.
 func (systemOps) mkdir(path string, mode uint32) error { return unix.Mkdir(path, mode) }
 
+// mknod creates one fixed device node inside the already-private /dev tmpfs.
+func (systemOps) mknod(path string, mode uint32, device int) error {
+	return unix.Mknod(path, mode, device)
+}
+
+// chmod applies canonical device-node permissions after umask affected creation.
+func (systemOps) chmod(path string, mode uint32) error { return unix.Chmod(path, mode) }
+
 // remove removes one empty preparation directory after its mount is detached.
 func (systemOps) remove(path string) error { return os.Remove(path) }
 

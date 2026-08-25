@@ -62,7 +62,8 @@ func (spec ProcessLaunchSpec) Validate() error {
 }
 
 // ProcessFactory performs the only production fork/exec boundary. Start owns
-// ExtraFDs and internally creates the parent-death release pipe.
+// ExtraFDs and internally creates the parent-owned release pipe. EOF before
+// the exact authorization byte makes the child exit without serving.
 type ProcessFactory interface {
 	Preflight(context.Context) error
 	Start(context.Context, ProcessLaunchSpec) (StartedProcess, error)
